@@ -1,5 +1,5 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.3.2 - OPERACIÓN LIMPIEZA
-// Evolución: Fix de Sintaxis CxC + Limpieza de Conflictos CSS Tailwind
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.4 - OPERACIÓN INTEGRAL
+// Evolución: Exportación a Excel, Control de Fechas y Eliminación de Errores
 // REGLA DE ORO: CERO OMISIONES. IDIOMA ESPAÑOL. GRADO MILITAR.
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -8,7 +8,7 @@ import {
   DollarSign, ArrowUpCircle, ArrowDownCircle, FileText, 
   PlusCircle, X, Loader2, TrendingUp, Wallet, UserCheck, 
   ShieldCheck, Zap, Calculator, Landmark, CheckCircle2,
-  FileSignature, Lock, Cpu, Activity, UserPlus, Truck
+  FileSignature, Lock, Cpu, Activity, UserPlus, Truck, Trash2, Download
 } from 'lucide-react';
 
 // --- DEFINICIÓN DE TIPOS NÚCLEO ---
@@ -45,13 +45,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [type, setType] = useState<TransactionType>('INCOME');
   const [reference, setReference] = useState<string>('');
   const [selectedCapitanId, setSelectedCapitanId] = useState<string>('');
+  const [transactionDate, setTransactionDate] = useState(new Date().toISOString().split('T')[0]);
   const [isSyncing, setIsSyncing] = useState(false);
   
   const [reqItems, setReqItems] = useState('');
   const [reqPriority, setReqPriority] = useState('MEDIA');
   const [reqAmount, setReqAmount] = useState<string>(''); 
-  const [newCxC, setNewCxC] = useState({ alumno: '', monto: '', concepto: '' });
-  const [newCxP, setNewCxP] = useState({ proveedor: '', monto: 0, descripcion: '', categoria: 'Partes' });
+  const [newCxC, setNewCxC] = useState({ alumno: '', monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0] });
+  const [newCxP, setNewCxP] = useState({ proveedor: '', monto: 0, descripcion: '', categoria: 'Partes', fecha: new Date().toISOString().split('T')[0] });
   const [physicalBalance, setPhysicalBalance] = useState<string>('');
   
   const TASA_BS_USD = 36.50; 
@@ -69,8 +70,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   const formatDate = (date: Date | string | null) => {
     if (!date) return "---";
-    const d = typeof date === 'string' ? new Date(date) : date;
-    return d.toLocaleDateString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    const d = new Date(date);
+    return new Date(d.getTime() + d.getTimezoneOffset() * 60000).toLocaleDateString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric' });
   };
 
   const fetchMasterData = useCallback(async () => {
@@ -78,7 +79,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     try {
       const [capRes, finRes, reqRes, cxcRes] = await Promise.all([
         supabase.from('capitanes').select('*').order('nombre', { ascending: true }),
-        supabase.from('transacciones_finanzas').select('*').order('created_at', { ascending: false }),
+        supabase.from('transacciones_finanzas').select('*').order('issue_date', { ascending: false }),
         supabase.from('solicitudes_compra').select('*').order('created_at', { ascending: false }),
         supabase.from('cuentas_por_cobrar').select('*').order('fecha_emision', { ascending: false })
       ]);
@@ -100,7 +101,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchMasterData();
-    const channel = supabase.channel('valkyron-erp-v8-3-2')
+    const channel = supabase.channel('valkyron-erp-v8-4')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_por_cobrar' }, fetchMasterData)
@@ -114,6 +115,47 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const inventoryValue = inventory.reduce((acc, item) => acc + (item.quantity * (item.unitPrice || 0)), 0);
   const theoreticalBalance = totalIncomes - totalCashOut;
   const totalReceivables = useMemo(() => receivables.reduce((acc, r) => acc + (Number(r.monto_pendiente) || 0), 0), [receivables]);
+
+  const handleExportCSV = () => {
+    const headers = ['Fecha', 'Referencia', 'Entidad / Concepto', 'Metodo Pago', 'Monto ($)', 'Tipo', 'Estatus'];
+    const rows = transactions.map(t => [
+      formatDate(t.issueDate),
+      t.invoiceNumber,
+      `"${t.entityName}"`,
+      t.payment_method || 'N/A',
+      t.amount,
+      t.type,
+      t.status
+    ]);
+    const csvContent = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `Reporte_Financiero_Valkyron_${new Date().toISOString().split('T')[0]}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleDeleteTransaction = async (id: string) => {
+    if (!window.confirm("ATENCIÓN: ¿Autoriza la eliminación de este registro contable? Esta acción es irreversible.")) return;
+    setIsSyncing(true);
+    const { error } = await supabase.from('transacciones_finanzas').delete().eq('id', id);
+    if (error) alert("Error al eliminar: " + error.message);
+    else fetchMasterData();
+    setIsSyncing(false);
+  };
+
+  const handleDeleteCxC = async (id: string) => {
+    if (!window.confirm("¿Desea eliminar esta Cuenta por Cobrar?")) return;
+    setIsSyncing(true);
+    const { error } = await supabase.from('cuentas_por_cobrar').delete().eq('id', id);
+    if (error) alert("Error al eliminar: " + error.message);
+    else fetchMasterData();
+    setIsSyncing(false);
+  };
 
   const handleMulticurrencyRegister = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -130,7 +172,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       amount: equivalentUSD, invoice_number: `TX-${hash.substring(0,8)}`,
       description: reference || 'REGISTRO MANUAL', status: 'PAID',
       category: type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
-      payment_method: currency
+      payment_method: currency,
+      issue_date: new Date(transactionDate).toISOString()
     }]);
 
     if (!error) {
@@ -148,10 +191,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         nombre_alumno: newCxC.alumno.toUpperCase(),
         monto_total: parseFloat(newCxC.monto),
         concepto: newCxC.concepto.toUpperCase() || 'VUELO PENDIENTE',
-        estatus: 'PENDIENTE'
+        estatus: 'PENDIENTE',
+        fecha_emision: new Date(newCxC.fecha).toISOString()
       }]);
       if (error) throw error;
-      setNewCxC({ alumno: '', monto: '', concepto: '' });
+      setNewCxC({ alumno: '', monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0] });
       fetchMasterData();
       alert("Deuda de alumno registrada.");
     } catch (err: any) { alert(err.message); }
@@ -166,7 +210,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const { error } = await supabase.from('transacciones_finanzas').insert([{
       type: 'PAYABLE', entity_name: vendorName.toUpperCase(), amount: newCxP.monto,
       invoice_number: `INV-${hash.substring(0,8)}`, description: `[CXP-MANUAL] ${newCxP.descripcion.toUpperCase()}`,
-      issue_date: new Date().toISOString(), status: 'PENDING', category: newCxP.categoria,
+      issue_date: new Date(newCxP.fecha).toISOString(),
+      status: 'PENDING', category: newCxP.categoria,
       payment_method: 'CASH'
     }]);
     if (!error) { fetchMasterData(); setIsAddingCxP(false); }
@@ -231,9 +276,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_0_30px_rgba(225,173,1,0.3)]">
               <Cpu className="text-black h-8 w-8 animate-pulse" />
             </div>
-            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.3.2</span>
+            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.4</span>
           </h1>
-          <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.4em] mt-3 ml-16">Valkyron Intelligence // Strategic Asset Center</p>
+          <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.4em] mt-3 ml-16">Valkyron Intelligence // Gestión de Activos Estratégicos</p>
         </div>
 
         <div className="flex p-1.5 bg-black/60 backdrop-blur-3xl rounded-[2rem] border border-white/5 shadow-inner overflow-x-auto max-w-full">
@@ -259,6 +304,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <h2 className="text-[10px] font-black uppercase tracking-widest">Ejecutar Transacción</h2>
             </div>
             <form onSubmit={handleMulticurrencyRegister} className="space-y-6">
+              <div className="space-y-2">
+                 <label className="text-[8px] font-black text-zinc-500 uppercase tracking-widest">Fecha del Movimiento</label>
+                 <input type="date" required value={transactionDate} onChange={(e) => setTransactionDate(e.target.value)} className={inputStyle + " w-full text-[12px] font-mono"} />
+              </div>
               <div className="grid grid-cols-2 gap-3">
                 <select value={type} onChange={(e) => setType(e.target.value as any)} className={inputStyle + " text-[10px] font-black uppercase"}>
                   <option value="INCOME">INGRESO (+)</option>
@@ -292,14 +341,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           <div className={`lg:col-span-8 ${glassStyle} rounded-[3.5rem] overflow-hidden flex flex-col text-white`}>
             <div className="p-8 border-b border-white/5 flex justify-between items-center bg-white/[0.01]">
               <h3 className="text-[11px] font-black uppercase tracking-[0.4em] flex items-center gap-4 italic"><Landmark className="h-5 w-5 text-[#E1AD01]" /> Libro Mayor</h3>
-              <div className="flex gap-2">
+              <div className="flex gap-3">
+                <button onClick={handleExportCSV} className="bg-[#E1AD01]/10 text-[#E1AD01] px-4 py-2 rounded-xl border border-[#E1AD01]/20 text-[9px] font-black uppercase tracking-widest hover:bg-[#E1AD01] hover:text-black transition-all flex items-center gap-2">
+                  <Download size={12}/> Exportar Excel
+                </button>
                 <button onClick={() => setIsAddingCxP(true)} className="bg-white/5 px-4 py-2 rounded-xl border border-white/10 text-[9px] font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center gap-2"><Truck size={12}/> CxP Manual</button>
               </div>
             </div>
             <div className="flex-1 overflow-y-auto max-h-[600px] scrollbar-hide px-6">
               <table className="w-full text-left border-separate border-spacing-y-3">
                 <tbody>
-                  {transactions.slice(0, 20).map((t) => (
+                  {transactions.map((t) => (
                     <tr key={t.id} className="group transition-all">
                       <td className="bg-white/[0.02] group-hover:bg-white/[0.05] p-5 rounded-l-3xl border-y border-l border-white/5">
                         <span className="text-[10px] font-black block">{formatDate(t.issueDate)}</span>
@@ -312,8 +364,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                       <td className={`bg-white/[0.02] group-hover:bg-white/[0.05] p-5 border-y border-white/5 text-right font-black text-xl italic ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
                         ${t.amount.toLocaleString()}
                       </td>
-                      <td className="bg-white/[0.02] group-hover:bg-white/[0.05] p-5 rounded-r-3xl border-y border-r border-white/5 text-center">
-                        {t.status === 'PAID' ? <CheckCircle2 className="h-5 w-5 text-emerald-500/50 mx-auto" /> : <Loader2 className="h-5 w-5 text-[#E1AD01] animate-spin mx-auto" />}
+                      <td className="bg-white/[0.02] group-hover:bg-white/[0.05] p-5 rounded-r-3xl border-y border-r border-white/5 text-center flex items-center justify-center gap-4">
+                        {t.status === 'PAID' ? <CheckCircle2 className="h-5 w-5 text-emerald-500/50" /> : <Loader2 className="h-5 w-5 text-[#E1AD01] animate-spin" />}
+                        <button onClick={() => handleDeleteTransaction(t.id)} className="text-zinc-600 hover:text-red-500 transition-all p-2 rounded-full hover:bg-red-500/10">
+                          <Trash2 size={16} />
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -328,8 +383,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-in slide-in-from-bottom-4 duration-700 text-white">
           <div className={`${glassStyle} rounded-[3rem] p-8`}>
              <h3 className="text-[12px] font-black uppercase tracking-[0.4em] mb-8 flex items-center gap-3 italic"><UserPlus className="text-[#E1AD01]"/> Cuentas por Cobrar (Alumnos)</h3>
-             <form onSubmit={handleRegisterCxC} className="space-y-6">
+             <form onSubmit={handleRegisterCxC} className="space-y-5">
                 <input required className={inputStyle + " w-full"} placeholder="NOMBRE DEL ALUMNO" value={newCxC.alumno} onChange={e => setNewCxC({...newCxC, alumno: e.target.value})} />
+                <input type="date" required value={newCxC.fecha} onChange={(e) => setNewCxC({...newCxC, fecha: e.target.value})} className={inputStyle + " w-full text-[12px] font-mono"} />
                 <div className="grid grid-cols-2 gap-4">
                   <input type="number" required className={inputStyle + " w-full font-black text-lg"} placeholder="MONTO $" value={newCxC.monto} onChange={e => setNewCxC({...newCxC, monto: e.target.value})} />
                   <input className={inputStyle + " w-full"} placeholder="CONCEPTO" value={newCxC.concepto} onChange={e => setNewCxC({...newCxC, concepto: e.target.value})} />
@@ -338,12 +394,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
              </form>
              <div className="mt-8 space-y-3 max-h-[300px] overflow-y-auto scrollbar-hide">
                {receivables.map(r => (
-                 <div key={r.id} className="bg-white/[0.03] p-4 rounded-2xl border border-white/5 flex justify-between items-center">
+                 <div key={r.id} className="bg-white/[0.03] p-4 rounded-2xl border border-white/5 flex justify-between items-center group">
                    <div>
                      <p className="text-[10px] font-black uppercase">{r.nombre_alumno}</p>
-                     <p className="text-[7px] text-zinc-500 uppercase">{r.concepto}</p>
+                     <p className="text-[7px] text-zinc-500 uppercase">{r.concepto} • {formatDate(r.fecha_emision)}</p>
                    </div>
-                   <p className="text-red-400 font-mono font-black text-lg">${r.monto_pendiente}</p>
+                   <div className="flex items-center gap-3">
+                     <p className="text-red-400 font-mono font-black text-lg">${r.monto_pendiente}</p>
+                     <button onClick={() => handleDeleteCxC(r.id)} className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-500 transition-all"><Trash2 size={14}/></button>
+                   </div>
                  </div>
                ))}
              </div>
@@ -356,11 +415,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                  <div key={t.id} className="bg-white/[0.03] p-6 rounded-3xl border border-white/5 flex justify-between items-center group">
                    <div>
                      <p className="text-[10px] font-black uppercase">{t.entityName}</p>
-                     <p className="text-[7px] text-zinc-500 uppercase">{t.description}</p>
+                     <p className="text-[7px] text-zinc-500 uppercase">{t.description} • {formatDate(t.issueDate)}</p>
                    </div>
-                   <div className="text-right">
-                     <p className="text-red-500 font-mono font-black text-xl italic">${t.amount.toLocaleString()}</p>
-                     <span className="text-[7px] bg-red-500/10 text-red-500 px-2 py-0.5 rounded-full font-black uppercase">Pendiente</span>
+                   <div className="text-right flex items-center gap-3">
+                     <div>
+                        <p className="text-red-500 font-mono font-black text-xl italic">${t.amount.toLocaleString()}</p>
+                        <span className="text-[7px] bg-red-500/10 text-red-500 px-2 py-0.5 rounded-full font-black uppercase">Pendiente</span>
+                     </div>
+                     <button onClick={() => handleDeleteTransaction(t.id)} className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-500 transition-all"><Trash2 size={16}/></button>
                    </div>
                  </div>
                ))}
@@ -446,6 +508,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
             <form onSubmit={handleRegisterInvoiceCxP} className="p-10 space-y-6">
                <input required className={inputStyle + " w-full uppercase text-[10px] font-black"} placeholder="PROVEEDOR / ENTIDAD" value={newCxP.proveedor} onChange={e => setNewCxP({...newCxP, proveedor: e.target.value})} />
+               <input type="date" required value={newCxP.fecha} onChange={(e) => setNewCxP({...newCxP, fecha: e.target.value})} className={inputStyle + " w-full text-[12px] font-mono"} />
                <input type="number" step="0.01" required className={inputStyle + " w-full text-4xl font-black italic focus:border-red-500"} placeholder="0.00" value={newCxP.monto} onChange={e => setNewCxP({...newCxP, monto: parseFloat(e.target.value)})} />
                <input required className={inputStyle + " w-full uppercase text-[10px] font-black"} placeholder="DETALLE OPERACIÓN" value={newCxP.descripcion} onChange={e => setNewCxP({...newCxP, descripcion: e.target.value})} />
                <button type="submit" className="w-full bg-white text-black font-black py-6 rounded-[2rem] uppercase text-[11px] tracking-[0.3em] hover:bg-[#E1AD01] transition-all">Sellar CxP</button>
@@ -457,7 +520,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   );
 };
 
-// COMPONENTES ATÓMICOS
 const TabButton = ({ active, onClick, icon, label }: any) => (
   <button onClick={onClick} className={`flex items-center gap-3 px-8 py-4 rounded-[1.5rem] font-black text-[9px] uppercase tracking-[0.2em] transition-all duration-500 ${active ? 'bg-[#E1AD01] text-black shadow-[0_10px_20px_rgba(225,173,1,0.2)] scale-105' : 'text-zinc-500 hover:text-white hover:bg-white/5'}`}>
     {React.cloneElement(icon, { size: 14 })} {label}
