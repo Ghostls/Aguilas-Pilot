@@ -1,5 +1,5 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.5 - OPERACIÓN BÓVEDA
-// Evolución: Exportación a Excel, Fechas, Eliminación y Módulo Bóvedas (USDT/ZELLE/CASH/BS)
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.7 - NÚCLEO BI-MONEDA ABSOLUTO
+// Evolución: Separación total de valores (BS guardados como BS puros, sin conversión a USD)
 // REGLA DE ORO: CERO OMISIONES. IDIOMA ESPAÑOL. GRADO MILITAR.
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -56,9 +56,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [reqAmount, setReqAmount] = useState<string>(''); 
   const [newCxC, setNewCxC] = useState({ alumno: '', monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0] });
   const [newCxP, setNewCxP] = useState({ proveedor: '', monto: 0, descripcion: '', categoria: 'Partes', fecha: new Date().toISOString().split('T')[0] });
-  const [physicalBalance, setPhysicalBalance] = useState<string>('');
   
-  const TASA_BS_USD = 36.50; 
+  // ESTADOS DE ARQUEO BI-MONEDA
+  const [physicalBalanceUSD, setPhysicalBalanceUSD] = useState<string>('');
+  const [physicalBalanceBS, setPhysicalBalanceBS] = useState<string>('');
 
   const generateAuditHash = (data: string) => {
     const str = data + Date.now().toString() + Math.random().toString();
@@ -104,7 +105,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchMasterData();
-    const channel = supabase.channel('valkyron-erp-v8-5')
+    const channel = supabase.channel('valkyron-erp-v8-7')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_por_cobrar' }, fetchMasterData)
@@ -112,12 +113,27 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     return () => { supabase.removeChannel(channel); };
   }, [fetchMasterData]);
 
-  const totalIncomes = useMemo(() => transactions.filter(t => (t.type === 'INCOME' || t.type === 'RECEIVABLE') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
-  const totalCashOut = useMemo(() => transactions.filter(t => (t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
+  // KPIs Globales (Sólo calculan USD para las tarjetas de arriba)
+  const totalIncomesUSD = useMemo(() => transactions.filter(t => t.payment_method !== 'BS' && (t.type === 'INCOME' || t.type === 'RECEIVABLE') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
+  const totalCashOutUSD = useMemo(() => transactions.filter(t => t.payment_method !== 'BS' && (t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
   const instructorDebt = useMemo(() => transactions.filter(t => t.category === 'Nomina' && t.status === 'PENDING').reduce((acc, t) => acc + t.amount, 0), [transactions]);
-  const inventoryValue = inventory.reduce((acc, item) => acc + (item.quantity * (item.unitPrice || 0)), 0);
-  const theoreticalBalance = totalIncomes - totalCashOut;
   const totalReceivables = useMemo(() => receivables.reduce((acc, r) => acc + (Number(r.monto_pendiente) || 0), 0), [receivables]);
+
+  // CÁLCULOS BI-MONEDA PUROS (SEPARADOS) PARA EL ARQUEO
+  const theoreticalBalanceUSD = useMemo(() => {
+    const usdMethods = ['USDT', 'ZELLE', 'CASH'];
+    const usdTx = transactions.filter(t => usdMethods.includes(t.payment_method) && t.status === 'PAID');
+    const inUSD = usdTx.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
+    const outUSD = usdTx.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
+    return inUSD - outUSD;
+  }, [transactions]);
+
+  const theoreticalBalanceBS = useMemo(() => {
+    const bsTx = transactions.filter(t => t.payment_method === 'BS' && t.status === 'PAID');
+    const inBS = bsTx.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
+    const outBS = bsTx.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
+    return inBS - outBS; // Cálculo puro en Bolívares sin conversiones
+  }, [transactions]);
 
   // Función para calcular balance por bóveda específica
   const getVaultBalance = (method: PaymentMethod) => {
@@ -128,13 +144,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   const handleExportCSV = () => {
-    const headers = ['Fecha', 'Referencia', 'Entidad / Concepto', 'Metodo Pago', 'Monto ($)', 'Tipo', 'Estatus'];
+    const headers = ['Fecha', 'Referencia', 'Entidad / Concepto', 'Metodo Pago', 'Monto Original', 'Tipo', 'Estatus'];
     const rows = transactions.map(t => [
       formatDate(t.issueDate),
       t.invoiceNumber,
       `"${t.entityName}"`,
       t.payment_method || 'N/A',
-      t.amount,
+      t.amount, // El monto se exporta tal cual está (BS o USD)
       t.type,
       t.status
     ]);
@@ -173,14 +189,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const numericAmount = parseFloat(amount);
     if (isNaN(numericAmount) || numericAmount <= 0) return;
     setIsSyncing(true);
-    const equivalentUSD = currency === 'BS' ? numericAmount / TASA_BS_USD : numericAmount;
+    
+    // EVOLUCIÓN v8.7: Guardamos el monto tal cual. Nada de divisiones por TASA_BS_USD.
+    const finalAmount = numericAmount; 
+    
     const capitanObj = capitanes.find(c => c.id === selectedCapitanId);
-    const hash = generateAuditHash(`${type}-${equivalentUSD}`);
+    const hash = generateAuditHash(`${type}-${finalAmount}`);
     
     const { error } = await supabase.from('transacciones_finanzas').insert([{
       type: type, 
       entity_name: type === 'INSTRUCTOR_PAY' ? `PAGO: ${capitanObj?.nombre}` : `FLUJO ${currency}`,
-      amount: equivalentUSD, invoice_number: `TX-${hash.substring(0,8)}`,
+      amount: finalAmount, 
+      invoice_number: `TX-${hash.substring(0,8)}`,
       description: reference || 'REGISTRO MANUAL', status: 'PAID',
       category: type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
       payment_method: currency,
@@ -188,7 +208,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }]);
 
     if (!error) {
-      setGlobalFinance(prev => ({ ...prev, [currency]: Number(((prev[currency] || 0) + (type === 'INCOME' ? numericAmount : -numericAmount)).toFixed(2)) }));
+      setGlobalFinance(prev => ({ ...prev, [currency]: Number(((prev[currency] || 0) + (type === 'INCOME' ? finalAmount : -finalAmount)).toFixed(2)) }));
       setAmount(''); setReference(''); fetchMasterData();
     }
     setIsSyncing(false);
@@ -223,7 +243,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       invoice_number: `INV-${hash.substring(0,8)}`, description: `[CXP-MANUAL] ${newCxP.descripcion.toUpperCase()}`,
       issue_date: new Date(newCxP.fecha).toISOString(),
       status: 'PENDING', category: newCxP.categoria,
-      payment_method: 'CASH'
+      payment_method: 'CASH' // Las CxP por defecto se calculan en base USD (CASH)
     }]);
     if (!error) { fetchMasterData(); setIsAddingCxP(false); }
     setSubmitting(false);
@@ -264,11 +284,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   const handleCloseMonth = () => {
-    const phys = parseFloat(physicalBalance);
-    if (isNaN(phys)) return alert("Monto inválido.");
-    if (Math.abs(theoreticalBalance - phys) > 0.01) return alert("Discrepancia detectada.");
-    alert("Cierre Mensual Certificado.");
-    setPhysicalBalance('');
+    const physUSD = parseFloat(physicalBalanceUSD) || 0;
+    const physBS = parseFloat(physicalBalanceBS) || 0;
+
+    if (isNaN(physUSD) || isNaN(physBS)) return alert("Los montos físicos ingresados son inválidos.");
+    
+    // Verificación militar: Rango de discrepancia menor a 1 céntimo
+    const diffUSD = Math.abs(theoreticalBalanceUSD - physUSD);
+    const diffBS = Math.abs(theoreticalBalanceBS - physBS);
+
+    if (diffUSD > 0.01 || diffBS > 0.01) {
+       return alert(`ALERTA DE DISCREPANCIA EN ARQUEO:\n\nDiferencia USD: $${diffUSD.toFixed(2)}\nDiferencia BS: Bs ${diffBS.toFixed(2)}\n\nPor favor audite los movimientos.`);
+    }
+
+    alert("Cierre Mensual Certificado (Dólares y Bolívares cuadrando al 100%).");
+    setPhysicalBalanceUSD('');
+    setPhysicalBalanceBS('');
   };
 
   if (loading) return (
@@ -287,7 +318,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_0_30px_rgba(225,173,1,0.3)]">
               <Cpu className="text-black h-8 w-8 animate-pulse" />
             </div>
-            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.5</span>
+            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.7</span>
           </h1>
           <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.4em] mt-3 ml-16">Valkyron Intelligence // Gestión de Activos Estratégicos</p>
         </div>
@@ -302,10 +333,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 text-white">
-        <StatCard label="Ingresos Totales" value={totalIncomes} color="from-emerald-500/20" icon={<ArrowUpCircle className="text-emerald-500" />} />
-        <StatCard label="CxC Alumnos" value={totalReceivables} color="from-yellow-500/20" icon={<TrendingUp className="text-yellow-500" />} />
-        <StatCard label="Deuda Capitanes" value={instructorDebt} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
-        <StatCard label="Egresos Totales" value={totalCashOut} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
+        <StatCard label="Ingresos Totales (USD)" value={`$${totalIncomesUSD.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-emerald-500/20" icon={<ArrowUpCircle className="text-emerald-500" />} />
+        <StatCard label="CxC Alumnos (USD)" value={`$${totalReceivables.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-yellow-500/20" icon={<TrendingUp className="text-yellow-500" />} />
+        <StatCard label="Deuda Capitanes (USD)" value={`$${instructorDebt.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
+        <StatCard label="Egresos Totales (USD)" value={`$${totalCashOutUSD.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
       </div>
 
       {/* --- MÓDULO BÓVEDAS --- */}
@@ -324,7 +355,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <Coins className={`h-5 w-5 ${selectedVault === curr ? 'text-[#E1AD01]' : 'text-zinc-600'}`} />
                         <span className="font-black uppercase tracking-widest text-[11px]">{curr}</span>
                       </div>
-                      <span className="font-mono text-xl font-black italic">${getVaultBalance(curr).toLocaleString()}</span>
+                      <span className="font-mono text-xl font-black italic">
+                        {curr === 'BS' ? 'Bs ' : '$'}
+                        {getVaultBalance(curr).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                      </span>
                    </button>
                 ))}
              </div>
@@ -348,7 +382,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     <div className="text-right flex items-center gap-4">
                       <div>
                         <span className={`font-black text-xl italic block ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {t.type === 'INCOME' || t.type === 'RECEIVABLE' ? '+' : '-'}${t.amount.toLocaleString()}
+                          {t.type === 'INCOME' || t.type === 'RECEIVABLE' ? '+' : '-'}
+                          {selectedVault === 'BS' ? 'Bs ' : '$'}
+                          {t.amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
                         </span>
                         <span className="text-[7px] text-zinc-600 font-bold uppercase">{t.type}</span>
                       </div>
@@ -387,9 +423,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </select>
               </div>
               <div className="relative group">
-                <span className="absolute left-6 top-1/2 -translate-y-1/2 text-[#E1AD01] font-black text-2xl">$</span>
+                <span className="absolute left-6 top-1/2 -translate-y-1/2 text-[#E1AD01] font-black text-2xl">{currency === 'BS' ? 'Bs' : '$'}</span>
                 <input type="number" step="any" value={amount} onChange={(e) => setAmount(e.target.value)} 
-                  className="w-full bg-white/5 border border-white/10 py-10 pl-14 pr-8 rounded-3xl text-5xl font-black italic outline-none focus:border-[#E1AD01] transition-all text-white" 
+                  className="w-full bg-white/5 border border-white/10 py-10 pl-16 pr-8 rounded-3xl text-5xl font-black italic outline-none focus:border-[#E1AD01] transition-all text-white" 
                   placeholder="0.00" required />
               </div>
               {type === 'INSTRUCTOR_PAY' && (
@@ -430,7 +466,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <span className="text-[7px] text-zinc-500 font-bold uppercase">{t.payment_method || '---'}</span>
                       </td>
                       <td className={`bg-white/[0.02] group-hover:bg-white/[0.05] p-5 border-y border-white/5 text-right font-black text-xl italic ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
-                        ${t.amount.toLocaleString()}
+                        {t.payment_method === 'BS' ? 'Bs ' : '$'}
+                        {t.amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
                       </td>
                       <td className="bg-white/[0.02] group-hover:bg-white/[0.05] p-5 rounded-r-3xl border-y border-r border-white/5 text-center flex items-center justify-center gap-4">
                         {t.status === 'PAID' ? <CheckCircle2 className="h-5 w-5 text-emerald-500/50" /> : <Loader2 className="h-5 w-5 text-[#E1AD01] animate-spin" />}
@@ -550,18 +587,36 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
+      {/* --- MÓDULO DE CIERRE BI-MONEDA --- */}
       {activeTab === 'CLOSING' && (
         <div className="animate-in slide-in-from-bottom-4 flex justify-center mt-10 text-white">
-          <div className={`${glassStyle} rounded-[3rem] p-12 w-full max-w-[600px] shadow-2xl relative overflow-hidden`}>
-            <h3 className="font-black text-[14px] uppercase tracking-[0.4em] mb-10 italic">Arqueo & Cierre Mensual</h3>
-            <div className="space-y-6">
-              <div className="bg-black/50 border border-white/5 p-6 rounded-3xl flex justify-between items-center">
-                <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Saldo Teórico en Sistema</span>
-                <span className="text-2xl font-black font-mono">${theoreticalBalance.toFixed(2)}</span>
+          <div className={`${glassStyle} rounded-[3rem] p-12 w-full max-w-[800px] shadow-2xl relative overflow-hidden`}>
+            <h3 className="font-black text-[14px] uppercase tracking-[0.4em] mb-10 italic text-center">Arqueo & Cierre Mensual Bi-Moneda</h3>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+              {/* BÓVEDA USD */}
+              <div className="space-y-6">
+                <div className="bg-emerald-900/20 border border-emerald-500/20 p-6 rounded-3xl flex flex-col items-center">
+                  <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Teórico Dólares (USDT/ZELLE/CASH)</span>
+                  <span className="text-3xl font-black font-mono text-white">${theoreticalBalanceUSD.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+                </div>
+                <p className="text-[9px] text-zinc-500 font-bold uppercase px-2 text-center">Físico Auditado (USD):</p>
+                <input type="number" step="any" value={physicalBalanceUSD} onChange={(e) => setPhysicalBalanceUSD(e.target.value)} className="w-full bg-white/5 border border-emerald-500/30 p-6 rounded-3xl text-3xl font-black outline-none text-center" placeholder="0.00" />
               </div>
-              <p className="text-[9px] text-zinc-500 font-bold uppercase px-2">Ingrese balance físico auditado:</p>
-              <input type="number" step="any" value={physicalBalance} onChange={(e) => setPhysicalBalance(e.target.value)} className="w-full bg-white/5 border border-[#E1AD01]/30 p-8 rounded-3xl text-5xl font-black outline-none text-center" placeholder="0.00" />
-              <button onClick={handleCloseMonth} className="w-full py-6 bg-red-600 rounded-[2rem] font-black uppercase text-[11px] flex items-center justify-center gap-3 hover:bg-red-700 transition-all shadow-xl tracking-[0.2em]"><Lock className="h-4 w-4"/> Certificar Cierre Mensual</button>
+
+              {/* BÓVEDA BS */}
+              <div className="space-y-6">
+                <div className="bg-blue-900/20 border border-blue-500/20 p-6 rounded-3xl flex flex-col items-center">
+                  <span className="text-[10px] font-black text-blue-500 uppercase tracking-widest mb-2">Teórico Bolívares (BS)</span>
+                  <span className="text-3xl font-black font-mono text-white">Bs {theoreticalBalanceBS.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
+                </div>
+                <p className="text-[9px] text-zinc-500 font-bold uppercase px-2 text-center">Físico Auditado (BS):</p>
+                <input type="number" step="any" value={physicalBalanceBS} onChange={(e) => setPhysicalBalanceBS(e.target.value)} className="w-full bg-white/5 border border-blue-500/30 p-6 rounded-3xl text-3xl font-black outline-none text-center" placeholder="0.00" />
+              </div>
+            </div>
+
+            <div className="mt-10">
+              <button onClick={handleCloseMonth} className="w-full py-6 bg-red-600 rounded-[2rem] font-black uppercase text-[11px] flex items-center justify-center gap-3 hover:bg-red-700 transition-all shadow-xl tracking-[0.2em]"><Lock className="h-4 w-4"/> Certificar Cierre Bi-Moneda</button>
             </div>
           </div>
         </div>
@@ -599,7 +654,7 @@ const StatCard = ({ label, value, color, icon }: any) => (
     <div className="relative z-10">
       <p className="text-[9px] text-zinc-500 font-black uppercase tracking-[0.4em] mb-4">{label}</p>
       <div className="flex items-center gap-4">
-        <h3 className="text-4xl font-black font-mono italic tracking-tighter">${value.toLocaleString()}</h3>
+        <h3 className="text-4xl font-black font-mono italic tracking-tighter">{value}</h3>
       </div>
     </div>
     <div className="absolute -right-8 -bottom-8 opacity-[0.03] group-hover:opacity-10 group-hover:rotate-12 transition-all duration-1000 scale-150">
