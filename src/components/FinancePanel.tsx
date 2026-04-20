@@ -1,5 +1,5 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.4 - OPERACIÓN INTEGRAL
-// Evolución: Exportación a Excel, Control de Fechas y Eliminación de Errores
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.5 - OPERACIÓN BÓVEDA
+// Evolución: Exportación a Excel, Fechas, Eliminación y Módulo Bóvedas (USDT/ZELLE/CASH/BS)
 // REGLA DE ORO: CERO OMISIONES. IDIOMA ESPAÑOL. GRADO MILITAR.
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -8,13 +8,13 @@ import {
   DollarSign, ArrowUpCircle, ArrowDownCircle, FileText, 
   PlusCircle, X, Loader2, TrendingUp, Wallet, UserCheck, 
   ShieldCheck, Zap, Calculator, Landmark, CheckCircle2,
-  FileSignature, Lock, Cpu, Activity, UserPlus, Truck, Trash2, Download
+  FileSignature, Lock, Cpu, Activity, UserPlus, Truck, Trash2, Download, Coins
 } from 'lucide-react';
 
 // --- DEFINICIÓN DE TIPOS NÚCLEO ---
 export type PaymentMethod = 'USDT' | 'ZELLE' | 'CASH' | 'BS';
 export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE' | 'RECEIVABLE';
-export type TabType = 'LEDGER' | 'REQUISITIONS' | 'CLOSING' | 'DEBTS';
+export type TabType = 'LEDGER' | 'REQUISITIONS' | 'CLOSING' | 'DEBTS' | 'ACCOUNTS';
 
 interface FinancePanelProps {
   vendors: Vendor[];
@@ -47,6 +47,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [selectedCapitanId, setSelectedCapitanId] = useState<string>('');
   const [transactionDate, setTransactionDate] = useState(new Date().toISOString().split('T')[0]);
   const [isSyncing, setIsSyncing] = useState(false);
+  
+  // Estado para el visor de bóvedas
+  const [selectedVault, setSelectedVault] = useState<PaymentMethod>('USDT');
   
   const [reqItems, setReqItems] = useState('');
   const [reqPriority, setReqPriority] = useState('MEDIA');
@@ -101,7 +104,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchMasterData();
-    const channel = supabase.channel('valkyron-erp-v8-4')
+    const channel = supabase.channel('valkyron-erp-v8-5')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_por_cobrar' }, fetchMasterData)
@@ -115,6 +118,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const inventoryValue = inventory.reduce((acc, item) => acc + (item.quantity * (item.unitPrice || 0)), 0);
   const theoreticalBalance = totalIncomes - totalCashOut;
   const totalReceivables = useMemo(() => receivables.reduce((acc, r) => acc + (Number(r.monto_pendiente) || 0), 0), [receivables]);
+
+  // Función para calcular balance por bóveda específica
+  const getVaultBalance = (method: PaymentMethod) => {
+    const vaultTxs = transactions.filter(t => t.payment_method === method && t.status === 'PAID');
+    const vaultIn = vaultTxs.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
+    const vaultOut = vaultTxs.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
+    return vaultIn - vaultOut;
+  };
 
   const handleExportCSV = () => {
     const headers = ['Fecha', 'Referencia', 'Entidad / Concepto', 'Metodo Pago', 'Monto ($)', 'Tipo', 'Estatus'];
@@ -276,13 +287,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_0_30px_rgba(225,173,1,0.3)]">
               <Cpu className="text-black h-8 w-8 animate-pulse" />
             </div>
-            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.4</span>
+            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.5</span>
           </h1>
           <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.4em] mt-3 ml-16">Valkyron Intelligence // Gestión de Activos Estratégicos</p>
         </div>
 
         <div className="flex p-1.5 bg-black/60 backdrop-blur-3xl rounded-[2rem] border border-white/5 shadow-inner overflow-x-auto max-w-full">
           <TabButton active={activeTab === 'LEDGER'} onClick={() => setActiveTab('LEDGER')} icon={<Landmark />} label="Libro Diario" />
+          <TabButton active={activeTab === 'ACCOUNTS'} onClick={() => setActiveTab('ACCOUNTS')} icon={<Coins />} label="Bóvedas" />
           <TabButton active={activeTab === 'DEBTS'} onClick={() => setActiveTab('DEBTS')} icon={<UserPlus />} label="Deudas (CxC/CxP)" />
           <TabButton active={activeTab === 'REQUISITIONS'} onClick={() => setActiveTab('REQUISITIONS')} icon={<FileSignature />} label="Requisiciones" />
           <TabButton active={activeTab === 'CLOSING'} onClick={() => setActiveTab('CLOSING')} icon={<Lock />} label="Arqueo & Cierre" />
@@ -295,6 +307,62 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         <StatCard label="Deuda Capitanes" value={instructorDebt} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
         <StatCard label="Egresos Totales" value={totalCashOut} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
       </div>
+
+      {/* --- MÓDULO BÓVEDAS --- */}
+      {activeTab === 'ACCOUNTS' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-in slide-in-from-right-10 duration-700">
+          <div className={`lg:col-span-4 ${glassStyle} rounded-[3rem] p-8 text-left`}>
+             <h3 className="text-[12px] font-black uppercase tracking-[0.4em] mb-8 flex items-center gap-3 italic text-white"><Wallet className="text-[#E1AD01]"/> Control de Liquidez</h3>
+             <div className="space-y-4">
+                {(['USDT', 'ZELLE', 'CASH', 'BS'] as PaymentMethod[]).map(curr => (
+                   <button 
+                     key={curr} 
+                     onClick={() => setSelectedVault(curr)} 
+                     className={`w-full p-6 rounded-3xl flex justify-between items-center border transition-all ${selectedVault === curr ? 'bg-[#E1AD01]/10 border-[#E1AD01] text-[#E1AD01] shadow-[0_0_20px_rgba(225,173,1,0.2)]' : 'bg-white/5 border-white/10 text-zinc-500 hover:text-white hover:bg-white/10'}`}
+                   >
+                      <div className="flex items-center gap-3">
+                        <Coins className={`h-5 w-5 ${selectedVault === curr ? 'text-[#E1AD01]' : 'text-zinc-600'}`} />
+                        <span className="font-black uppercase tracking-widest text-[11px]">{curr}</span>
+                      </div>
+                      <span className="font-mono text-xl font-black italic">${getVaultBalance(curr).toLocaleString()}</span>
+                   </button>
+                ))}
+             </div>
+          </div>
+
+          <div className={`lg:col-span-8 ${glassStyle} rounded-[3.5rem] overflow-hidden flex flex-col text-white`}>
+            <div className="p-8 border-b border-white/5 bg-white/[0.01]">
+              <h3 className="text-[11px] font-black uppercase tracking-[0.4em] flex items-center gap-4 italic"><Landmark className="h-5 w-5 text-[#E1AD01]" /> Auditoría de Bóveda: {selectedVault}</h3>
+            </div>
+            <div className="flex-1 overflow-y-auto max-h-[600px] scrollbar-hide px-6 py-2">
+              <div className="space-y-3">
+                {transactions.filter(t => t.payment_method === selectedVault).length === 0 && (
+                  <p className="text-center text-zinc-600 text-[10px] py-10 uppercase font-black tracking-widest">Sin movimientos registrados</p>
+                )}
+                {transactions.filter(t => t.payment_method === selectedVault).map((t) => (
+                  <div key={t.id} className="bg-white/[0.02] border border-white/5 p-5 rounded-[2rem] flex justify-between items-center group hover:bg-white/[0.05] transition-all">
+                    <div>
+                      <span className="text-[10px] font-black uppercase text-white block mb-1">{t.entityName}</span>
+                      <span className="text-[8px] text-zinc-500 font-mono uppercase">{formatDate(t.issueDate)} // {t.description || 'S/N'}</span>
+                    </div>
+                    <div className="text-right flex items-center gap-4">
+                      <div>
+                        <span className={`font-black text-xl italic block ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {t.type === 'INCOME' || t.type === 'RECEIVABLE' ? '+' : '-'}${t.amount.toLocaleString()}
+                        </span>
+                        <span className="text-[7px] text-zinc-600 font-bold uppercase">{t.type}</span>
+                      </div>
+                      <button onClick={() => handleDeleteTransaction(t.id)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-2 rounded-full hover:bg-red-500/10">
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {activeTab === 'LEDGER' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-in slide-in-from-right-10 duration-700">
@@ -340,7 +408,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
           <div className={`lg:col-span-8 ${glassStyle} rounded-[3.5rem] overflow-hidden flex flex-col text-white`}>
             <div className="p-8 border-b border-white/5 flex justify-between items-center bg-white/[0.01]">
-              <h3 className="text-[11px] font-black uppercase tracking-[0.4em] flex items-center gap-4 italic"><Landmark className="h-5 w-5 text-[#E1AD01]" /> Libro Mayor</h3>
+              <h3 className="text-[11px] font-black uppercase tracking-[0.4em] flex items-center gap-4 italic"><Landmark className="h-5 w-5 text-[#E1AD01]" /> Libro Mayor (Vista Global)</h3>
               <div className="flex gap-3">
                 <button onClick={handleExportCSV} className="bg-[#E1AD01]/10 text-[#E1AD01] px-4 py-2 rounded-xl border border-[#E1AD01]/20 text-[9px] font-black uppercase tracking-widest hover:bg-[#E1AD01] hover:text-black transition-all flex items-center gap-2">
                   <Download size={12}/> Exportar Excel
