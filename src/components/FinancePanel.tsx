@@ -1,5 +1,5 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.7 - NÚCLEO BI-MONEDA ABSOLUTO
-// Evolución: Separación total de valores (BS guardados como BS puros, sin conversión a USD)
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.6.1 - OPERACIÓN BI-MONEDA
+// Evolución: Libro Mayor Inteligente (BS y $ visualmente segregados en visor global)
 // REGLA DE ORO: CERO OMISIONES. IDIOMA ESPAÑOL. GRADO MILITAR.
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -48,7 +48,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [transactionDate, setTransactionDate] = useState(new Date().toISOString().split('T')[0]);
   const [isSyncing, setIsSyncing] = useState(false);
   
-  // Estado para el visor de bóvedas
   const [selectedVault, setSelectedVault] = useState<PaymentMethod>('USDT');
   
   const [reqItems, setReqItems] = useState('');
@@ -57,9 +56,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [newCxC, setNewCxC] = useState({ alumno: '', monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0] });
   const [newCxP, setNewCxP] = useState({ proveedor: '', monto: 0, descripcion: '', categoria: 'Partes', fecha: new Date().toISOString().split('T')[0] });
   
-  // ESTADOS DE ARQUEO BI-MONEDA
   const [physicalBalanceUSD, setPhysicalBalanceUSD] = useState<string>('');
   const [physicalBalanceBS, setPhysicalBalanceBS] = useState<string>('');
+  
+  const TASA_BS_USD = 36.50; 
 
   const generateAuditHash = (data: string) => {
     const str = data + Date.now().toString() + Math.random().toString();
@@ -105,7 +105,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchMasterData();
-    const channel = supabase.channel('valkyron-erp-v8-7')
+    const channel = supabase.channel('valkyron-erp-v8-6-1')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' }, fetchMasterData)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_por_cobrar' }, fetchMasterData)
@@ -113,13 +113,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     return () => { supabase.removeChannel(channel); };
   }, [fetchMasterData]);
 
-  // KPIs Globales (Sólo calculan USD para las tarjetas de arriba)
-  const totalIncomesUSD = useMemo(() => transactions.filter(t => t.payment_method !== 'BS' && (t.type === 'INCOME' || t.type === 'RECEIVABLE') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
-  const totalCashOutUSD = useMemo(() => transactions.filter(t => t.payment_method !== 'BS' && (t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
+  const totalIncomes = useMemo(() => transactions.filter(t => (t.type === 'INCOME' || t.type === 'RECEIVABLE') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
+  const totalCashOut = useMemo(() => transactions.filter(t => (t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
   const instructorDebt = useMemo(() => transactions.filter(t => t.category === 'Nomina' && t.status === 'PENDING').reduce((acc, t) => acc + t.amount, 0), [transactions]);
+  const inventoryValue = inventory.reduce((acc, item) => acc + (item.quantity * (item.unitPrice || 0)), 0);
   const totalReceivables = useMemo(() => receivables.reduce((acc, r) => acc + (Number(r.monto_pendiente) || 0), 0), [receivables]);
 
-  // CÁLCULOS BI-MONEDA PUROS (SEPARADOS) PARA EL ARQUEO
+  // CÁLCULOS BI-MONEDA PARA EL ARQUEO 
   const theoreticalBalanceUSD = useMemo(() => {
     const usdMethods = ['USDT', 'ZELLE', 'CASH'];
     const usdTx = transactions.filter(t => usdMethods.includes(t.payment_method) && t.status === 'PAID');
@@ -130,9 +130,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   const theoreticalBalanceBS = useMemo(() => {
     const bsTx = transactions.filter(t => t.payment_method === 'BS' && t.status === 'PAID');
-    const inBS = bsTx.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
-    const outBS = bsTx.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
-    return inBS - outBS; // Cálculo puro en Bolívares sin conversiones
+    const inBS_USD = bsTx.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
+    const outBS_USD = bsTx.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
+    return (inBS_USD - outBS_USD) * TASA_BS_USD;
   }, [transactions]);
 
   // Función para calcular balance por bóveda específica
@@ -144,13 +144,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   const handleExportCSV = () => {
-    const headers = ['Fecha', 'Referencia', 'Entidad / Concepto', 'Metodo Pago', 'Monto Original', 'Tipo', 'Estatus'];
+    const headers = ['Fecha', 'Referencia', 'Entidad / Concepto', 'Metodo Pago', 'Monto ($)', 'Monto Original (Si BS)', 'Tipo', 'Estatus'];
     const rows = transactions.map(t => [
       formatDate(t.issueDate),
       t.invoiceNumber,
       `"${t.entityName}"`,
       t.payment_method || 'N/A',
-      t.amount, // El monto se exporta tal cual está (BS o USD)
+      t.amount,
+      t.payment_method === 'BS' ? (t.amount * TASA_BS_USD).toFixed(2) : t.amount, 
       t.type,
       t.status
     ]);
@@ -189,18 +190,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const numericAmount = parseFloat(amount);
     if (isNaN(numericAmount) || numericAmount <= 0) return;
     setIsSyncing(true);
-    
-    // EVOLUCIÓN v8.7: Guardamos el monto tal cual. Nada de divisiones por TASA_BS_USD.
-    const finalAmount = numericAmount; 
-    
+    const equivalentUSD = currency === 'BS' ? numericAmount / TASA_BS_USD : numericAmount;
     const capitanObj = capitanes.find(c => c.id === selectedCapitanId);
-    const hash = generateAuditHash(`${type}-${finalAmount}`);
+    const hash = generateAuditHash(`${type}-${equivalentUSD}`);
     
     const { error } = await supabase.from('transacciones_finanzas').insert([{
       type: type, 
       entity_name: type === 'INSTRUCTOR_PAY' ? `PAGO: ${capitanObj?.nombre}` : `FLUJO ${currency}`,
-      amount: finalAmount, 
-      invoice_number: `TX-${hash.substring(0,8)}`,
+      amount: equivalentUSD, invoice_number: `TX-${hash.substring(0,8)}`,
       description: reference || 'REGISTRO MANUAL', status: 'PAID',
       category: type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
       payment_method: currency,
@@ -208,7 +205,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }]);
 
     if (!error) {
-      setGlobalFinance(prev => ({ ...prev, [currency]: Number(((prev[currency] || 0) + (type === 'INCOME' ? finalAmount : -finalAmount)).toFixed(2)) }));
+      setGlobalFinance(prev => ({ ...prev, [currency]: Number(((prev[currency] || 0) + (type === 'INCOME' ? numericAmount : -numericAmount)).toFixed(2)) }));
       setAmount(''); setReference(''); fetchMasterData();
     }
     setIsSyncing(false);
@@ -243,7 +240,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       invoice_number: `INV-${hash.substring(0,8)}`, description: `[CXP-MANUAL] ${newCxP.descripcion.toUpperCase()}`,
       issue_date: new Date(newCxP.fecha).toISOString(),
       status: 'PENDING', category: newCxP.categoria,
-      payment_method: 'CASH' // Las CxP por defecto se calculan en base USD (CASH)
+      payment_method: 'CASH'
     }]);
     if (!error) { fetchMasterData(); setIsAddingCxP(false); }
     setSubmitting(false);
@@ -318,7 +315,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_0_30px_rgba(225,173,1,0.3)]">
               <Cpu className="text-black h-8 w-8 animate-pulse" />
             </div>
-            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.7</span>
+            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.6.1</span>
           </h1>
           <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.4em] mt-3 ml-16">Valkyron Intelligence // Gestión de Activos Estratégicos</p>
         </div>
@@ -333,10 +330,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 text-white">
-        <StatCard label="Ingresos Totales (USD)" value={`$${totalIncomesUSD.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-emerald-500/20" icon={<ArrowUpCircle className="text-emerald-500" />} />
-        <StatCard label="CxC Alumnos (USD)" value={`$${totalReceivables.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-yellow-500/20" icon={<TrendingUp className="text-yellow-500" />} />
-        <StatCard label="Deuda Capitanes (USD)" value={`$${instructorDebt.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
-        <StatCard label="Egresos Totales (USD)" value={`$${totalCashOutUSD.toLocaleString(undefined, {minimumFractionDigits: 2})}`} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
+        <StatCard label="Ingresos Totales (Global USD)" value={totalIncomes} color="from-emerald-500/20" icon={<ArrowUpCircle className="text-emerald-500" />} />
+        <StatCard label="CxC Alumnos" value={totalReceivables} color="from-yellow-500/20" icon={<TrendingUp className="text-yellow-500" />} />
+        <StatCard label="Deuda Capitanes" value={instructorDebt} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
+        <StatCard label="Egresos Totales (Global USD)" value={totalCashOut} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
       </div>
 
       {/* --- MÓDULO BÓVEDAS --- */}
@@ -357,7 +354,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                       </div>
                       <span className="font-mono text-xl font-black italic">
                         {curr === 'BS' ? 'Bs ' : '$'}
-                        {getVaultBalance(curr).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                        {curr === 'BS' 
+                           ? (getVaultBalance(curr) * TASA_BS_USD).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+                           : getVaultBalance(curr).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+                        }
                       </span>
                    </button>
                 ))}
@@ -384,7 +384,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <span className={`font-black text-xl italic block ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
                           {t.type === 'INCOME' || t.type === 'RECEIVABLE' ? '+' : '-'}
                           {selectedVault === 'BS' ? 'Bs ' : '$'}
-                          {t.amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                          {selectedVault === 'BS' 
+                             ? (t.amount * TASA_BS_USD).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) 
+                             : t.amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+                          }
                         </span>
                         <span className="text-[7px] text-zinc-600 font-bold uppercase">{t.type}</span>
                       </div>
@@ -466,8 +469,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <span className="text-[7px] text-zinc-500 font-bold uppercase">{t.payment_method || '---'}</span>
                       </td>
                       <td className={`bg-white/[0.02] group-hover:bg-white/[0.05] p-5 border-y border-white/5 text-right font-black text-xl italic ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {/* QUIRÚRGICO: Renderizado inteligente por moneda (BS vs USD) */}
+                        {t.type === 'INCOME' || t.type === 'RECEIVABLE' ? '+' : '-'}
                         {t.payment_method === 'BS' ? 'Bs ' : '$'}
-                        {t.amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                        {t.payment_method === 'BS' 
+                           ? (t.amount * TASA_BS_USD).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+                           : t.amount.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})
+                        }
                       </td>
                       <td className="bg-white/[0.02] group-hover:bg-white/[0.05] p-5 rounded-r-3xl border-y border-r border-white/5 text-center flex items-center justify-center gap-4">
                         {t.status === 'PAID' ? <CheckCircle2 className="h-5 w-5 text-emerald-500/50" /> : <Loader2 className="h-5 w-5 text-[#E1AD01] animate-spin" />}
