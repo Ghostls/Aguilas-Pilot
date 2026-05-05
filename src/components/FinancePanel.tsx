@@ -1,5 +1,5 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.6.1 - OPERACIÓN BI-MONEDA
-// Evolución: Libro Mayor Inteligente (BS y $ visualmente segregados en visor global)
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v8.6.2 - OPERACIÓN BI-MONEDA
+// Evolución: Libro Mayor Inteligente con Precisión Quirúrgica (MIA Core)
 // REGLA DE ORO: CERO OMISIONES. IDIOMA ESPAÑOL. GRADO MILITAR.
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -113,34 +113,50 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     return () => { supabase.removeChannel(channel); };
   }, [fetchMasterData]);
 
-  const totalIncomes = useMemo(() => transactions.filter(t => (t.type === 'INCOME' || t.type === 'RECEIVABLE') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
-  const totalCashOut = useMemo(() => transactions.filter(t => (t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY') && t.status === 'PAID').reduce((acc, t) => acc + t.amount, 0), [transactions]);
-  const instructorDebt = useMemo(() => transactions.filter(t => t.category === 'Nomina' && t.status === 'PENDING').reduce((acc, t) => acc + t.amount, 0), [transactions]);
+  // --- CORRECCIÓN DE SUMATORIA GLOBAL (GRADO MILITAR) ---
+  const totalIncomes = useMemo(() => 
+    transactions
+      .filter(t => (t.type === 'INCOME' || t.type === 'RECEIVABLE') && t.status === 'PAID')
+      .reduce((acc, t) => acc + (Number(t.amount) || 0), 0)
+  , [transactions]);
+
+  const totalCashOut = useMemo(() => 
+    transactions
+      .filter(t => (t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY') && t.status === 'PAID')
+      .reduce((acc, t) => acc + (Number(t.amount) || 0), 0)
+  , [transactions]);
+
+  const instructorDebt = useMemo(() => transactions.filter(t => t.category === 'Nomina' && t.status === 'PENDING').reduce((acc, t) => acc + (Number(t.amount) || 0), 0), [transactions]);
   const inventoryValue = inventory.reduce((acc, item) => acc + (item.quantity * (item.unitPrice || 0)), 0);
   const totalReceivables = useMemo(() => receivables.reduce((acc, r) => acc + (Number(r.monto_pendiente) || 0), 0), [receivables]);
 
-  // CÁLCULOS BI-MONEDA PARA EL ARQUEO 
+  // --- CÁLCULOS QUIRÚRGICOS DE BÓVEDAS ---
   const theoreticalBalanceUSD = useMemo(() => {
     const usdMethods = ['USDT', 'ZELLE', 'CASH'];
-    const usdTx = transactions.filter(t => usdMethods.includes(t.payment_method) && t.status === 'PAID');
-    const inUSD = usdTx.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
-    const outUSD = usdTx.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
-    return inUSD - outUSD;
+    return transactions
+      .filter(t => usdMethods.includes(t.payment_method) && t.status === 'PAID')
+      .reduce((acc, t) => {
+        const isPlus = t.type === 'INCOME' || t.type === 'RECEIVABLE';
+        return isPlus ? acc + t.amount : acc - t.amount;
+      }, 0);
   }, [transactions]);
 
   const theoreticalBalanceBS = useMemo(() => {
-    const bsTx = transactions.filter(t => t.payment_method === 'BS' && t.status === 'PAID');
-    const inBS_USD = bsTx.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
-    const outBS_USD = bsTx.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
-    return (inBS_USD - outBS_USD) * TASA_BS_USD;
+    return transactions
+      .filter(t => t.payment_method === 'BS' && t.status === 'PAID')
+      .reduce((acc, t) => {
+        const isPlus = t.type === 'INCOME' || t.type === 'RECEIVABLE';
+        const amountInBS = t.amount * TASA_BS_USD;
+        return isPlus ? acc + amountInBS : acc - amountInBS;
+      }, 0);
   }, [transactions]);
 
-  // Función para calcular balance por bóveda específica
   const getVaultBalance = (method: PaymentMethod) => {
     const vaultTxs = transactions.filter(t => t.payment_method === method && t.status === 'PAID');
-    const vaultIn = vaultTxs.filter(t => t.type === 'INCOME' || t.type === 'RECEIVABLE').reduce((acc, t) => acc + t.amount, 0);
-    const vaultOut = vaultTxs.filter(t => t.type === 'EXPENSE' || t.type === 'PAYABLE' || t.type === 'INSTRUCTOR_PAY').reduce((acc, t) => acc + t.amount, 0);
-    return vaultIn - vaultOut;
+    return vaultTxs.reduce((acc, t) => {
+      const isPlus = t.type === 'INCOME' || t.type === 'RECEIVABLE';
+      return isPlus ? acc + t.amount : acc - t.amount;
+    }, 0);
   };
 
   const handleExportCSV = () => {
@@ -189,24 +205,37 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     e.preventDefault();
     const numericAmount = parseFloat(amount);
     if (isNaN(numericAmount) || numericAmount <= 0) return;
+    
     setIsSyncing(true);
-    const equivalentUSD = currency === 'BS' ? numericAmount / TASA_BS_USD : numericAmount;
+    
+    // Normalización con redondeo de precisión para evitar errores de punto flotante de JS
+    const equivalentUSD = currency === 'BS' 
+      ? Math.round((numericAmount / TASA_BS_USD) * 100) / 100 
+      : numericAmount;
+
     const capitanObj = capitanes.find(c => c.id === selectedCapitanId);
     const hash = generateAuditHash(`${type}-${equivalentUSD}`);
     
     const { error } = await supabase.from('transacciones_finanzas').insert([{
       type: type, 
       entity_name: type === 'INSTRUCTOR_PAY' ? `PAGO: ${capitanObj?.nombre}` : `FLUJO ${currency}`,
-      amount: equivalentUSD, invoice_number: `TX-${hash.substring(0,8)}`,
-      description: reference || 'REGISTRO MANUAL', status: 'PAID',
+      amount: equivalentUSD, 
+      invoice_number: `TX-${hash.substring(0,8)}`,
+      description: reference || 'REGISTRO MANUAL', 
+      status: 'PAID',
       category: type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
       payment_method: currency,
       issue_date: new Date(transactionDate).toISOString()
     }]);
 
     if (!error) {
-      setGlobalFinance(prev => ({ ...prev, [currency]: Number(((prev[currency] || 0) + (type === 'INCOME' ? numericAmount : -numericAmount)).toFixed(2)) }));
+      setGlobalFinance(prev => ({ 
+        ...prev, 
+        [currency]: Number(((prev[currency] || 0) + (type === 'INCOME' ? numericAmount : -numericAmount)).toFixed(2)) 
+      }));
       setAmount(''); setReference(''); fetchMasterData();
+    } else {
+      alert("Error de Sincronización: " + error.message);
     }
     setIsSyncing(false);
   };
@@ -286,7 +315,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
     if (isNaN(physUSD) || isNaN(physBS)) return alert("Los montos físicos ingresados son inválidos.");
     
-    // Verificación militar: Rango de discrepancia menor a 1 céntimo
     const diffUSD = Math.abs(theoreticalBalanceUSD - physUSD);
     const diffBS = Math.abs(theoreticalBalanceBS - physBS);
 
@@ -315,7 +343,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_0_30px_rgba(225,173,1,0.3)]">
               <Cpu className="text-black h-8 w-8 animate-pulse" />
             </div>
-            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.6.1</span>
+            Centro Financiero <span className="text-[#E1AD01] text-lg font-mono tracking-[0.5em] ml-2">v8.6.2</span>
           </h1>
           <p className="text-zinc-500 text-[9px] font-black uppercase tracking-[0.4em] mt-3 ml-16">Valkyron Intelligence // Gestión de Activos Estratégicos</p>
         </div>
@@ -330,10 +358,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 text-white">
-        <StatCard label="Ingresos Totales (Global USD)" value={totalIncomes} color="from-emerald-500/20" icon={<ArrowUpCircle className="text-emerald-500" />} />
-        <StatCard label="CxC Alumnos" value={totalReceivables} color="from-yellow-500/20" icon={<TrendingUp className="text-yellow-500" />} />
-        <StatCard label="Deuda Capitanes" value={instructorDebt} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
-        <StatCard label="Egresos Totales (Global USD)" value={totalCashOut} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
+        <StatCard label="Ingresos Totales (Global USD)" value={totalIncomes.toLocaleString(undefined, {minimumFractionDigits: 2})} color="from-emerald-500/20" icon={<ArrowUpCircle className="text-emerald-500" />} />
+        <StatCard label="CxC Alumnos" value={totalReceivables.toLocaleString(undefined, {minimumFractionDigits: 2})} color="from-yellow-500/20" icon={<TrendingUp className="text-yellow-500" />} />
+        <StatCard label="Deuda Capitanes" value={instructorDebt.toLocaleString(undefined, {minimumFractionDigits: 2})} color="from-blue-500/20" icon={<UserCheck className="text-blue-500" />} />
+        <StatCard label="Egresos Totales (Global USD)" value={totalCashOut.toLocaleString(undefined, {minimumFractionDigits: 2})} color="from-red-500/20" icon={<ArrowDownCircle className="text-red-500" />} />
       </div>
 
       {/* --- MÓDULO BÓVEDAS --- */}
@@ -469,7 +497,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <span className="text-[7px] text-zinc-500 font-bold uppercase">{t.payment_method || '---'}</span>
                       </td>
                       <td className={`bg-white/[0.02] group-hover:bg-white/[0.05] p-5 border-y border-white/5 text-right font-black text-xl italic ${t.type === 'INCOME' || t.type === 'RECEIVABLE' ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {/* QUIRÚRGICO: Renderizado inteligente por moneda (BS vs USD) */}
                         {t.type === 'INCOME' || t.type === 'RECEIVABLE' ? '+' : '-'}
                         {t.payment_method === 'BS' ? 'Bs ' : '$'}
                         {t.payment_method === 'BS' 
@@ -602,17 +629,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <h3 className="font-black text-[14px] uppercase tracking-[0.4em] mb-10 italic text-center">Arqueo & Cierre Mensual Bi-Moneda</h3>
             
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              {/* BÓVEDA USD */}
               <div className="space-y-6">
                 <div className="bg-emerald-900/20 border border-emerald-500/20 p-6 rounded-3xl flex flex-col items-center">
-                  <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Teórico Dólares (USDT/ZELLE/CASH)</span>
+                  <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest mb-2">Teórico Dólares (Global)</span>
                   <span className="text-3xl font-black font-mono text-white">${theoreticalBalanceUSD.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>
                 </div>
                 <p className="text-[9px] text-zinc-500 font-bold uppercase px-2 text-center">Físico Auditado (USD):</p>
                 <input type="number" step="any" value={physicalBalanceUSD} onChange={(e) => setPhysicalBalanceUSD(e.target.value)} className="w-full bg-white/5 border border-emerald-500/30 p-6 rounded-3xl text-3xl font-black outline-none text-center" placeholder="0.00" />
               </div>
 
-              {/* BÓVEDA BS */}
               <div className="space-y-6">
                 <div className="bg-blue-900/20 border border-blue-500/20 p-6 rounded-3xl flex flex-col items-center">
                   <span className="text-[10px] font-black text-blue-500 uppercase tracking-widest mb-2">Teórico Bolívares (BS)</span>
