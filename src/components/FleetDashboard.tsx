@@ -1,10 +1,8 @@
 // src/components/FleetDashboard.tsx
-// VALKYRON OS v5.0 — Evolución: Si registro = maintenance → crear orden_trabajo automática
-// FIX: select options visibles — bg/color forzados
-// NEW: Modal de razón cuando estado inicial = maintenance
-// REGLA DE ORO: CERO OMISIONES.
+// VALKYRON OS v5.1 — FIX CRÍTICO: Canal Realtime eliminado (lo maneja Index.tsx)
+// REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { Aircraft, HangarLocation } from '@/Types/Maintenance';
 import AircraftCard from './AircraftCard';
 import AircraftDetail from './AircraftDetail';
@@ -24,7 +22,6 @@ const normalizeAircraftStatus = (rawStatus: string): 'operational' | 'maintenanc
   return 'operational';
 };
 
-// FIX: select con opciones siempre visibles
 const SELECT_CLS = `w-full bg-[#0d0d0d] border border-white/10 rounded-xl p-4 text-white text-[10px]
   font-black outline-none focus:border-[#E1AD01] transition-all
   [&>option]:bg-[#0d0d0d] [&>option]:text-white`;
@@ -49,13 +46,13 @@ const FleetDashboard = ({
   setFleetData,
 }: {
   fleetData: Aircraft[];
-  setFleetData: any;
+  setFleetData: React.Dispatch<React.SetStateAction<Aircraft[]>>;
 }) => {
   const [selectedAircraft, setSelectedAircraft] = useState<Aircraft | null>(null);
   const [isModalOpen, setIsModalOpen]           = useState(false);
-  const [isRazonOpen, setIsRazonOpen]           = useState(false);  // Modal razón de hangar
+  const [isRazonOpen, setIsRazonOpen]           = useState(false);
   const [loading, setLoading]                   = useState(false);
-  const [pendingAircraft, setPendingAircraft]   = useState<any>(null); // Datos pendientes pre-confirmación
+  const [pendingAircraft, setPendingAircraft]   = useState<any>(null);
 
   const [newAircraft, setNewAircraft] = useState({
     tailNumber:  '',
@@ -65,7 +62,6 @@ const FleetDashboard = ({
     sede:        'LARA' as 'LARA' | 'MATURIN',
   });
 
-  // Estado del form de razón de hangar
   const [razonForm, setRazonForm] = useState({
     razon:       '',
     razonCustom: '',
@@ -77,67 +73,20 @@ const FleetDashboard = ({
     ? razonForm.razonCustom.trim()
     : razonForm.razon;
 
-  // ── REALTIME ─────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const channel = supabase
-      .channel('schema-db-changes')
-      .on('postgres_changes' as any, { event: '*', schema: 'public', table: 'flota_aviones' },
-        (payload: any) => {
-          const updatedRow = payload.new;
-          setFleetData((currentFleet: Aircraft[]) => {
-            if (payload.eventType === 'INSERT') {
-              const mappedNew: Aircraft = {
-                id:                   updatedRow.id,
-                tailNumber:           updatedRow.matricula,
-                model:                updatedRow.modelo,
-                status:               normalizeAircraftStatus(updatedRow.estado),
-                location:             updatedRow.sede || 'LARA',
-                hours_vuelo_totales:  updatedRow.horas_vuelo_totales,
-                components:           updatedRow.componentes || [],
-              };
-              const exists = currentFleet.some(ac => ac.id === mappedNew.id);
-              return exists ? currentFleet : [...currentFleet, mappedNew];
-            }
-            if (payload.eventType === 'UPDATE') {
-              return currentFleet.map(ac =>
-                ac.id === updatedRow.id
-                  ? {
-                      ...ac,
-                      status:               normalizeAircraftStatus(updatedRow.estado),
-                      hours_vuelo_totales:  updatedRow.horas_vuelo_totales,
-                      location:             updatedRow.sede || ac.location,
-                    }
-                  : ac
-              );
-            }
-            if (payload.eventType === 'DELETE') {
-              return currentFleet.filter(ac => ac.id !== payload.old.id);
-            }
-            return currentFleet;
-          });
-        }
-      )
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, [setFleetData]);
-
   // ── PASO 1: Submit del form principal ─────────────────────────────────────
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    // Si el estado es maintenance → abrir modal de razón antes de insertar
     if (newAircraft.status === 'maintenance') {
       setPendingAircraft({ ...newAircraft });
       setIsModalOpen(false);
       setRazonForm({ razon: '', razonCustom: '', mecanico: '', descripcion: '' });
       setIsRazonOpen(true);
     } else {
-      // Operativa o grounded → insertar directamente
       insertAircraft({ ...newAircraft }, null);
     }
   };
 
-  // ── PASO 2: Confirmar razón → insertar aeronave + orden de trabajo ────────
+  // ── PASO 2: Confirmar razón → insertar aeronave + orden de trabajo ─────────
   const handleRazonConfirm = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!razonFinal) {
@@ -155,6 +104,8 @@ const FleetDashboard = ({
   };
 
   // ── INSERT CENTRAL ────────────────────────────────────────────────────────
+  // NOTA: El Realtime en Index.tsx escucha flota_aviones y llama syncFleet()
+  // automáticamente — NO necesitamos actualizar fleetData manualmente aquí.
   const insertAircraft = async (
     ac: typeof newAircraft,
     hangarData: { razon: string; mecanico: string; descripcion: string } | null
@@ -162,11 +113,11 @@ const FleetDashboard = ({
     setLoading(true);
 
     const dbEntry = {
-      matricula:          ac.tailNumber.toUpperCase(),
-      modelo:             ac.model.toUpperCase(),
-      estado:             ac.status,
+      matricula:           ac.tailNumber.toUpperCase(),
+      modelo:              ac.model.toUpperCase(),
+      estado:              ac.status,       // siempre inglés: 'operational' | 'maintenance' | 'grounded'
       horas_vuelo_totales: ac.totalHours,
-      sede:               ac.sede,
+      sede:                ac.sede,
     };
 
     const { data, error } = await supabase
@@ -178,18 +129,17 @@ const FleetDashboard = ({
       return;
     }
 
-    // Si el estado es maintenance → crear orden de trabajo automáticamente
-    // para que aparezca de inmediato en ControlHub
+    // Si maintenance → crear orden de trabajo automáticamente en ControlHub
     if (ac.status === 'maintenance' && hangarData && data?.length) {
       const { error: ordenError } = await supabase
         .from('ordenes_trabajo').insert([{
-          matricula:        ac.tailNumber.toUpperCase(),
-          modelo:           ac.model.toUpperCase(),
+          matricula:         ac.tailNumber.toUpperCase(),
+          modelo:            ac.model.toUpperCase(),
           descripcion_tarea: hangarData.descripcion || hangarData.razon,
-          sede:             ac.sede === 'LARA' ? 'Lara' : 'Maturín',
-          nombre_mecanico:  hangarData.mecanico || 'POR ASIGNAR',
-          estado:           'In Progress',
-          observaciones:    `RAZÓN DE ENTRADA: ${hangarData.razon.toUpperCase()} | REGISTRO INICIAL DE FLOTA`,
+          sede:              ac.sede === 'LARA' ? 'Lara' : 'Maturín',
+          nombre_mecanico:   hangarData.mecanico || 'POR ASIGNAR',
+          estado:            'In Progress',
+          observaciones:     `RAZÓN DE ENTRADA: ${hangarData.razon.toUpperCase()} | REGISTRO INICIAL DE FLOTA`,
         }]);
 
       if (ordenError) {
@@ -197,7 +147,7 @@ const FleetDashboard = ({
       }
     }
 
-    // Reset form
+    // Reset form — el Realtime de Index.tsx actualizará fleetData automáticamente
     setIsModalOpen(false);
     setNewAircraft({ tailNumber: '', model: '', totalHours: 0, status: 'operational', sede: 'LARA' });
     setLoading(false);
@@ -205,13 +155,19 @@ const FleetDashboard = ({
 
   const handleCancelRazon = () => {
     setIsRazonOpen(false);
-    setIsModalOpen(true); // Volver al form sin perder datos
+    setIsModalOpen(true);
   };
 
   // ── RENDER ────────────────────────────────────────────────────────────────
   if (selectedAircraft) {
     return <AircraftDetail aircraft={selectedAircraft} onBack={() => setSelectedAircraft(null)} />;
   }
+
+  // Mapear status para AircraftCard — normalizar valores que vengan de DB en español
+  const normalizedFleet = fleetData.map(ac => ({
+    ...ac,
+    status: normalizeAircraftStatus(ac.status as string),
+  }));
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500 text-left font-sans text-white">
@@ -234,7 +190,7 @@ const FleetDashboard = ({
 
       {/* Grid de tarjetas */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {fleetData.map(ac => (
+        {normalizedFleet.map(ac => (
           <AircraftCard key={ac.id} aircraft={ac} onSelect={setSelectedAircraft} />
         ))}
       </div>
@@ -295,7 +251,6 @@ const FleetDashboard = ({
                 />
               </div>
 
-              {/* Estatus — con indicador visual si elige maintenance */}
               <div className="space-y-2">
                 <label className="text-[9px] font-black text-[#E1AD01] uppercase tracking-widest block">
                   Estatus Inicial
@@ -307,7 +262,6 @@ const FleetDashboard = ({
                   <option value="grounded">EN TIERRA (AOG)</option>
                 </select>
 
-                {/* Aviso si elige maintenance */}
                 {newAircraft.status === 'maintenance' && (
                   <div className="flex items-start gap-2 bg-[#E1AD01]/5 border border-[#E1AD01]/20
                                   rounded-xl px-3 py-2.5 mt-2">
@@ -351,7 +305,6 @@ const FleetDashboard = ({
 
       {/* ════════════════════════════════════════════════════════════
           MODAL PASO 2 — RAZÓN DE ENTRADA A HANGAR
-          Solo aparece cuando status = maintenance
       ════════════════════════════════════════════════════════════ */}
       {isRazonOpen && pendingAircraft && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/98
@@ -359,7 +312,6 @@ const FleetDashboard = ({
           <div className="bg-[#0a0a0a] border border-amber-500/40 w-full max-w-sm rounded-3xl
                           overflow-hidden shadow-[0_0_60px_rgba(225,173,1,0.15)]">
 
-            {/* Header */}
             <div className="bg-amber-500/10 border-b border-amber-500/20 p-5">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-xl bg-[#E1AD01] flex items-center justify-center shrink-0">
@@ -378,7 +330,6 @@ const FleetDashboard = ({
 
             <form onSubmit={handleRazonConfirm} className="p-6 space-y-4 font-mono">
 
-              {/* Razón predefinida */}
               <div className="space-y-1.5">
                 <label className="text-[9px] font-black text-[#E1AD01] uppercase tracking-widest block">
                   Motivo *
@@ -392,7 +343,6 @@ const FleetDashboard = ({
                 </select>
               </div>
 
-              {/* Custom si elige Otra */}
               {razonForm.razon === 'Otra (especificar)' && (
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-[#E1AD01] uppercase tracking-widest block">
@@ -408,7 +358,6 @@ const FleetDashboard = ({
                 </div>
               )}
 
-              {/* Descripción técnica */}
               <div className="space-y-1.5">
                 <label className="text-[9px] font-black text-slate-500 uppercase tracking-widest block">
                   Descripción Técnica
@@ -423,7 +372,6 @@ const FleetDashboard = ({
                 />
               </div>
 
-              {/* Mecánico */}
               <div className="space-y-1.5">
                 <label className="text-[9px] font-black text-slate-500 uppercase tracking-widest block">
                   Técnico Asignado
@@ -438,7 +386,6 @@ const FleetDashboard = ({
                 />
               </div>
 
-              {/* Advertencia */}
               <div className="flex items-start gap-2 bg-red-500/5 border border-red-500/15 rounded-xl p-3">
                 <AlertCircle className="h-3.5 w-3.5 text-red-400 shrink-0 mt-0.5" />
                 <p className="text-[9px] text-red-400/80 leading-relaxed">
