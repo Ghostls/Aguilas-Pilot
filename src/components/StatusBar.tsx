@@ -1,6 +1,7 @@
 // src/components/StatusBar.tsx
 // NÚCLEO DE IDENTIDAD VISUAL - ÁGUILAS PILOT
-// Evolución: Integración de Isologotipo y Control de Alta de Personal (Solo CEO)
+// FIX v2.1: .maybeSingle() — evita 406 cuando la fila no existe en perfiles
+// Fallback a user_metadata si perfiles no tiene la fila aún
 import { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import { useNavigate } from 'react-router-dom';
@@ -9,7 +10,6 @@ import {
   MapPin, User, LogOut, Activity, UserPlus 
 } from 'lucide-react';
 
-// Añadimos la prop onOpenRegister para disparar el modal desde Index.tsx
 const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -19,26 +19,40 @@ const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
   useEffect(() => {
     const fetchUserIdentity = async () => {
       const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        const { data } = await supabase
-          .from('perfiles')
-          .select('nombre_completo, rol, sede')
-          .eq('id', user.id)
-          .single();
-        if (data) setProfile(data);
+      if (!user) return;
+
+      // FIX: .maybeSingle() — devuelve null sin lanzar 406 si la fila no existe
+      const { data } = await supabase
+        .from('perfiles')
+        .select('nombre_completo, rol, sede')
+        .eq('id', user.id)
+        .maybeSingle();
+
+      if (data) {
+        setProfile(data);
+      } else {
+        // Fallback a user_metadata cuando perfiles aún no tiene la fila
+        const meta = user.user_metadata;
+        if (meta) {
+          setProfile({
+            nombre_completo: meta.nombre_completo || user.email || 'Operador',
+            rol:             (meta.rol || meta.role || 'MECANICO').toString().toUpperCase(),
+            sede:            meta.sede || 'LARA',
+          });
+        }
       }
     };
 
     fetchUserIdentity();
 
-    const handleOnline = () => setIsOnline(true);
+    const handleOnline  = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
-    window.addEventListener('online', handleOnline);
+    window.addEventListener('online',  handleOnline);
     window.addEventListener('offline', handleOffline);
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
 
     return () => {
-      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('online',  handleOnline);
       window.removeEventListener('offline', handleOffline);
       clearInterval(timer);
     };
@@ -52,7 +66,7 @@ const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
   return (
     <header className="status-bar flex items-center justify-between px-6 py-2 bg-black/40 backdrop-blur-md border-b border-white/5 text-sm font-medium z-[100] font-mono">
       
-      {/* SECCIÓN IZQUIERDA: IDENTIDAD CORPORATIVA ÁGUILAS PILOT */}
+      {/* SECCIÓN IZQUIERDA: IDENTIDAD CORPORATIVA */}
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-3">
           <img 
@@ -61,7 +75,7 @@ const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
             className="h-7 w-auto object-contain drop-shadow-[0_0_8px_rgba(255,255,255,0.15)]"
           />
           <span className="hidden sm:block text-[9px] text-[#E1AD01] font-black uppercase tracking-[0.4em] border-l border-white/10 pl-3">
-            OS v4.12
+            OS v4.17
           </span>
         </div>
         <div className="hidden md:flex items-center gap-3 text-[9px] text-slate-500 font-bold uppercase tracking-widest border-l border-white/10 pl-4">
@@ -86,21 +100,23 @@ const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
             </div>
             
             <div className={`px-3 py-1.5 rounded-full flex items-center gap-2 ${
-              profile.rol === 'CEO' ? 'bg-[#E1AD01] text-black shadow-[0_0_15px_rgba(225,173,1,0.3)]' : 'bg-white/10 text-white'
+              profile.rol === 'CEO'
+                ? 'bg-[#E1AD01] text-black shadow-[0_0_15px_rgba(225,173,1,0.3)]'
+                : 'bg-white/10 text-white'
             }`}>
               {profile.rol === 'CEO' ? <Shield className="h-3 w-3" /> : <User className="h-3 w-3" />}
               <span className="text-[8px] font-black uppercase tracking-[0.2em]">{profile.rol}</span>
             </div>
           </div>
         ) : (
-          <div className="h-8 w-32 bg-white/5 animate-pulse rounded-full border border-white/5"></div>
+          <div className="h-8 w-32 bg-white/5 animate-pulse rounded-full border border-white/5" />
         )}
       </div>
 
       {/* SECCIÓN DERECHA: STATUS, REGISTRO Y CIERRE */}
       <div className="flex items-center gap-5">
         
-        {/* PRIVILEGIO NIVEL CEO: ALTA DE PERSONAL */}
+        {/* PRIVILEGIO CEO: ALTA DE PERSONAL */}
         {profile?.rol === 'CEO' && (
           <button 
             onClick={onOpenRegister}

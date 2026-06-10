@@ -1,8 +1,7 @@
 // src/pages/Index.tsx
-// VALKYRON OS v4.16 — FIX: InventoryCheckout autónomo (sin prop parts)
-// FIX ROL: lectura robusta desde user_metadata + tabla perfiles
+// VALKYRON OS v4.17 — FIX CRÍTICO: .maybeSingle() en fetch de perfiles (evita 406)
+// FIX v4.16 preservado: InventoryCheckout autónomo
 // FIX REALTIME: canal único 'index-fleet-monitor'
-// FIX TYPESCRIPT: status cast correcto
 // Regla de Oro: Cero Omisiones. Grado Militar. Siempre evolución.
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -33,16 +32,16 @@ type TabKey =
   | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights';
 
 const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { key: 'home',        label: 'Inicio',      icon: Home          },
-  { key: 'captain-log', label: 'Mi Bitácora', icon: Award         },
-  { key: 'fleet',       label: 'Flota',       icon: Plane         },
-  { key: 'flights',     label: 'Vuelos',      icon: FileText      },
-  { key: 'inventory',   label: 'Stock',       icon: Package       },
-  { key: 'control-hub', label: 'Hangar',      icon: Wrench        },
+  { key: 'home',        label: 'Inicio',      icon: Home           },
+  { key: 'captain-log', label: 'Mi Bitácora', icon: Award          },
+  { key: 'fleet',       label: 'Flota',       icon: Plane          },
+  { key: 'flights',     label: 'Vuelos',      icon: FileText       },
+  { key: 'inventory',   label: 'Stock',       icon: Package        },
+  { key: 'control-hub', label: 'Hangar',      icon: Wrench         },
   { key: 'checkout',    label: 'Salidas',     icon: ClipboardCheck },
-  { key: 'fuel',        label: 'AVGAS',       icon: Fuel          },
-  { key: 'finance',     label: 'Dinero',      icon: DollarSign    },
-  { key: 'vendors',     label: 'Aliados',     icon: Truck         },
+  { key: 'fuel',        label: 'AVGAS',       icon: Fuel           },
+  { key: 'finance',     label: 'Dinero',      icon: DollarSign     },
+  { key: 'vendors',     label: 'Aliados',     icon: Truck          },
 ];
 
 // ─── NORMALIZACIÓN DE ESTADO DE AERONAVE ─────────────────────────────────────
@@ -58,6 +57,7 @@ const normalizeStatus = (raw: string): AircraftStatus => {
 };
 
 // ─── NORMALIZACIÓN DE ROL ─────────────────────────────────────────────────────
+// Prioridad: prop userRole → user_metadata → tabla perfiles → fallback MECANICO
 const resolveRol = (
   userRoleProp: string | undefined,
   metaRol:      string | undefined,
@@ -70,7 +70,7 @@ const resolveRol = (
   return 'MECANICO';
 };
 
-// ─── COMPONENTE ───────────────────────────────────────────────────────────────
+// ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   const [activeTab,        setActiveTab]        = useState<TabKey>('home');
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -81,7 +81,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   } | null>(null);
   const navigate = useNavigate();
 
-  // Fuente de verdad compartida entre módulos
+  // Fuentes de verdad compartidas entre módulos
   const [fleetData,        setFleetData]        = useState<Aircraft[]>([]);
   const [partsData,        setPartsData]        = useState<SparePart[]>([]);
   const [transactionsData, setTransactionsData] = useState<any[]>([]);
@@ -120,17 +120,26 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           const metaRol  = user.user_metadata?.rol  as string | undefined;
           const metaRole = user.user_metadata?.role as string | undefined;
 
+          // FIX v4.17: .maybeSingle() — devuelve null si la fila no existe
+          // .single() lanzaba HTTP 406 cuando el usuario no tenía fila en perfiles,
+          // rompiendo todo el bloque y dejando userProfile como null → rol = MECANICO
           const { data: profile } = await supabase
             .from('perfiles')
             .select('nombre_completo, sede, rol')
             .eq('id', user.id)
-            .single();
+            .maybeSingle();
 
           const rolResuelto = resolveRol(
             userRole,
             metaRol || metaRole,
             profile?.rol,
           );
+
+          console.log('[ÁGUILAS OS] Rol resuelto:', rolResuelto, {
+            prop:    userRole,
+            meta:    metaRol || metaRole,
+            perfil:  profile?.rol,
+          });
 
           setUserProfile({
             rol:             rolResuelto,
@@ -178,7 +187,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
         }
 
       } catch (err) {
-        console.error('Error Crítico Águilas Pilot:', err);
+        console.error('[ÁGUILAS OS] Error Crítico:', err);
       } finally {
         setLoading(false);
       }
@@ -186,7 +195,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 
     syncTerminalData();
 
-    // CANAL ÚNICO — FleetDashboard y App.tsx NO tienen canales propios
+    // CANAL ÚNICO — FleetDashboard y App.tsx NO deben tener canales propios para flota_aviones
     const fleetChannel = supabase
       .channel('index-fleet-monitor')
       .on('postgres_changes',
@@ -343,6 +352,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
               transactions={transactionsData}
               setTransactions={setTransactionsData}
               vendors={vendorsData}
+              userRole={userProfile?.rol}
             />
           )}
 
@@ -357,12 +367,9 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {/* FIX v4.16: InventoryCheckout es autónomo — consulta Supabase
-              directamente. No requiere prop 'parts'. */}
           {activeTab === 'checkout' && (
             <InventoryCheckout
-              onCheckoutSuccess={(pn, qty, aircraftId) => {
-                // Sincronizar partsData local tras despacho exitoso
+              onCheckoutSuccess={(pn, qty, _aircraftId) => {
                 setPartsData(prev =>
                   prev.map(p =>
                     p.partNumber.toUpperCase() === pn

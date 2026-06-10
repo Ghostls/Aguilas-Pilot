@@ -1,5 +1,6 @@
 // src/components/auth/Register.tsx
-// VALKYRON OS v2.0 — Alta de Personal Águilas Pilot
+// VALKYRON OS v2.1 — Alta de Personal Águilas Pilot
+// FIX CRÍTICO: Inserción directa en tabla `perfiles` post-signUp
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import { useState } from 'react';
@@ -13,10 +14,10 @@ type Rol  = 'CEO' | 'ADMIN' | 'MECANICO' | 'PILOTO';
 type Sede = 'Lara' | 'Maturín';
 
 const ROLES: { id: Rol; label: string; desc: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { id: 'MECANICO', label: 'Técnico MRO', desc: 'Hangar & Stock',    icon: Wrench   },
-  { id: 'PILOTO',   label: 'Piloto',      desc: 'Vuelos & AVGAS',   icon: Plane    },
-  { id: 'ADMIN',    label: 'Administrador', desc: 'Finanzas & Almacén', icon: Landmark },
-  { id: 'CEO',      label: 'CEO',         desc: 'Control Total',    icon: Shield   },
+  { id: 'MECANICO', label: 'Técnico MRO',    desc: 'Hangar & Stock',      icon: Wrench   },
+  { id: 'PILOTO',   label: 'Piloto',          desc: 'Vuelos & AVGAS',     icon: Plane    },
+  { id: 'ADMIN',    label: 'Administrador',   desc: 'Finanzas & Almacén', icon: Landmark },
+  { id: 'CEO',      label: 'CEO',             desc: 'Control Total',      icon: Shield   },
 ];
 
 const INPUT_CLS = `w-full bg-black/60 border border-white/10 p-4 rounded-2xl text-white text-xs
@@ -43,13 +44,14 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
     setLoading(true);
     setError('');
 
-    const { error: authError } = await supabase.auth.signUp({
+    // ── PASO 1: Crear usuario en Supabase Auth con metadata ─────────────────
+    const { data: authData, error: authError } = await supabase.auth.signUp({
       email:    formData.email,
       password: formData.password,
       options: {
         data: {
           nombre_completo: formData.nombre.toUpperCase(),
-          rol:             formData.rol,
+          rol:             formData.rol,        // ← guardado en user_metadata
           sede:            formData.sede,
         },
       },
@@ -57,10 +59,37 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
 
     if (authError) {
       setError(authError.message);
-    } else {
-      setSuccess(true);
-      setTimeout(() => onClose(), 2200);
+      setLoading(false);
+      return;
     }
+
+    // ── PASO 2: Insertar en tabla `perfiles` con el rol correcto ────────────
+    // CRÍTICO: user_metadata puede no estar disponible en el primer login
+    // La tabla `perfiles` es la fuente de verdad para el rol
+    const userId = authData.user?.id;
+    if (userId) {
+      const { error: profileError } = await supabase
+        .from('perfiles')
+        .upsert({
+          id:              userId,
+          nombre_completo: formData.nombre.toUpperCase(),
+          rol:             formData.rol,   // ← fuente de verdad
+          sede:            formData.sede,
+          email:           formData.email.toLowerCase(),
+        }, { onConflict: 'id' });
+
+      if (profileError) {
+        // No bloqueamos el flujo — el usuario se creó, solo logueamos el error
+        console.error('[REGISTER] Error insertando perfil:', profileError.message);
+        // Avisamos pero no falla el registro completo
+        setError(`Usuario creado pero hubo un error guardando el perfil: ${profileError.message}`);
+        setLoading(false);
+        return;
+      }
+    }
+
+    setSuccess(true);
+    setTimeout(() => onClose(), 2200);
     setLoading(false);
   };
 
@@ -132,7 +161,7 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
             </label>
             <div className="grid grid-cols-4 gap-2">
               {ROLES.map(rol => {
-                const Icon = rol.icon;
+                const Icon   = rol.icon;
                 const active = formData.rol === rol.id;
                 return (
                   <button key={rol.id} type="button"
@@ -151,8 +180,7 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
                       <p className={`text-[9px] font-black uppercase leading-none ${active ? 'text-black' : ''}`}>
                         {rol.label}
                       </p>
-                      <p className={`text-[7px] mt-1 font-bold leading-tight
-                                    ${active ? 'text-black/60' : 'text-slate-600'}`}>
+                      <p className={`text-[7px] mt-1 font-bold leading-tight ${active ? 'text-black/60' : 'text-slate-600'}`}>
                         {rol.desc}
                       </p>
                     </div>
