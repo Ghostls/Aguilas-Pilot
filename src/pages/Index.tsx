@@ -1,5 +1,6 @@
 // src/pages/Index.tsx
-// VALKYRON OS v4.15 — FIX ROL: lectura robusta desde user_metadata + tabla perfiles
+// VALKYRON OS v4.16 — FIX: InventoryCheckout autónomo (sin prop parts)
+// FIX ROL: lectura robusta desde user_metadata + tabla perfiles
 // FIX REALTIME: canal único 'index-fleet-monitor'
 // FIX TYPESCRIPT: status cast correcto
 // Regla de Oro: Cero Omisiones. Grado Militar. Siempre evolución.
@@ -32,16 +33,16 @@ type TabKey =
   | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights';
 
 const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { key: 'home',        label: 'Inicio',      icon: Home         },
-  { key: 'captain-log', label: 'Mi Bitácora', icon: Award        },
-  { key: 'fleet',       label: 'Flota',       icon: Plane        },
-  { key: 'flights',     label: 'Vuelos',      icon: FileText     },
-  { key: 'inventory',   label: 'Stock',       icon: Package      },
-  { key: 'control-hub', label: 'Hangar',      icon: Wrench       },
+  { key: 'home',        label: 'Inicio',      icon: Home          },
+  { key: 'captain-log', label: 'Mi Bitácora', icon: Award         },
+  { key: 'fleet',       label: 'Flota',       icon: Plane         },
+  { key: 'flights',     label: 'Vuelos',      icon: FileText      },
+  { key: 'inventory',   label: 'Stock',       icon: Package       },
+  { key: 'control-hub', label: 'Hangar',      icon: Wrench        },
   { key: 'checkout',    label: 'Salidas',     icon: ClipboardCheck },
-  { key: 'fuel',        label: 'AVGAS',       icon: Fuel         },
-  { key: 'finance',     label: 'Dinero',      icon: DollarSign   },
-  { key: 'vendors',     label: 'Aliados',     icon: Truck        },
+  { key: 'fuel',        label: 'AVGAS',       icon: Fuel          },
+  { key: 'finance',     label: 'Dinero',      icon: DollarSign    },
+  { key: 'vendors',     label: 'Aliados',     icon: Truck         },
 ];
 
 // ─── NORMALIZACIÓN DE ESTADO DE AERONAVE ─────────────────────────────────────
@@ -57,31 +58,30 @@ const normalizeStatus = (raw: string): AircraftStatus => {
 };
 
 // ─── NORMALIZACIÓN DE ROL ─────────────────────────────────────────────────────
-// Lee desde múltiples fuentes y garantiza un valor válido siempre
 const resolveRol = (
-  userRoleProp: string | undefined,   // viene de App.tsx → user_metadata
-  metaRol:      string | undefined,   // user_metadata.rol directo
-  perfilRol:    string | undefined,   // tabla perfiles.rol
+  userRoleProp: string | undefined,
+  metaRol:      string | undefined,
+  perfilRol:    string | undefined,
 ): string => {
   const candidates = [userRoleProp, metaRol, perfilRol];
   for (const c of candidates) {
     if (c && c.trim() !== '') return c.trim().toUpperCase();
   }
-  return 'MECANICO'; // fallback de seguridad
+  return 'MECANICO';
 };
 
 // ─── COMPONENTE ───────────────────────────────────────────────────────────────
 const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
-  const [activeTab,         setActiveTab]         = useState<TabKey>('home');
-  const [isMobileMenuOpen,  setIsMobileMenuOpen]  = useState(false);
-  const [loading,           setLoading]           = useState(true);
-  const [isRegisterOpen,    setIsRegisterOpen]    = useState(false);
-  const [userProfile,       setUserProfile]       = useState<{
+  const [activeTab,        setActiveTab]        = useState<TabKey>('home');
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [loading,          setLoading]          = useState(true);
+  const [isRegisterOpen,   setIsRegisterOpen]   = useState(false);
+  const [userProfile,      setUserProfile]      = useState<{
     rol: string; nombre_completo: string; sede: string;
   } | null>(null);
   const navigate = useNavigate();
 
-  // Fuente de verdad compartida entre FLOTA y HANGAR
+  // Fuente de verdad compartida entre módulos
   const [fleetData,        setFleetData]        = useState<Aircraft[]>([]);
   const [partsData,        setPartsData]        = useState<SparePart[]>([]);
   const [transactionsData, setTransactionsData] = useState<any[]>([]);
@@ -117,12 +117,8 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
         const { data: { user } } = await supabase.auth.getUser();
 
         if (user) {
-          // FIX v4.15: lectura de rol desde 3 fuentes en orden de prioridad
-          // 1. userRole prop (App.tsx → user_metadata al login)
-          // 2. user_metadata.rol en tiempo real (por si el token cambió)
-          // 3. tabla perfiles.rol (fallback DB)
-          const metaRol   = user.user_metadata?.rol as string | undefined;
-          const metaRole  = user.user_metadata?.role as string | undefined; // alias inglés
+          const metaRol  = user.user_metadata?.rol  as string | undefined;
+          const metaRole = user.user_metadata?.role as string | undefined;
 
           const { data: profile } = await supabase
             .from('perfiles')
@@ -159,10 +155,10 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             partNumber: p.numero_parte,
             name:       p.nombre,
             quantity:   p.cantidad,
-            minStock:   p.stock_minimo   || 0,
+            minStock:   p.stock_minimo    || 0,
             unitPrice:  p.precio_unitario || 0,
-            location:   p.ubicacion || 'LARA',
-            category:   p.categoria || 'General',
+            location:   p.ubicacion       || 'LARA',
+            category:   p.categoria       || 'General',
           })));
         }
 
@@ -254,32 +250,40 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
       <nav className="z-50 px-4 pt-4 sticky top-0">
         <div className="max-w-[1920px] mx-auto flex items-center justify-between lg:justify-center
                         bg-[#0a0a0a]/90 backdrop-blur-2xl border border-white/10 rounded-2xl p-1 shadow-2xl">
-          <button className="lg:hidden p-3 text-[#E1AD01]"
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}>
+          <button
+            className="lg:hidden p-3 text-[#E1AD01]"
+            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+          >
             {isMobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
           </button>
           <div className={`${isMobileMenuOpen
             ? 'flex absolute top-20 left-4 right-4 bg-[#0a0a0a] border border-white/10 rounded-2xl p-4 flex-col'
             : 'hidden lg:flex'} items-center lg:flex-row lg:gap-1`}>
             {visibleTabs.map(tab => (
-              <button key={tab.key}
+              <button
+                key={tab.key}
                 onClick={() => { setActiveTab(tab.key); setIsMobileMenuOpen(false); }}
                 className={`flex items-center gap-2 px-3 lg:px-5 py-3 text-[9px] font-black transition-all
                             uppercase tracking-[0.2em] rounded-xl w-full lg:w-auto
                             ${activeTab === tab.key
                               ? 'text-[#E1AD01] bg-white/5 border border-[#E1AD01]/20'
-                              : 'text-slate-500 hover:text-white hover:bg-white/[0.02]'}`}>
+                              : 'text-slate-500 hover:text-white hover:bg-white/[0.02]'}`}
+              >
                 {(() => {
                   const Icon = tab.icon;
-                  return <Icon className={`h-3.5 w-3.5 ${activeTab === tab.key ? 'animate-pulse' : 'opacity-40'}`} />;
+                  return (
+                    <Icon className={`h-3.5 w-3.5 ${activeTab === tab.key ? 'animate-pulse' : 'opacity-40'}`} />
+                  );
                 })()}
                 <span>{tab.label}</span>
               </button>
             ))}
             <div className="h-[1px] w-full bg-white/10 my-2 lg:h-6 lg:w-[1px] lg:mx-2 lg:my-0" />
-            <button onClick={handleLogout}
+            <button
+              onClick={handleLogout}
               className="flex items-center gap-2 px-5 py-3 text-[9px] font-black text-red-500/60
-                         hover:text-red-500 transition-all uppercase tracking-[0.2em] rounded-xl w-full lg:w-auto">
+                         hover:text-red-500 transition-all uppercase tracking-[0.2em] rounded-xl w-full lg:w-auto"
+            >
               <LogOut className="h-3.5 w-3.5" /> <span>Cerrar Sesión</span>
             </button>
           </div>
@@ -342,8 +346,6 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {/* FIX v4.14: setFleet={setFleetData} — ControlHub escribe en el mismo
-              estado que lee FleetDashboard → re-render inmediato al Finalizar Misión */}
           {activeTab === 'control-hub' && (
             <ControlHub
               tasks={tasksData}
@@ -355,8 +357,21 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
+          {/* FIX v4.16: InventoryCheckout es autónomo — consulta Supabase
+              directamente. No requiere prop 'parts'. */}
           {activeTab === 'checkout' && (
-            <InventoryCheckout parts={partsData} onCheckoutSuccess={() => {}} />
+            <InventoryCheckout
+              onCheckoutSuccess={(pn, qty, aircraftId) => {
+                // Sincronizar partsData local tras despacho exitoso
+                setPartsData(prev =>
+                  prev.map(p =>
+                    p.partNumber.toUpperCase() === pn
+                      ? { ...p, quantity: p.quantity - qty }
+                      : p
+                  )
+                );
+              }}
+            />
           )}
 
           {activeTab === 'fuel' && (
