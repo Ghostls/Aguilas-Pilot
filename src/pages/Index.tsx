@@ -1,5 +1,5 @@
 // src/pages/Index.tsx
-// VALKYRON OS v4.17 — FIX CRÍTICO: .maybeSingle() en fetch de perfiles (evita 406)
+// VALKYRON OS v4.18 — FIX CRÍTICO: .maybeSingle() en fetch de perfiles (evita 406)
 // FIX v4.16 preservado: InventoryCheckout autónomo
 // FIX REALTIME: canal único 'index-fleet-monitor'
 // Regla de Oro: Cero Omisiones. Grado Militar. Siempre evolución.
@@ -20,16 +20,17 @@ import { Register } from '@/components/auth/Register';
 import { CaptainDashboard } from '@/components/CaptainDashboard';
 import { supabase } from '@/lib/supabaseClient';
 import FlightRegister from '@/components/flights/FlightRegister';
+import { FlightCalendar } from '@/components/FlightCalendar';
 import { WorkOrder, Vendor, SparePart, Aircraft } from '@/Types/Maintenance';
 
 import {
   Plane, Package, LogOut, Wrench, ClipboardCheck,
-  Truck, Home, Fuel, X, DollarSign, Menu, FileText, Award
+  Truck, Home, Fuel, X, DollarSign, Menu, FileText, Award, CalendarDays
 } from 'lucide-react';
 
 type TabKey =
   | 'home' | 'captain-log' | 'fleet' | 'inventory'
-  | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights';
+  | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights' | 'calendario';
 
 const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { key: 'home',        label: 'Inicio',      icon: Home           },
@@ -42,6 +43,7 @@ const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?
   { key: 'fuel',        label: 'AVGAS',       icon: Fuel           },
   { key: 'finance',     label: 'Dinero',      icon: DollarSign     },
   { key: 'vendors',     label: 'Aliados',     icon: Truck          },
+  { key: 'calendario',  label: 'Calendario',  icon: CalendarDays   },
 ];
 
 // ─── NORMALIZACIÓN DE ESTADO DE AERONAVE ─────────────────────────────────────
@@ -225,13 +227,13 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
     if (rol === 'CEO') return true;
 
     if (rol === 'ADMIN' || rol.includes('ADMIN'))
-      return ['home', 'inventory', 'fuel', 'finance', 'vendors', 'flights', 'fleet'].includes(tab.key);
+      return ['home', 'inventory', 'fuel', 'finance', 'vendors', 'flights', 'fleet', 'calendario'].includes(tab.key);
 
     if (rol === 'MECANICO')
       return ['home', 'fleet', 'inventory', 'control-hub', 'checkout', 'fuel'].includes(tab.key);
 
-    if (rol === 'PILOTO')
-      return ['home', 'captain-log', 'flights', 'fleet'].includes(tab.key);
+    if (rol === 'PILOTO' || rol === 'ESTUDIANTE')
+      return ['home', 'captain-log', 'flights', 'fleet', 'calendario'].includes(tab.key);
 
     return tab.key === 'home';
   });
@@ -398,6 +400,13 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             <VendorPanel vendors={vendorsData} setVendors={setVendorsData} />
           )}
 
+          {activeTab === 'calendario' && (
+            <FlightCalendar
+              userRole={userProfile?.rol}
+              userProfile={userProfile}
+            />
+          )}
+
           {activeTab === 'flights' && (
             <FlightRegister onFlightLogUpdate={() => {}} />
           )}
@@ -412,7 +421,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           Águilas Pilot — Strategic Division 2026
         </div>
         <div className="text-[8px] text-[#E1AD01] font-black uppercase tracking-[0.3em] italic text-right">
-          Valkyron OS v2.1
+          Valkyron OS v4.18
         </div>
       </footer>
     </div>
