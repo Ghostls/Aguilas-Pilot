@@ -1,6 +1,10 @@
 // src/components/FuelPanel.tsx
-// Evolución Grado Militar - Valkyron OS v3.1
-// NUEVO: Eliminar movimiento desde la bitácora
+// Evolución Grado Militar - Valkyron OS v3.2
+// NUEVO: Sistema de PRESENTACIÓN de combustible (Pipa, Bidón 200L, Tambor 55GAL, Granel)
+//        - Al registrar ENTRADA, se elige presentación + cantidad de unidades
+//        - El sistema calcula automáticamente los litros totales
+//        - Para PIPA y GRANEL, se ingresan los litros directamente
+// v3.1 preservado: Eliminar movimiento desde la bitácora
 // v3.0 preservado: Edición de registros existentes
 // v2.0 preservado: Unidad GAL → LTS
 
@@ -10,7 +14,7 @@ import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
 import { supabase } from '../lib/supabaseClient';
 import {
   X, History, Loader2, Warehouse,
-  Plane, ShieldCheck, Pencil, Trash2
+  Plane, ShieldCheck, Pencil, Trash2, Container
 } from 'lucide-react';
 
 interface FuelPanelProps {
@@ -29,8 +33,22 @@ interface FuelRecord {
   ticket_number: string;
   technician: string;
   hobbs_at_charge: number | null;
+  presentation: string | null;
+  unit_count: number | null;
   created_at: string;
 }
+
+type PresentationType = 'PIPA' | 'BIDON_200' | 'TAMBOR_55GAL' | 'GRANEL';
+
+const PRESENTATION_OPTIONS: { value: PresentationType; label: string; litersPerUnit: number | null }[] = [
+  { value: 'PIPA',         label: 'Pipa / Cisterna',             litersPerUnit: null },   // litros directos
+  { value: 'BIDON_200',     label: 'Bidón 200 LTS',               litersPerUnit: 200 },
+  { value: 'TAMBOR_55GAL',  label: 'Tambor 55 GAL (≈208.2 LTS)',  litersPerUnit: 208.2 },
+  { value: 'GRANEL',        label: 'Granel / Otro (LTS directo)', litersPerUnit: null },
+];
+
+const getPresentationLabel = (value: string | null) =>
+  PRESENTATION_OPTIONS.find(p => p.value === value)?.label ?? value ?? '—';
 
 interface RecordForm {
   aircraftId:    string;
@@ -41,6 +59,8 @@ interface RecordForm {
   ticketNumber:  string;
   technician:    string;
   hobbsAtCharge: number;
+  presentation:  PresentationType;
+  unitCount:     number;
 }
 
 const EMPTY_FORM: RecordForm = {
@@ -52,6 +72,8 @@ const EMPTY_FORM: RecordForm = {
   ticketNumber:  '',
   technician:    '',
   hobbsAtCharge: 0,
+  presentation:  'PIPA',
+  unitCount:     1,
 };
 
 export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }) => {
@@ -117,6 +139,8 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
       ticketNumber:  r.ticket_number,
       technician:    r.technician,
       hobbsAtCharge: r.hobbs_at_charge ?? 0,
+      presentation:  (r.presentation as PresentationType) ?? 'PIPA',
+      unitCount:     r.unit_count ?? 1,
     });
     setIsAdding(true);
   };
@@ -150,13 +174,43 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
     setDeletingId(null);
   };
 
+  // ── Cálculo automático de litros según presentación ────────────────────────
+  const handlePresentationChange = (presentation: PresentationType) => {
+    const option = PRESENTATION_OPTIONS.find(p => p.value === presentation);
+    if (option?.litersPerUnit != null) {
+      setForm(prev => ({
+        ...prev,
+        presentation,
+        liters: option.litersPerUnit! * (prev.unitCount || 1),
+      }));
+    } else {
+      // PIPA / GRANEL → litros directos, no se recalcula desde unitCount
+      setForm(prev => ({ ...prev, presentation }));
+    }
+  };
+
+  const handleUnitCountChange = (unitCount: number) => {
+    const option = PRESENTATION_OPTIONS.find(p => p.value === form.presentation);
+    if (option?.litersPerUnit != null) {
+      setForm(prev => ({
+        ...prev,
+        unitCount,
+        liters: option.litersPerUnit! * (unitCount || 0),
+      }));
+    } else {
+      setForm(prev => ({ ...prev, unitCount }));
+    }
+  };
+
   const handleAction = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
 
     const isEditing = editingRecord !== null;
+    const isHangarIn = activeMode === 'HANGAR';
+
     const dbEntry = {
-      operation_type: activeMode === 'HANGAR' ? 'IN' : 'OUT',
+      operation_type: isHangarIn ? 'IN' : 'OUT',
       aircraft_id:    activeMode === 'AIRCRAFT' ? form.aircraftId.toUpperCase() : 'STOCK_HANGAR',
       liters:         Number(form.liters),
       fuel_type:      String(form.fuelType),
@@ -165,6 +219,8 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
       ticket_number:  String(form.ticketNumber).toUpperCase(),
       technician:     String(form.technician).toUpperCase(),
       hobbs_at_charge: activeMode === 'AIRCRAFT' ? Number(form.hobbsAtCharge) : null,
+      presentation:   isHangarIn ? form.presentation : null,
+      unit_count:     isHangarIn ? Number(form.unitCount) : null,
     };
 
     let error = null;
@@ -195,6 +251,8 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
   };
 
   const TANK_CAPACITY_LTS = 10000;
+  const selectedPresentation = PRESENTATION_OPTIONS.find(p => p.value === form.presentation);
+  const isUnitBased = selectedPresentation?.litersPerUnit != null;
 
   return (
     <div className="space-y-8 animate-in fade-in duration-700 text-left font-sans text-white">
@@ -253,6 +311,7 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
             <tr>
               <th className="p-5">Unidad</th>
               <th className="p-5">Cant.</th>
+              <th className="p-5">Presentación</th>
               <th className="p-5">Sede</th>
               <th className="p-5">Firma</th>
               <th className="p-5 text-right">Acciones</th>
@@ -273,6 +332,18 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                 <td className={`p-5 font-black ${r.operation_type === 'IN' ? 'text-green-500' : 'text-[#E1AD01]'}`}>
                   {r.operation_type === 'IN' ? '+' : '-'}
                   {Number(r.liters ?? 0).toFixed(1)} LTS
+                </td>
+                <td className="p-5 text-slate-400 font-bold uppercase">
+                  {r.operation_type === 'IN'
+                    ? (
+                      <span className="flex items-center gap-1.5">
+                        <Container className="h-3 w-3 text-[#E1AD01]/60" />
+                        {getPresentationLabel(r.presentation)}
+                        {r.unit_count ? <span className="text-slate-600">× {r.unit_count}</span> : null}
+                      </span>
+                    )
+                    : <span className="text-slate-700">—</span>
+                  }
                 </td>
                 <td className="p-5 text-slate-400 font-bold uppercase">{r.location}</td>
                 <td className="p-5 text-slate-600 italic uppercase font-black">{r.technician}</td>
@@ -317,7 +388,7 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
             ))}
             {records.length === 0 && (
               <tr>
-                <td colSpan={5} className="p-12 text-center text-slate-700 text-[10px] font-black uppercase tracking-widest">
+                <td colSpan={6} className="p-12 text-center text-slate-700 text-[10px] font-black uppercase tracking-widest">
                   Sin movimientos registrados
                 </td>
               </tr>
@@ -329,7 +400,7 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
       {/* ── MODAL REGISTRO / EDICIÓN ── */}
       {isAdding && (
         <div className="fixed inset-0 bg-black/98 backdrop-blur-xl z-[100] flex items-center justify-center p-4">
-          <Card className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-xl shadow-2xl rounded-[2.5rem] overflow-hidden">
+          <Card className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-xl shadow-2xl rounded-[2.5rem] overflow-hidden max-h-[90vh] overflow-y-auto">
 
             <CardHeader className={`p-6 flex justify-between items-center ${
               editingRecord ? 'bg-white/10 border-b border-[#E1AD01]/20' : 'bg-[#E1AD01]'
@@ -394,18 +465,74 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                                  text-white text-[10px] outline-none [&>option]:bg-[#0d0d0d] [&>option]:text-white"
                       onChange={e => setForm({ ...form, fuelType: e.target.value })}>
                       <option value="AVGAS 100LL">AVGAS 100LL</option>
-                      <option value="JET-A1">JET-A1</option>
                     </select>
                   </div>
                 </div>
 
+                {/* ── PRESENTACIÓN (solo para ENTRADA / HANGAR) ── */}
+                {activeMode === 'HANGAR' && (
+                  <div className="grid grid-cols-2 gap-6 bg-[#E1AD01]/5 border border-[#E1AD01]/20 p-4 rounded-2xl">
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest flex items-center gap-1.5">
+                        <Container className="h-3 w-3" /> Presentación
+                      </label>
+                      <select value={form.presentation}
+                        className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
+                                   text-white text-[10px] outline-none focus:border-[#E1AD01] uppercase
+                                   [&>option]:bg-[#0d0d0d] [&>option]:text-white"
+                        onChange={e => handlePresentationChange(e.target.value as PresentationType)}>
+                        {PRESENTATION_OPTIONS.map(opt => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {isUnitBased ? (
+                      <div className="space-y-2">
+                        <label className="text-[9px] text-slate-400 font-black uppercase tracking-widest block">
+                          Cantidad de Unidades
+                        </label>
+                        <input type="number" step="1" min="1" required
+                          value={form.unitCount || ''}
+                          className="w-full bg-black border border-white/10 p-4 rounded-xl text-white
+                                     text-[10px] outline-none focus:border-[#E1AD01]"
+                          onChange={e => handleUnitCountChange(parseInt(e.target.value) || 0)} />
+                        <p className="text-[8px] text-slate-500 normal-case">
+                          {form.unitCount || 0} × {selectedPresentation?.litersPerUnit} LTS ={' '}
+                          <span className="text-[#E1AD01] font-black">{form.liters.toFixed(1)} LTS</span>
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <label className="text-[9px] text-slate-400 font-black uppercase tracking-widest block">
+                          Identificación (Placa Pipa / Ref.)
+                        </label>
+                        <input
+                          value={form.ticketNumber ? '' : ''}
+                          placeholder="Opcional — usar campo Ticket #"
+                          disabled
+                          className="w-full bg-black/40 border border-white/5 p-4 rounded-xl text-slate-600
+                                     text-[10px] outline-none cursor-not-allowed"
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 gap-6">
                   <div className="space-y-2">
-                    <label className="text-[9px] text-white font-black uppercase tracking-widest block">Volumen (LTS)</label>
+                    <label className="text-[9px] text-white font-black uppercase tracking-widest block">
+                      Volumen (LTS)
+                      {activeMode === 'HANGAR' && isUnitBased && (
+                        <span className="text-[8px] text-slate-500 normal-case ml-2">(auto)</span>
+                      )}
+                    </label>
                     <input type="number" step="1" min="0" required
                       value={form.liters || ''}
-                      className="w-full bg-black border border-white/10 p-4 text-3xl font-black
-                                 text-white outline-none focus:border-[#E1AD01] rounded-xl"
+                      readOnly={activeMode === 'HANGAR' && isUnitBased}
+                      className={`w-full bg-black border border-white/10 p-4 text-3xl font-black
+                                 text-white outline-none focus:border-[#E1AD01] rounded-xl
+                                 ${activeMode === 'HANGAR' && isUnitBased ? 'opacity-60 cursor-not-allowed' : ''}`}
                       onChange={e => setForm({ ...form, liters: parseFloat(e.target.value) })} />
                   </div>
                   <div className="space-y-2">
