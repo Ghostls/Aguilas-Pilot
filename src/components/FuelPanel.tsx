@@ -1,20 +1,24 @@
 // src/components/FuelPanel.tsx
-// Evolución Grado Militar - Valkyron OS v3.2
-// NUEVO: Sistema de PRESENTACIÓN de combustible (Pipa, Bidón 200L, Tambor 55GAL, Granel)
-//        - Al registrar ENTRADA, se elige presentación + cantidad de unidades
-//        - El sistema calcula automáticamente los litros totales
-//        - Para PIPA y GRANEL, se ingresan los litros directamente
-// v3.1 preservado: Eliminar movimiento desde la bitácora
-// v3.0 preservado: Edición de registros existentes
-// v2.0 preservado: Unidad GAL → LTS
+// Evolución Grado Militar - Valkyron OS v4.0 — Águilas Pilot Edition
+//
+// ARQUITECTURA v4.0: Aeronave como Almacén
+//   - No hay tanques terrestres. Las aeronaves son el depósito.
+//   - ENTRADA  → proveedor externo → aeronave almacén (pipa/bidón/tambor/granel)
+//   - TRANSFERENCIA → aeronave origen → aeronave destino (una sola operación atómica)
+//   - KPIs → saldo por aeronave en tiempo real
+//
+// v3.x preservado: presentaciones (Pipa, Bidón 200L, Tambor 55GAL, Granel)
+// v3.1 preservado: eliminar movimiento desde bitácora
+// v3.0 preservado: edición de registros existentes
+// v2.0 preservado: unidad GAL → LTS
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Vendor, HangarLocation } from '../Types/Maintenance';
+import { Vendor } from '../Types/Maintenance';
 import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
 import { supabase } from '../lib/supabaseClient';
 import {
-  X, History, Loader2, Warehouse,
-  Plane, ShieldCheck, Pencil, Trash2, Container
+  X, History, Loader2, ArrowDownToLine, ArrowRightLeft,
+  Plane, ShieldCheck, Pencil, Trash2, Container, Fuel, AlertTriangle
 } from 'lucide-react';
 
 interface FuelPanelProps {
@@ -24,8 +28,9 @@ interface FuelPanelProps {
 
 interface FuelRecord {
   id: string;
-  operation_type: 'IN' | 'OUT';
-  aircraft_id: string;
+  operation_type: 'IN' | 'TRANSFER';
+  aircraft_id: string;           // aeronave que RECIBE (entrada) o que ORIGINA (transferencia)
+  destination_aircraft_id: string | null; // aeronave DESTINO (solo en TRANSFER)
   liters: number;
   fuel_type: string;
   location: string;
@@ -39,108 +44,132 @@ interface FuelRecord {
 }
 
 type PresentationType = 'PIPA' | 'BIDON_200' | 'TAMBOR_55GAL' | 'GRANEL';
+type OperationMode = 'IN' | 'TRANSFER';
 
 const PRESENTATION_OPTIONS: { value: PresentationType; label: string; litersPerUnit: number | null }[] = [
-  { value: 'PIPA',         label: 'Pipa / Cisterna',             litersPerUnit: null },   // litros directos
-  { value: 'BIDON_200',     label: 'Bidón 200 LTS',               litersPerUnit: 200 },
-  { value: 'TAMBOR_55GAL',  label: 'Tambor 55 GAL (≈208.2 LTS)',  litersPerUnit: 208.2 },
-  { value: 'GRANEL',        label: 'Granel / Otro (LTS directo)', litersPerUnit: null },
+  { value: 'PIPA',        label: 'Pipa / Cisterna',             litersPerUnit: null  },
+  { value: 'BIDON_200',   label: 'Bidón 200 LTS',               litersPerUnit: 200   },
+  { value: 'TAMBOR_55GAL',label: 'Tambor 55 GAL (≈208.2 LTS)', litersPerUnit: 208.2 },
+  { value: 'GRANEL',      label: 'Granel / Otro (LTS directo)', litersPerUnit: null  },
 ];
 
 const getPresentationLabel = (value: string | null) =>
   PRESENTATION_OPTIONS.find(p => p.value === value)?.label ?? value ?? '—';
 
 interface RecordForm {
-  aircraftId:    string;
-  liters:        number;
-  fuelType:      string;
-  location:      HangarLocation;
-  vendorId:      string;
-  ticketNumber:  string;
-  technician:    string;
-  hobbsAtCharge: number;
-  presentation:  PresentationType;
-  unitCount:     number;
+  aircraftId:           string; // receptor en IN, origen en TRANSFER
+  destinationAircraftId:string; // solo en TRANSFER
+  liters:               number;
+  fuelType:             string;
+  location:             string;
+  vendorId:             string;
+  ticketNumber:         string;
+  technician:           string;
+  hobbsAtCharge:        number;
+  presentation:         PresentationType;
+  unitCount:            number;
 }
 
 const EMPTY_FORM: RecordForm = {
-  aircraftId:    '',
-  liters:        0,
-  fuelType:      'AVGAS 100LL',
-  location:      'Lara',
-  vendorId:      '',
-  ticketNumber:  '',
-  technician:    '',
-  hobbsAtCharge: 0,
-  presentation:  'PIPA',
-  unitCount:     1,
+  aircraftId:            '',
+  destinationAircraftId: '',
+  liters:                0,
+  fuelType:              'AVGAS 100LL',
+  location:              'Barquisimeto',
+  vendorId:              '',
+  ticketNumber:          '',
+  technician:            '',
+  hobbsAtCharge:         0,
+  presentation:          'PIPA',
+  unitCount:             1,
 };
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const fmtLts = (n: number) => n.toFixed(1);
+
+const FUEL_LOW_THRESHOLD = 100; // litros — alerta visual
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }) => {
-  const [activeMode,    setActiveMode]    = useState<'AIRCRAFT' | 'HANGAR'>('AIRCRAFT');
-  const [isAdding,      setIsAdding]      = useState(false);
-  const [records,       setRecords]       = useState<FuelRecord[]>([]);
-  const [stockStatus,   setStockStatus]   = useState({ lara: 0, maturin: 0 });
-  const [loading,       setLoading]       = useState(false);
-  const [deletingId,    setDeletingId]    = useState<string | null>(null);
-  const [editingRecord, setEditingRecord] = useState<FuelRecord | null>(null);
-  const [form,          setForm]          = useState<RecordForm>(EMPTY_FORM);
+  const [operationMode,  setOperationMode]  = useState<OperationMode>('IN');
+  const [isAdding,       setIsAdding]       = useState(false);
+  const [records,        setRecords]        = useState<FuelRecord[]>([]);
+  const [aircraftStock,  setAircraftStock]  = useState<Record<string, number>>({});
+  const [loading,        setLoading]        = useState(false);
+  const [deletingId,     setDeletingId]     = useState<string | null>(null);
+  const [editingRecord,  setEditingRecord]  = useState<FuelRecord | null>(null);
+  const [form,           setForm]           = useState<RecordForm>(EMPTY_FORM);
 
   const fuelVendors = vendors.filter(v =>
-    v.category.includes('Consumibles') || v.category.includes('Servicios Técnicos')
+    v.category?.includes('Consumibles') || v.category?.includes('Servicios Técnicos')
   );
 
+  // ── Fetch & calcular saldo por aeronave ────────────────────────────────────
   const fetchGlobalFuelData = useCallback(async () => {
     try {
-      const { data: allLogs, error } = await supabase
+      const { data: allLogs, error } = await (supabase as any)
         .from('registros_combustible')
         .select('*')
         .order('created_at', { ascending: false });
       if (error) throw error;
 
       if (allLogs) {
-        const calculateStock = (loc: string) =>
-          allLogs
-            .filter(r => r.location?.toLowerCase() === loc.toLowerCase())
-            .reduce((acc, curr) =>
-              curr.operation_type === 'IN'
-                ? acc + Number(curr.liters)
-                : acc - Number(curr.liters),
-              0
-            );
+        // Construir mapa de saldo por aeronave
+        const stockMap: Record<string, number> = {};
 
-        setStockStatus({
-          lara:    calculateStock('lara'),
-          maturin: calculateStock('maturín'),
+        allLogs.forEach((r: FuelRecord) => {
+          const origin = r.aircraft_id;
+          const dest   = r.destination_aircraft_id;
+          const lts    = Number(r.liters);
+
+          if (!stockMap[origin]) stockMap[origin] = 0;
+
+          if (r.operation_type === 'IN') {
+            // Entrada directa desde proveedor → aeronave gana litros
+            stockMap[origin] += lts;
+          } else if (r.operation_type === 'TRANSFER') {
+            // Transferencia: origen pierde, destino gana
+            stockMap[origin] -= lts;
+            if (dest) {
+              if (!stockMap[dest]) stockMap[dest] = 0;
+              stockMap[dest] += lts;
+            }
+          }
         });
-        setRecords(allLogs.slice(0, 15));
+
+        setAircraftStock(stockMap);
+        setRecords(allLogs.slice(0, 20));
       }
-    } catch (err) { console.error("ERROR TELEMETRÍA:", err); }
+    } catch (err) { console.error('[FuelPanel] Error telemetría:', err); }
   }, []);
 
   useEffect(() => { fetchGlobalFuelData(); }, [fetchGlobalFuelData]);
 
-  const openNew = (mode: 'AIRCRAFT' | 'HANGAR') => {
+  // ── Modal ─────────────────────────────────────────────────────────────────
+  const openNew = (mode: OperationMode) => {
     setEditingRecord(null);
-    setActiveMode(mode);
+    setOperationMode(mode);
     setForm(EMPTY_FORM);
     setIsAdding(true);
   };
 
   const openEdit = (r: FuelRecord) => {
     setEditingRecord(r);
-    setActiveMode(r.operation_type === 'IN' ? 'HANGAR' : 'AIRCRAFT');
+    setOperationMode(r.operation_type);
     setForm({
-      aircraftId:    r.aircraft_id === 'STOCK_HANGAR' ? '' : r.aircraft_id,
-      liters:        Number(r.liters),
-      fuelType:      r.fuel_type,
-      location:      r.location as HangarLocation,
-      vendorId:      r.vendor_id ?? '',
-      ticketNumber:  r.ticket_number,
-      technician:    r.technician,
-      hobbsAtCharge: r.hobbs_at_charge ?? 0,
-      presentation:  (r.presentation as PresentationType) ?? 'PIPA',
-      unitCount:     r.unit_count ?? 1,
+      aircraftId:            r.aircraft_id,
+      destinationAircraftId: r.destination_aircraft_id ?? '',
+      liters:                Number(r.liters),
+      fuelType:              r.fuel_type,
+      location:              r.location,
+      vendorId:              r.vendor_id ?? '',
+      ticketNumber:          r.ticket_number,
+      technician:            r.technician,
+      hobbsAtCharge:         r.hobbs_at_charge ?? 0,
+      presentation:          (r.presentation as PresentationType) ?? 'PIPA',
+      unitCount:             r.unit_count ?? 1,
     });
     setIsAdding(true);
   };
@@ -151,17 +180,16 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
     setForm(EMPTY_FORM);
   };
 
-  // ── ELIMINAR movimiento ───────────────────────────────────────────────────
+  // ── Eliminar ──────────────────────────────────────────────────────────────
   const handleDelete = async (record: FuelRecord) => {
-    const tipo  = record.operation_type === 'IN' ? 'ENTRADA' : 'SALIDA';
-    const litros = Number(record.liters).toFixed(1);
+    const tipo  = record.operation_type === 'IN' ? 'ENTRADA' : 'TRANSFERENCIA';
     const confirm = window.confirm(
-      `¿Eliminar este movimiento?\n\n${tipo} · ${litros} LTS · ${record.aircraft_id}\nTicket: ${record.ticket_number}\n\nEsta acción afectará el saldo del tanque.`
+      `¿Eliminar este movimiento?\n\n${tipo} · ${fmtLts(Number(record.liters))} LTS\nAeronave: ${record.aircraft_id}${record.destination_aircraft_id ? ` → ${record.destination_aircraft_id}` : ''}\nTicket: ${record.ticket_number}\n\nEsta acción revertirá el saldo de combustible.`
     );
     if (!confirm) return;
 
     setDeletingId(record.id);
-    const { error } = await supabase
+    const { error } = await (supabase as any)
       .from('registros_combustible')
       .delete()
       .eq('id', record.id);
@@ -174,7 +202,7 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
     setDeletingId(null);
   };
 
-  // ── Cálculo automático de litros según presentación ────────────────────────
+  // ── Presentación (solo en ENTRADA) ────────────────────────────────────────
   const handlePresentationChange = (presentation: PresentationType) => {
     const option = PRESENTATION_OPTIONS.find(p => p.value === presentation);
     if (option?.litersPerUnit != null) {
@@ -184,7 +212,6 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
         liters: option.litersPerUnit! * (prev.unitCount || 1),
       }));
     } else {
-      // PIPA / GRANEL → litros directos, no se recalcula desde unitCount
       setForm(prev => ({ ...prev, presentation }));
     }
   };
@@ -202,36 +229,55 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
     }
   };
 
+  // ── Submit ────────────────────────────────────────────────────────────────
   const handleAction = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
 
-    const isEditing = editingRecord !== null;
-    const isHangarIn = activeMode === 'HANGAR';
+    const isEditing   = editingRecord !== null;
+    const isTransfer  = operationMode === 'TRANSFER';
 
-    const dbEntry = {
-      operation_type: isHangarIn ? 'IN' : 'OUT',
-      aircraft_id:    activeMode === 'AIRCRAFT' ? form.aircraftId.toUpperCase() : 'STOCK_HANGAR',
-      liters:         Number(form.liters),
-      fuel_type:      String(form.fuelType),
-      location:       String(form.location),
-      vendor_id:      form.vendorId || null,
-      ticket_number:  String(form.ticketNumber).toUpperCase(),
-      technician:     String(form.technician).toUpperCase(),
-      hobbs_at_charge: activeMode === 'AIRCRAFT' ? Number(form.hobbsAtCharge) : null,
-      presentation:   isHangarIn ? form.presentation : null,
-      unit_count:     isHangarIn ? Number(form.unitCount) : null,
+    // Validación: en transferencia, origen ≠ destino
+    if (isTransfer && form.aircraftId === form.destinationAircraftId) {
+      alert('La aeronave origen y destino no pueden ser la misma.');
+      setLoading(false);
+      return;
+    }
+
+    // Validación: saldo suficiente en origen para transferencia
+    if (isTransfer && !isEditing) {
+      const saldoOrigen = aircraftStock[form.aircraftId] ?? 0;
+      if (form.liters > saldoOrigen) {
+        alert(`SALDO INSUFICIENTE\n\n${form.aircraftId} tiene ${fmtLts(saldoOrigen)} LTS disponibles.\nSolicitado: ${fmtLts(form.liters)} LTS`);
+        setLoading(false);
+        return;
+      }
+    }
+
+    const dbEntry: Record<string, any> = {
+      operation_type:          operationMode,
+      aircraft_id:             form.aircraftId.toUpperCase(),
+      destination_aircraft_id: isTransfer ? form.destinationAircraftId.toUpperCase() : null,
+      liters:                  Number(form.liters),
+      fuel_type:               String(form.fuelType),
+      location:                String(form.location),
+      vendor_id:               form.vendorId || null,
+      ticket_number:           String(form.ticketNumber).toUpperCase(),
+      technician:              String(form.technician).toUpperCase(),
+      hobbs_at_charge:         isTransfer ? Number(form.hobbsAtCharge) : null,
+      presentation:            operationMode === 'IN' ? form.presentation : null,
+      unit_count:              operationMode === 'IN' ? Number(form.unitCount) : null,
     };
 
     let error = null;
     if (isEditing) {
-      const { error: updateErr } = await supabase
+      const { error: updateErr } = await (supabase as any)
         .from('registros_combustible')
         .update(dbEntry)
         .eq('id', editingRecord.id);
       error = updateErr;
     } else {
-      const { error: insertErr } = await supabase
+      const { error: insertErr } = await (supabase as any)
         .from('registros_combustible')
         .insert([dbEntry]);
       error = insertErr;
@@ -243,139 +289,215 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
       await fetchGlobalFuelData();
       closeModal();
       alert(isEditing
-        ? `[VALKYRON OPS] Registro actualizado con éxito.`
-        : `[VALKYRON OPS] Movimiento ${activeMode} certificado.`
+        ? '[ÁGUILAS OPS] Registro actualizado.'
+        : `[ÁGUILAS OPS] ${operationMode === 'IN' ? 'Entrada' : 'Transferencia'} certificada.`
       );
     }
     setLoading(false);
   };
 
-  const TANK_CAPACITY_LTS = 10000;
+  // ── Derivados ─────────────────────────────────────────────────────────────
   const selectedPresentation = PRESENTATION_OPTIONS.find(p => p.value === form.presentation);
-  const isUnitBased = selectedPresentation?.litersPerUnit != null;
+  const isUnitBased          = selectedPresentation?.litersPerUnit != null;
 
+  // Aeronaves con saldo > 0 para uso como origen en transferencia
+  const aircraftWithFuel = fleet.filter(a =>
+    (aircraftStock[a.tailNumber] ?? 0) > 0
+  );
+
+  // Total general de combustible en flota
+  const totalFuelFleet = Object.values(aircraftStock).reduce((acc, v) => acc + (v > 0 ? v : 0), 0);
+
+  // ─────────────────────────────────────────────────────────────────────────
   return (
     <div className="space-y-8 animate-in fade-in duration-700 text-left font-sans text-white">
 
-      {/* ── KPI TANQUES ── */}
+      {/* ── KPI FLOTA ── */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
 
-        <div className="bg-[#0a0a0a] border border-[#E1AD01]/20 p-6 rounded-3xl">
-          <p className="text-[10px] text-white/50 font-black uppercase tracking-[0.2em] mb-2">Tanque Lara</p>
+        {/* Total flota */}
+        <div className="bg-[#0a0a0a] border border-[#E1AD01]/20 p-6 rounded-3xl flex flex-col justify-between">
+          <p className="text-[10px] text-white/50 font-black uppercase tracking-[0.2em] mb-2">
+            Total Combustible — Flota
+          </p>
           <div className="flex items-end gap-2">
-            <h3 className="text-4xl font-black text-[#E1AD01] font-mono">{stockStatus.lara.toFixed(1)}</h3>
+            <h3 className="text-4xl font-black text-[#E1AD01] font-mono">{fmtLts(totalFuelFleet)}</h3>
             <span className="text-[10px] text-[#E1AD01]/40 font-black mb-1">LTS</span>
           </div>
-          <div className="mt-4 h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-            <div className="h-full bg-[#E1AD01] transition-all duration-700"
-              style={{ width: `${Math.min((stockStatus.lara / TANK_CAPACITY_LTS) * 100, 100)}%` }} />
-          </div>
+          <p className="text-[8px] text-white/20 font-black uppercase tracking-widest mt-3">
+            {fleet.length} aeronaves en registro
+          </p>
         </div>
 
-        <div className="bg-[#0a0a0a] border border-[#E1AD01]/20 p-6 rounded-3xl">
-          <p className="text-[10px] text-white/50 font-black uppercase tracking-[0.2em] mb-2">Tanque Maturín</p>
-          <div className="flex items-end gap-2">
-            <h3 className="text-4xl font-black text-[#E1AD01] font-mono">{stockStatus.maturin.toFixed(1)}</h3>
-            <span className="text-[10px] text-[#E1AD01]/40 font-black mb-1">LTS</span>
-          </div>
-          <div className="mt-4 h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-            <div className="h-full bg-[#E1AD01] transition-all duration-700"
-              style={{ width: `${Math.min((stockStatus.maturin / TANK_CAPACITY_LTS) * 100, 100)}%` }} />
-          </div>
+        {/* Saldo por aeronave — scroll horizontal */}
+        <div className="md:col-span-2 bg-[#0a0a0a] border border-[#E1AD01]/20 p-5 rounded-3xl overflow-x-auto">
+          <p className="text-[10px] text-white/50 font-black uppercase tracking-[0.2em] mb-4">
+            Saldo por Aeronave
+          </p>
+          {fleet.length === 0 ? (
+            <p className="text-[9px] text-slate-700 font-black uppercase tracking-widest">Sin aeronaves registradas</p>
+          ) : (
+            <div className="flex gap-4 min-w-max">
+              {fleet.map(a => {
+                const saldo = aircraftStock[a.tailNumber] ?? 0;
+                const isLow  = saldo > 0 && saldo < FUEL_LOW_THRESHOLD;
+                const isEmpty = saldo <= 0;
+                return (
+                  <div key={a.id}
+                    className={`flex flex-col items-center gap-1.5 px-4 py-3 rounded-2xl border transition-all
+                      ${isEmpty ? 'border-white/5 bg-black/20' : isLow
+                        ? 'border-orange-500/30 bg-orange-500/5'
+                        : 'border-[#E1AD01]/20 bg-[#E1AD01]/5'}`}>
+                    <Plane className={`h-4 w-4 ${isEmpty ? 'text-white/20' : isLow ? 'text-orange-400' : 'text-[#E1AD01]'}`} />
+                    <span className="text-[9px] font-black uppercase tracking-widest text-white/60">
+                      {a.tailNumber}
+                    </span>
+                    <span className={`text-lg font-black font-mono ${isEmpty ? 'text-white/20' : isLow ? 'text-orange-400' : 'text-[#E1AD01]'}`}>
+                      {fmtLts(Math.max(saldo, 0))}
+                    </span>
+                    <span className="text-[7px] text-white/30 font-black uppercase">LTS</span>
+                    {isLow && (
+                      <div className="flex items-center gap-0.5">
+                        <AlertTriangle className="h-2.5 w-2.5 text-orange-500" />
+                        <span className="text-[7px] text-orange-500 font-black uppercase">Bajo</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
+      </div>
 
-        <div className="grid grid-cols-1 gap-2">
-          <button onClick={() => openNew('HANGAR')}
-            className="bg-white/5 hover:bg-[#E1AD01]/10 text-white p-4 rounded-2xl border border-white/10
-                       flex items-center gap-4 transition-all">
-            <Warehouse className="h-5 w-5 text-[#E1AD01]" />
-            <span className="text-[9px] font-black uppercase tracking-widest">Entrada Stock</span>
-          </button>
-          <button onClick={() => openNew('AIRCRAFT')}
-            className="bg-[#E1AD01] hover:bg-white text-black p-4 rounded-2xl flex items-center gap-4 transition-all">
-            <Plane className="h-5 w-5" />
-            <span className="text-[9px] font-black tracking-widest italic uppercase">Despacho Avión</span>
-          </button>
-        </div>
+      {/* ── BOTONES ACCIÓN ── */}
+      <div className="grid grid-cols-2 gap-4">
+        <button onClick={() => openNew('IN')}
+          className="bg-white/5 hover:bg-[#E1AD01]/10 text-white p-5 rounded-2xl border border-white/10
+                     flex items-center gap-4 transition-all">
+          <ArrowDownToLine className="h-5 w-5 text-[#E1AD01] shrink-0" />
+          <div className="text-left">
+            <span className="text-[9px] font-black uppercase tracking-widest block">Entrada de Combustible</span>
+            <span className="text-[8px] text-white/30 font-normal normal-case">Proveedor → Aeronave almacén</span>
+          </div>
+        </button>
+        <button onClick={() => openNew('TRANSFER')}
+          className="bg-[#E1AD01] hover:bg-white text-black p-5 rounded-2xl flex items-center gap-4 transition-all">
+          <ArrowRightLeft className="h-5 w-5 shrink-0" />
+          <div className="text-left">
+            <span className="text-[9px] font-black uppercase tracking-widest block">Transferencia</span>
+            <span className="text-[8px] text-black/50 font-normal normal-case">Aeronave almacén → Aeronave</span>
+          </div>
+        </button>
       </div>
 
       {/* ── BITÁCORA ── */}
       <div className="bg-[#050505] border border-white/10 rounded-[2rem] overflow-hidden shadow-2xl">
         <div className="p-6 border-b border-white/5 bg-white/[0.01] flex justify-between items-center">
           <h3 className="text-white font-black text-[10px] uppercase tracking-[0.4em] italic flex items-center gap-2">
-            <History className="h-4 w-4 text-[#E1AD01]" /> Bitácora de Suministro Unificada
+            <History className="h-4 w-4 text-[#E1AD01]" /> Bitácora de Suministro — Flota
           </h3>
         </div>
         <table className="w-full font-mono text-left text-[10px]">
           <thead className="text-slate-600 uppercase tracking-widest bg-white/[0.02] border-b border-white/5">
             <tr>
-              <th className="p-5">Unidad</th>
+              <th className="p-5">Tipo</th>
+              <th className="p-5">Aeronave(s)</th>
               <th className="p-5">Cant.</th>
               <th className="p-5">Presentación</th>
               <th className="p-5">Sede</th>
-              <th className="p-5">Firma</th>
+              <th className="p-5">Auditor</th>
               <th className="p-5 text-right">Acciones</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-white/5">
             {records.map(r => (
               <tr key={r.id} className="hover:bg-white/[0.01] transition-colors group">
-                <td className="p-5 font-black uppercase text-white">
-                  <span className={r.operation_type === 'IN' ? 'text-green-500 mr-2' : 'text-[#E1AD01] mr-2'}>
-                    {r.operation_type === 'IN' ? '▲' : '▼'}
+
+                {/* Tipo de operación */}
+                <td className="p-5">
+                  {r.operation_type === 'IN' ? (
+                    <span className="inline-flex items-center gap-1.5 text-green-500">
+                      <ArrowDownToLine className="h-3 w-3" />
+                      <span className="font-black uppercase text-[8px] tracking-widest">Entrada</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 text-[#E1AD01]">
+                      <ArrowRightLeft className="h-3 w-3" />
+                      <span className="font-black uppercase text-[8px] tracking-widest">Transfer</span>
+                    </span>
+                  )}
+                  <span className="block text-[7px] text-slate-600 font-normal mt-0.5">
+                    {new Date(r.created_at).toLocaleDateString('es-VE', { day: '2-digit', month: 'short', year: '2-digit' })}
                   </span>
-                  {r.aircraft_id}
-                  <span className="block text-[7px] text-slate-500 font-normal">
+                </td>
+
+                {/* Aeronave(s) */}
+                <td className="p-5 font-black uppercase text-white">
+                  {r.operation_type === 'IN' ? (
+                    <span className="flex items-center gap-1.5">
+                      <Plane className="h-3 w-3 text-green-500/60" />
+                      {r.aircraft_id}
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1.5">
+                      <span className="text-slate-500">{r.aircraft_id}</span>
+                      <ArrowRightLeft className="h-2.5 w-2.5 text-[#E1AD01]/50" />
+                      <span>{r.destination_aircraft_id ?? '—'}</span>
+                    </span>
+                  )}
+                  <span className="block text-[7px] text-slate-500 font-normal mt-0.5">
                     Ticket: {r.ticket_number}
                   </span>
                 </td>
-                <td className={`p-5 font-black ${r.operation_type === 'IN' ? 'text-green-500' : 'text-[#E1AD01]'}`}>
-                  {r.operation_type === 'IN' ? '+' : '-'}
-                  {Number(r.liters ?? 0).toFixed(1)} LTS
+
+                {/* Litros */}
+                <td className={`p-5 font-black text-lg ${r.operation_type === 'IN' ? 'text-green-500' : 'text-[#E1AD01]'}`}>
+                  {r.operation_type === 'IN' ? '+' : '⇄'}
+                  {fmtLts(Number(r.liters ?? 0))}
+                  <span className="text-[8px] ml-1 opacity-50">LTS</span>
                 </td>
+
+                {/* Presentación */}
                 <td className="p-5 text-slate-400 font-bold uppercase">
-                  {r.operation_type === 'IN'
-                    ? (
-                      <span className="flex items-center gap-1.5">
-                        <Container className="h-3 w-3 text-[#E1AD01]/60" />
-                        {getPresentationLabel(r.presentation)}
-                        {r.unit_count ? <span className="text-slate-600">× {r.unit_count}</span> : null}
-                      </span>
-                    )
-                    : <span className="text-slate-700">—</span>
-                  }
+                  {r.operation_type === 'IN' ? (
+                    <span className="flex items-center gap-1.5">
+                      <Container className="h-3 w-3 text-[#E1AD01]/60" />
+                      {getPresentationLabel(r.presentation)}
+                      {r.unit_count && r.unit_count > 1
+                        ? <span className="text-slate-600">× {r.unit_count}</span>
+                        : null
+                      }
+                    </span>
+                  ) : (
+                    <span className="text-slate-700 flex items-center gap-1.5">
+                      <Fuel className="h-3 w-3" />
+                      {r.fuel_type}
+                    </span>
+                  )}
                 </td>
+
                 <td className="p-5 text-slate-400 font-bold uppercase">{r.location}</td>
                 <td className="p-5 text-slate-600 italic uppercase font-black">{r.technician}</td>
 
-                {/* ── ACCIONES: EDITAR + ELIMINAR ── */}
+                {/* Acciones */}
                 <td className="p-5 text-right">
-                  <div className="flex items-center justify-end gap-1.5
-                                  opacity-0 group-hover:opacity-100 transition-all duration-200">
-                    {/* Editar */}
-                    <button
-                      onClick={() => openEdit(r)}
-                      title="Editar"
+                  <div className="flex items-center justify-end gap-1.5 opacity-0 group-hover:opacity-100 transition-all duration-200">
+                    <button onClick={() => openEdit(r)} title="Editar"
                       className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl
                                  border border-white/10 text-slate-500
                                  hover:border-[#E1AD01]/60 hover:text-[#E1AD01]
-                                 transition-all text-[8px] font-black uppercase tracking-widest"
-                    >
+                                 transition-all text-[8px] font-black uppercase tracking-widest">
                       <Pencil className="h-3 w-3" />
                       Editar
                     </button>
-
-                    {/* Eliminar */}
-                    <button
-                      onClick={() => handleDelete(r)}
-                      disabled={deletingId === r.id}
+                    <button onClick={() => handleDelete(r)} disabled={deletingId === r.id}
                       title="Eliminar movimiento"
                       className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl
                                  border border-red-500/20 text-red-500/50
                                  hover:border-red-500/60 hover:text-red-400 hover:bg-red-500/5
                                  transition-all text-[8px] font-black uppercase tracking-widest
-                                 disabled:opacity-40"
-                    >
+                                 disabled:opacity-40">
                       {deletingId === r.id
                         ? <Loader2 className="h-3 w-3 animate-spin" />
                         : <Trash2 className="h-3 w-3" />
@@ -388,7 +510,7 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
             ))}
             {records.length === 0 && (
               <tr>
-                <td colSpan={6} className="p-12 text-center text-slate-700 text-[10px] font-black uppercase tracking-widest">
+                <td colSpan={7} className="p-12 text-center text-slate-700 text-[10px] font-black uppercase tracking-widest">
                   Sin movimientos registrados
                 </td>
               </tr>
@@ -403,17 +525,21 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
           <Card className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-xl shadow-2xl rounded-[2.5rem] overflow-hidden max-h-[90vh] overflow-y-auto">
 
             <CardHeader className={`p-6 flex justify-between items-center ${
-              editingRecord ? 'bg-white/10 border-b border-[#E1AD01]/20' : 'bg-[#E1AD01]'
+              editingRecord
+                ? 'bg-white/10 border-b border-[#E1AD01]/20'
+                : operationMode === 'IN'
+                  ? 'bg-green-500/10 border-b border-green-500/20'
+                  : 'bg-[#E1AD01]'
             }`}>
               <CardTitle className={`text-[11px] font-black uppercase tracking-[0.4em] italic flex items-center gap-2 ${
-                editingRecord ? 'text-[#E1AD01]' : 'text-black'
+                editingRecord ? 'text-[#E1AD01]' : operationMode === 'IN' ? 'text-green-400' : 'text-black'
               }`}>
                 {editingRecord ? (
                   <><Pencil className="h-4 w-4" /> EDITAR REGISTRO</>
-                ) : activeMode === 'HANGAR' ? (
-                  <><Warehouse className="h-4 w-4" /> ORDEN DE RECEPCIÓN</>
+                ) : operationMode === 'IN' ? (
+                  <><ArrowDownToLine className="h-4 w-4" /> ORDEN DE RECEPCIÓN</>
                 ) : (
-                  <><Plane className="h-4 w-4" /> ORDEN DE DESPACHO</>
+                  <><ArrowRightLeft className="h-4 w-4" /> ORDEN DE TRANSFERENCIA</>
                 )}
               </CardTitle>
               {editingRecord && (
@@ -422,7 +548,7 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                 </span>
               )}
               <button onClick={closeModal}
-                className={`hover:rotate-90 transition-all ${editingRecord ? 'text-white' : 'text-black'}`}>
+                className={`hover:rotate-90 transition-all ${editingRecord || operationMode === 'IN' ? 'text-white' : 'text-black'}`}>
                 <X className="h-6 w-6" />
               </button>
             </CardHeader>
@@ -430,48 +556,92 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
             <CardContent className="p-10 text-white">
               <form onSubmit={handleAction} className="space-y-6 font-mono">
 
-                <div className="grid grid-cols-2 gap-6">
-                  <div className="space-y-2">
-                    <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest block">Objetivo</label>
-                    {activeMode === 'AIRCRAFT' ? (
+                {/* ── ENTRADA: selección aeronave receptora + proveedor ── */}
+                {operationMode === 'IN' && (
+                  <div className="grid grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-green-400 font-black uppercase tracking-widest block">
+                        Aeronave Receptora
+                      </label>
+                      <select required value={form.aircraftId}
+                        className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
+                                   text-white text-[10px] outline-none focus:border-green-500 uppercase
+                                   [&>option]:bg-[#0d0d0d] [&>option]:text-white"
+                        onChange={e => setForm({ ...form, aircraftId: e.target.value })}>
+                        <option value="">-- SELECCIONAR --</option>
+                        {fleet.map(a => (
+                          <option key={a.id} value={a.tailNumber}>{a.tailNumber} — {a.modelo ?? a.model ?? ''}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                        Proveedor
+                      </label>
+                      <select value={form.vendorId}
+                        className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
+                                   text-white text-[10px] outline-none [&>option]:bg-[#0d0d0d] [&>option]:text-white"
+                        onChange={e => setForm({ ...form, vendorId: e.target.value })}>
+                        <option value="">-- PROVEEDOR --</option>
+                        {fuelVendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── TRANSFERENCIA: origen → destino con saldo visible ── */}
+                {operationMode === 'TRANSFER' && (
+                  <div className="grid grid-cols-2 gap-6 bg-[#E1AD01]/5 border border-[#E1AD01]/20 p-4 rounded-2xl">
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest block">
+                        Aeronave Origen
+                      </label>
                       <select required value={form.aircraftId}
                         className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
                                    text-white text-[10px] outline-none focus:border-[#E1AD01] uppercase
                                    [&>option]:bg-[#0d0d0d] [&>option]:text-white"
                         onChange={e => setForm({ ...form, aircraftId: e.target.value })}>
                         <option value="">-- SELECCIONAR --</option>
-                        {fleet.map(a => <option key={a.id} value={a.tailNumber}>{a.tailNumber}</option>)}
-                        {editingRecord &&
-                          editingRecord.aircraft_id !== 'STOCK_HANGAR' &&
-                          !fleet.find(a => a.tailNumber === editingRecord.aircraft_id) && (
-                            <option value={editingRecord.aircraft_id}>{editingRecord.aircraft_id}</option>
-                          )}
+                        {fleet.map(a => {
+                          const saldo = aircraftStock[a.tailNumber] ?? 0;
+                          return (
+                            <option key={a.id} value={a.tailNumber} disabled={saldo <= 0}>
+                              {a.tailNumber} — {fmtLts(Math.max(saldo, 0))} LTS{saldo <= 0 ? ' (sin stock)' : ''}
+                            </option>
+                          );
+                        })}
                       </select>
-                    ) : (
-                      <select required value={form.vendorId}
+                      {form.aircraftId && (
+                        <p className="text-[8px] text-[#E1AD01]/70 font-black">
+                          Disponible: <span className="text-[#E1AD01]">
+                            {fmtLts(Math.max(aircraftStock[form.aircraftId] ?? 0, 0))} LTS
+                          </span>
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[9px] text-slate-400 font-black uppercase tracking-widest block">
+                        Aeronave Destino
+                      </label>
+                      <select required value={form.destinationAircraftId}
                         className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
                                    text-white text-[10px] outline-none focus:border-[#E1AD01] uppercase
                                    [&>option]:bg-[#0d0d0d] [&>option]:text-white"
-                        onChange={e => setForm({ ...form, vendorId: e.target.value })}>
-                        <option value="">-- PROVEEDOR --</option>
-                        {fuelVendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                        onChange={e => setForm({ ...form, destinationAircraftId: e.target.value })}>
+                        <option value="">-- SELECCIONAR --</option>
+                        {fleet
+                          .filter(a => a.tailNumber !== form.aircraftId)
+                          .map(a => (
+                            <option key={a.id} value={a.tailNumber}>{a.tailNumber} — {a.modelo ?? a.model ?? ''}</option>
+                          ))}
                       </select>
-                    )}
+                    </div>
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">Tipo</label>
-                    <select value={form.fuelType}
-                      className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
-                                 text-white text-[10px] outline-none [&>option]:bg-[#0d0d0d] [&>option]:text-white"
-                      onChange={e => setForm({ ...form, fuelType: e.target.value })}>
-                      <option value="AVGAS 100LL">AVGAS 100LL</option>
-                    </select>
-                  </div>
-                </div>
+                )}
 
-                {/* ── PRESENTACIÓN (solo para ENTRADA / HANGAR) ── */}
-                {activeMode === 'HANGAR' && (
-                  <div className="grid grid-cols-2 gap-6 bg-[#E1AD01]/5 border border-[#E1AD01]/20 p-4 rounded-2xl">
+                {/* ── PRESENTACIÓN (solo ENTRADA) ── */}
+                {operationMode === 'IN' && (
+                  <div className="grid grid-cols-2 gap-6 bg-white/[0.02] border border-white/10 p-4 rounded-2xl">
                     <div className="space-y-2">
                       <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest flex items-center gap-1.5">
                         <Container className="h-3 w-3" /> Presentación
@@ -499,40 +669,40 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                           onChange={e => handleUnitCountChange(parseInt(e.target.value) || 0)} />
                         <p className="text-[8px] text-slate-500 normal-case">
                           {form.unitCount || 0} × {selectedPresentation?.litersPerUnit} LTS ={' '}
-                          <span className="text-[#E1AD01] font-black">{form.liters.toFixed(1)} LTS</span>
+                          <span className="text-[#E1AD01] font-black">{fmtLts(form.liters)} LTS</span>
                         </p>
                       </div>
                     ) : (
                       <div className="space-y-2">
                         <label className="text-[9px] text-slate-400 font-black uppercase tracking-widest block">
-                          Identificación (Placa Pipa / Ref.)
+                          Tipo
                         </label>
-                        <input
-                          value={form.ticketNumber ? '' : ''}
-                          placeholder="Opcional — usar campo Ticket #"
-                          disabled
-                          className="w-full bg-black/40 border border-white/5 p-4 rounded-xl text-slate-600
-                                     text-[10px] outline-none cursor-not-allowed"
-                        />
+                        <select value={form.fuelType}
+                          className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
+                                     text-white text-[10px] outline-none [&>option]:bg-[#0d0d0d] [&>option]:text-white"
+                          onChange={e => setForm({ ...form, fuelType: e.target.value })}>
+                          <option value="AVGAS 100LL">AVGAS 100LL</option>
+                        </select>
                       </div>
                     )}
                   </div>
                 )}
 
+                {/* ── VOLUMEN + TICKET ── */}
                 <div className="grid grid-cols-2 gap-6">
                   <div className="space-y-2">
                     <label className="text-[9px] text-white font-black uppercase tracking-widest block">
                       Volumen (LTS)
-                      {activeMode === 'HANGAR' && isUnitBased && (
+                      {operationMode === 'IN' && isUnitBased && (
                         <span className="text-[8px] text-slate-500 normal-case ml-2">(auto)</span>
                       )}
                     </label>
-                    <input type="number" step="1" min="0" required
+                    <input type="number" step="0.1" min="0.1" required
                       value={form.liters || ''}
-                      readOnly={activeMode === 'HANGAR' && isUnitBased}
+                      readOnly={operationMode === 'IN' && isUnitBased}
                       className={`w-full bg-black border border-white/10 p-4 text-3xl font-black
                                  text-white outline-none focus:border-[#E1AD01] rounded-xl
-                                 ${activeMode === 'HANGAR' && isUnitBased ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                 ${operationMode === 'IN' && isUnitBased ? 'opacity-60 cursor-not-allowed' : ''}`}
                       onChange={e => setForm({ ...form, liters: parseFloat(e.target.value) })} />
                   </div>
                   <div className="space-y-2">
@@ -544,14 +714,15 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                   </div>
                 </div>
 
+                {/* ── SEDE + AUDITOR ── */}
                 <div className="grid grid-cols-2 gap-6">
                   <div className="space-y-2">
                     <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">Sede</label>
                     <select value={form.location}
                       className="w-full bg-[#0d0d0d] border border-white/10 p-4 rounded-xl
                                  text-white text-[10px] outline-none [&>option]:bg-[#0d0d0d] [&>option]:text-white"
-                      onChange={e => setForm({ ...form, location: e.target.value as HangarLocation })}>
-                      <option value="Lara">Lara</option>
+                      onChange={e => setForm({ ...form, location: e.target.value })}>
+                      <option value="Barquisimeto">Barquisimeto</option>
                       <option value="Maturín">Maturín</option>
                     </select>
                   </div>
@@ -564,9 +735,12 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                   </div>
                 </div>
 
-                {activeMode === 'AIRCRAFT' && (
+                {/* ── HOBBS (solo en TRANSFERENCIA) ── */}
+                {operationMode === 'TRANSFER' && (
                   <div className="space-y-2">
-                    <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">Hobbs</label>
+                    <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
+                      Hobbs Aeronave Destino
+                    </label>
                     <input type="number" step="0.1" value={form.hobbsAtCharge || ''}
                       className="w-full bg-black border border-white/10 p-4 rounded-xl text-white
                                  text-[10px] outline-none focus:border-[#E1AD01]"
@@ -580,13 +754,26 @@ export const FuelPanel: React.FC<FuelPanelProps> = ({ fleet = [], vendors = [] }
                     transition-all disabled:opacity-40
                     ${editingRecord
                       ? 'bg-white/10 border border-[#E1AD01]/40 text-[#E1AD01] hover:bg-[#E1AD01]/20'
-                      : 'bg-[#E1AD01] text-black hover:bg-white'
+                      : operationMode === 'IN'
+                        ? 'bg-green-500/20 border border-green-500/40 text-green-400 hover:bg-green-500/30'
+                        : 'bg-[#E1AD01] text-black hover:bg-white'
                     }`}>
                   {loading
                     ? <Loader2 className="animate-spin h-5 w-5" />
-                    : editingRecord ? <Pencil className="h-5 w-5" /> : <ShieldCheck className="h-5 w-5" />
+                    : editingRecord
+                      ? <Pencil className="h-5 w-5" />
+                      : operationMode === 'IN'
+                        ? <ArrowDownToLine className="h-5 w-5" />
+                        : <ShieldCheck className="h-5 w-5" />
                   }
-                  {loading ? 'SINCRO...' : editingRecord ? 'GUARDAR CAMBIOS' : 'CERTIFICAR MOVIMIENTO'}
+                  {loading
+                    ? 'SINCRO...'
+                    : editingRecord
+                      ? 'GUARDAR CAMBIOS'
+                      : operationMode === 'IN'
+                        ? 'CERTIFICAR ENTRADA'
+                        : 'CERTIFICAR TRANSFERENCIA'
+                  }
                 </button>
               </form>
             </CardContent>
