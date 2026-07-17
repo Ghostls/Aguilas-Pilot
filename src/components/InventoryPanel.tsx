@@ -1,6 +1,9 @@
 // src/components/InventoryPanel.tsx
-// VALKYRON OS v2.0 — Grado Militar
-// NUEVO: Buscador en tiempo real · Modal Editar funcional · Reposición stock-cero · Módulo Requisiciones (ADMIN/CEO)
+// VALKYRON OS v2.1 — Almacenes por Sede
+// CAMBIO v2.1:
+//   - Filtro jerárquico: Sede (Lara / Maturín) → Almacén (OMA / OPERACIONES)
+//   - HangarLocation: 'Lara-OMA' | 'Lara-OPERACIONES' | 'Maturín-OMA' | 'Maturín-OPERACIONES'
+//   - Selects de ubicación muestran sede + almacén agrupados con <optgroup>
 
 import { useState, useMemo } from 'react';
 import { SparePart, Vendor, HangarLocation } from '../Types/Maintenance';
@@ -9,7 +12,7 @@ import {
   Package, ArrowDownCircle, ArrowUpCircle, ScanLine, Plus,
   X, MapPin, ClipboardList, ShieldCheck, Loader2, Pencil, Trash2,
   Box, AlertCircle, Search, FileText, CheckCircle2, Clock, XCircle,
-  RefreshCw, ChevronDown,
+  RefreshCw, Warehouse,
 } from 'lucide-react';
 
 // ── Tipos ─────────────────────────────────────────────────────────────────────
@@ -20,7 +23,7 @@ interface InventoryPanelProps {
   transactions: any[];
   setTransactions: React.Dispatch<React.SetStateAction<any[]>>;
   vendors: Vendor[];
-  userRole?: string; // 'ADMIN' | 'CEO' | 'PILOTO' | 'MECANICO' etc.
+  userRole?: string;
 }
 
 interface Requisicion {
@@ -37,6 +40,32 @@ interface Requisicion {
   notas_admin?: string;
 }
 
+// ── Constantes de almacenes ───────────────────────────────────────────────────
+
+const SEDES = ['Lara', 'Maturín'] as const;
+type Sede = typeof SEDES[number];
+
+const ALMACENES: Record<Sede, HangarLocation[]> = {
+  'Lara':    ['Lara-OMA', 'Lara-OPERACIONES'],
+  'Maturín': ['Maturín-OMA', 'Maturín-OPERACIONES'],
+};
+
+const ALMACEN_LABEL: Record<HangarLocation, string> = {
+  'Lara-OMA':             'Lara · OMA',
+  'Lara-OPERACIONES':     'Lara · Operaciones',
+  'Maturín-OMA':          'Maturín · OMA',
+  'Maturín-OPERACIONES':  'Maturín · Operaciones',
+};
+
+type LocationFilter = 'all' | Sede | HangarLocation;
+
+function matchesFilter(partLocation: HangarLocation, filter: LocationFilter): boolean {
+  if (filter === 'all') return true;
+  if (filter === 'Lara')    return partLocation.startsWith('Lara');
+  if (filter === 'Maturín') return partLocation.startsWith('Maturín');
+  return partLocation === filter;
+}
+
 // ── Helpers CSS ────────────────────────────────────────────────────────────────
 
 const SELECT_CLS = `w-full bg-[#0d0d0d] border border-white/10 rounded-xl p-4 text-white text-[10px]
@@ -47,16 +76,17 @@ const INPUT_CLS = `w-full bg-black border border-white/10 rounded-xl p-4 text-wh
   uppercase outline-none focus:border-[#E1AD01] transition-all placeholder:text-white/20`;
 
 const EMPTY_FORM = {
-  name: '', partNumber: '', quantity: 0, location: 'Lara' as HangarLocation,
+  name: '', partNumber: '', quantity: 0, location: 'Lara-OMA' as HangarLocation,
   unitPrice: 0, vendorId: '', invoiceNumber: '', certificateNumber: '',
 };
 
 const EMPTY_EDIT = {
-  name: '', partNumber: '', quantity: 0, location: 'Lara' as HangarLocation,
+  name: '', partNumber: '', quantity: 0, location: 'Lara-OMA' as HangarLocation,
   unitPrice: 0, vendorId: '', invoiceNumber: '', certificateNumber: '',
 };
 
-// ── Status badge para requisiciones ───────────────────────────────────────────
+// ── Status badge ───────────────────────────────────────────────────────────────
+
 const ReqBadge = ({ status }: { status: Requisicion['status'] }) => {
   const cfg = {
     PENDIENTE:  { color: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/20', icon: Clock,        label: 'PENDIENTE'  },
@@ -71,7 +101,33 @@ const ReqBadge = ({ status }: { status: Requisicion['status'] }) => {
   );
 };
 
+// ── Select de ubicación reutilizable ──────────────────────────────────────────
+
+const LocationSelect = ({
+  value, onChange, className,
+}: {
+  value: HangarLocation;
+  onChange: (v: HangarLocation) => void;
+  className?: string;
+}) => (
+  <select
+    className={className ?? SELECT_CLS}
+    value={value}
+    onChange={e => onChange(e.target.value as HangarLocation)}
+  >
+    <optgroup label="— LARA —">
+      <option value="Lara-OMA">LARA · OMA</option>
+      <option value="Lara-OPERACIONES">LARA · OPERACIONES</option>
+    </optgroup>
+    <optgroup label="— MATURÍN —">
+      <option value="Maturín-OMA">MATURÍN · OMA</option>
+      <option value="Maturín-OPERACIONES">MATURÍN · OPERACIONES</option>
+    </optgroup>
+  </select>
+);
+
 // ══════════════════════════════════════════════════════════════════════════════
+
 export const InventoryPanel = ({
   parts, setParts, transactions, setTransactions, vendors, userRole = 'MECANICO',
 }: InventoryPanelProps) => {
@@ -79,40 +135,41 @@ export const InventoryPanel = ({
   const isAdminOrCEO = ['ADMIN', 'CEO'].includes(userRole.toUpperCase());
 
   // ── Tabs & filtros ─────────────────────────────────────────────────────────
-  const [activeTab, setActiveTab]           = useState<'parts' | 'log' | 'scan' | 'requisiciones'>('parts');
-  const [locationFilter, setLocationFilter] = useState<'all' | HangarLocation>('all');
-  const [searchQuery, setSearchQuery]       = useState('');
-  const [loading, setLoading]               = useState(false);
+  const [activeTab, setActiveTab]         = useState<'parts' | 'log' | 'scan' | 'requisiciones'>('parts');
+  const [locationFilter, setLocationFilter] = useState<LocationFilter>('all');
+  const [searchQuery, setSearchQuery]     = useState('');
+  const [loading, setLoading]             = useState(false);
 
   // ── Modales ────────────────────────────────────────────────────────────────
-  const [isAddOpen, setIsAddOpen]           = useState(false);
-  const [isEditOpen, setIsEditOpen]         = useState(false);
-  const [isDeleteOpen, setIsDeleteOpen]     = useState(false);
-  const [isReqOpen, setIsReqOpen]           = useState(false);       // crear requisición
-  const [isReviewOpen, setIsReviewOpen]     = useState(false);       // revisar requisición (admin)
-  const [targetPart, setTargetPart]         = useState<SparePart | null>(null);
-  const [targetReq, setTargetReq]           = useState<Requisicion | null>(null);
+  const [isAddOpen, setIsAddOpen]         = useState(false);
+  const [isEditOpen, setIsEditOpen]       = useState(false);
+  const [isDeleteOpen, setIsDeleteOpen]   = useState(false);
+  const [isReqOpen, setIsReqOpen]         = useState(false);
+  const [isReviewOpen, setIsReviewOpen]   = useState(false);
+  const [targetPart, setTargetPart]       = useState<SparePart | null>(null);
+  const [targetReq, setTargetReq]         = useState<Requisicion | null>(null);
 
   // ── Scan ───────────────────────────────────────────────────────────────────
-  const [scanInput, setScanInput]           = useState('');
-  const [scanResult, setScanResult]         = useState<SparePart | 'NOT_FOUND' | null>(null);
+  const [scanInput, setScanInput]         = useState('');
+  const [scanResult, setScanResult]       = useState<SparePart | 'NOT_FOUND' | null>(null);
 
   // ── Forms ──────────────────────────────────────────────────────────────────
-  const [newPart, setNewPart]               = useState({ ...EMPTY_FORM });
-  const [editForm, setEditForm]             = useState({ ...EMPTY_EDIT });
+  const [newPart, setNewPart]             = useState({ ...EMPTY_FORM });
+  const [editForm, setEditForm]           = useState({ ...EMPTY_EDIT });
 
   // ── Requisiciones ──────────────────────────────────────────────────────────
-  const [requisiciones, setRequisiciones]   = useState<Requisicion[]>([]);
-  const [reqLoading, setReqLoading]         = useState(false);
-  const [reqForm, setReqForm]               = useState({
+  const [requisiciones, setRequisiciones] = useState<Requisicion[]>([]);
+  const [reqLoading, setReqLoading]       = useState(false);
+  const [reqForm, setReqForm]             = useState({
     part_number: '', part_name: '', cantidad_solicitada: 1,
     justificacion: '', solicitante: '',
   });
-  const [adminNota, setAdminNota]           = useState('');
+  const [adminNota, setAdminNota]         = useState('');
 
-  // ── Filtrado de partes (búsqueda + sede) ───────────────────────────────────
+  // ── Filtrado ───────────────────────────────────────────────────────────────
+
   const filteredParts = useMemo(() => {
-    let list = locationFilter === 'all' ? parts : parts.filter(p => p.location === locationFilter);
+    let list = parts.filter(p => matchesFilter(p.location, locationFilter));
     if (searchQuery.trim()) {
       const q = searchQuery.toUpperCase().trim();
       list = list.filter(p =>
@@ -122,18 +179,34 @@ export const InventoryPanel = ({
     return list;
   }, [parts, locationFilter, searchQuery]);
 
-  const filteredTransactions = locationFilter === 'all'
-    ? transactions
-    : transactions.filter(t => t.location === locationFilter);
+  const filteredTransactions = parts
+    .filter(p => matchesFilter(p.location, locationFilter))
+    .flatMap(p => transactions.filter(t => t.location === p.location));
+
+  // Conteo por sede y almacén para el filtro
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { all: parts.length };
+    SEDES.forEach(sede => {
+      c[sede] = parts.filter(p => p.location.startsWith(sede)).length;
+      ALMACENES[sede].forEach(alm => {
+        c[alm] = parts.filter(p => p.location === alm).length;
+      });
+    });
+    return c;
+  }, [parts]);
 
   // ── Scan ───────────────────────────────────────────────────────────────────
+
   const handleScanSearch = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const found = parts.find(p => p.partNumber.toUpperCase().trim() === scanInput.toUpperCase().trim());
+    const found = parts.find(p =>
+      p.partNumber.toUpperCase().trim() === scanInput.toUpperCase().trim()
+    );
     setScanResult(found || 'NOT_FOUND');
   };
 
   // ── AGREGAR ────────────────────────────────────────────────────────────────
+
   const handleAddPart = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -172,28 +245,23 @@ export const InventoryPanel = ({
     setLoading(false);
   };
 
-  // ── EDITAR — abrir (pre-poblar form) ──────────────────────────────────────
+  // ── EDITAR ─────────────────────────────────────────────────────────────────
+
   const openEdit = (part: SparePart) => {
     setTargetPart(part);
     setEditForm({
-      name:              part.name,
-      partNumber:        part.partNumber,
-      quantity:          part.quantity,
-      location:          part.location,
-      unitPrice:         part.unitPrice,
-      vendorId:          '',
-      invoiceNumber:     '',
-      certificateNumber: part.certificateNumber ?? '',
+      name: part.name, partNumber: part.partNumber,
+      quantity: part.quantity, location: part.location,
+      unitPrice: part.unitPrice, vendorId: '',
+      invoiceNumber: '', certificateNumber: part.certificateNumber ?? '',
     });
     setIsEditOpen(true);
   };
 
-  // ── EDITAR — guardar ──────────────────────────────────────────────────────
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!targetPart) return;
     setLoading(true);
-
     const payload: Record<string, any> = {
       nombre:             editForm.name.toUpperCase(),
       numero_parte:       editForm.partNumber.toUpperCase(),
@@ -206,14 +274,11 @@ export const InventoryPanel = ({
     if (editForm.vendorId)      payload.vendor_id      = editForm.vendorId;
 
     const { error } = await supabase
-      .from('inventario_repuestos')
-      .update(payload)
-      .eq('id', targetPart.id);
+      .from('inventario_repuestos').update(payload).eq('id', targetPart.id);
 
     if (error) {
       alert('ERROR: ' + error.message);
     } else {
-      // Si es reposición (cantidad anterior era 0), loguear movimiento INBOUND
       if (targetPart.quantity === 0 && Number(editForm.quantity) > 0) {
         await supabase.from('transacciones_inventario').insert([{
           tipo_movimiento: 'INBOUND',
@@ -227,15 +292,9 @@ export const InventoryPanel = ({
       }
       setParts(prev => prev.map(p =>
         p.id === targetPart.id
-          ? {
-              ...p,
-              name:              payload.nombre,
-              partNumber:        payload.numero_parte,
-              quantity:          payload.cantidad,
-              location:          payload.ubicacion_hangar,
-              unitPrice:         payload.precio_unitario,
-              certificateNumber: payload.certificado_numero,
-            }
+          ? { ...p, name: payload.nombre, partNumber: payload.numero_parte,
+              quantity: payload.cantidad, location: payload.ubicacion_hangar,
+              unitPrice: payload.precio_unitario, certificateNumber: payload.certificado_numero }
           : p
       ));
       setIsEditOpen(false);
@@ -245,57 +304,51 @@ export const InventoryPanel = ({
   };
 
   // ── ELIMINAR ───────────────────────────────────────────────────────────────
+
   const openDelete = (part: SparePart) => { setTargetPart(part); setIsDeleteOpen(true); };
 
   const handleDeleteConfirm = async () => {
     if (!targetPart) return;
     setLoading(true);
     const { error } = await supabase.from('inventario_repuestos').delete().eq('id', targetPart.id);
-    if (error) {
-      alert('ERROR: ' + error.message);
-    } else {
+    if (error) { alert('ERROR: ' + error.message); }
+    else {
       setParts(prev => prev.filter(p => p.id !== targetPart.id));
-      setIsDeleteOpen(false);
-      setTargetPart(null);
+      setIsDeleteOpen(false); setTargetPart(null);
     }
     setLoading(false);
   };
 
-  // ── REQUISICIONES — cargar ────────────────────────────────────────────────
+  // ── REQUISICIONES ──────────────────────────────────────────────────────────
+
   const fetchRequisiciones = async () => {
     setReqLoading(true);
     const { data, error } = await supabase
-      .from('requisiciones_inventario')
-      .select('*')
-      .order('created_at', { ascending: false });
+      .from('requisiciones_inventario').select('*').order('created_at', { ascending: false });
     if (!error && data) setRequisiciones(data as Requisicion[]);
     setReqLoading(false);
   };
 
-  // Cargar cuando se abre el tab
   const handleTabChange = (tab: typeof activeTab) => {
     setActiveTab(tab);
     if (tab === 'requisiciones') fetchRequisiciones();
   };
 
-  // ── REQUISICIONES — crear ─────────────────────────────────────────────────
   const handleCreateReq = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     const { data, error } = await supabase
       .from('requisiciones_inventario')
       .insert([{
-        part_number:          reqForm.part_number.toUpperCase(),
-        part_name:            reqForm.part_name.toUpperCase(),
-        cantidad_solicitada:  Number(reqForm.cantidad_solicitada),
-        justificacion:        reqForm.justificacion,
-        solicitante:          reqForm.solicitante.toUpperCase(),
-        status:               'PENDIENTE',
-      }])
-      .select();
-    if (error) {
-      alert('ERROR: ' + error.message);
-    } else if (data?.length) {
+        part_number:         reqForm.part_number.toUpperCase(),
+        part_name:           reqForm.part_name.toUpperCase(),
+        cantidad_solicitada: Number(reqForm.cantidad_solicitada),
+        justificacion:       reqForm.justificacion,
+        solicitante:         reqForm.solicitante.toUpperCase(),
+        status:              'PENDIENTE',
+      }]).select();
+    if (error) { alert('ERROR: ' + error.message); }
+    else if (data?.length) {
       setRequisiciones(prev => [data[0] as Requisicion, ...prev]);
       setIsReqOpen(false);
       setReqForm({ part_number: '', part_name: '', cantidad_solicitada: 1, justificacion: '', solicitante: '' });
@@ -303,76 +356,134 @@ export const InventoryPanel = ({
     setLoading(false);
   };
 
-  // ── REQUISICIONES — abrir review desde stock cero ────────────────────────
   const openReqFromZeroStock = (part: SparePart) => {
     setReqForm({
-      part_number:          part.partNumber,
-      part_name:            part.name,
-      cantidad_solicitada:  1,
-      justificacion:        `Stock agotado (0 unidades). Reposición urgente.`,
-      solicitante:          '',
+      part_number: part.partNumber, part_name: part.name,
+      cantidad_solicitada: 1,
+      justificacion: `Stock agotado (0 unidades) en ${ALMACEN_LABEL[part.location]}. Reposición urgente.`,
+      solicitante: '',
     });
     setIsReqOpen(true);
   };
 
-  // ── REQUISICIONES — aprobar/rechazar (ADMIN/CEO) ──────────────────────────
   const handleReviewReq = async (newStatus: 'APROBADA' | 'RECHAZADA') => {
     if (!targetReq) return;
     setLoading(true);
     const { error } = await supabase
       .from('requisiciones_inventario')
-      .update({
-        status:      newStatus,
-        notas_admin: adminNota,
-        approved_at: new Date().toISOString(),
-      })
+      .update({ status: newStatus, notas_admin: adminNota, approved_at: new Date().toISOString() })
       .eq('id', targetReq.id);
-    if (error) {
-      alert('ERROR: ' + error.message);
-    } else {
+    if (error) { alert('ERROR: ' + error.message); }
+    else {
       setRequisiciones(prev =>
         prev.map(r => r.id === targetReq.id ? { ...r, status: newStatus, notas_admin: adminNota } : r)
       );
-      setIsReviewOpen(false);
-      setTargetReq(null);
-      setAdminNota('');
+      setIsReviewOpen(false); setTargetReq(null); setAdminNota('');
     }
     setLoading(false);
   };
 
   // ── RENDER ─────────────────────────────────────────────────────────────────
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 text-left font-sans text-white">
 
-      {/* ── Toolbar ── */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4
-                      bg-[#0f0f0f] p-5 rounded-2xl border border-white/10">
-        <div className="flex items-center gap-3 flex-wrap">
-          <MapPin className="text-[#E1AD01] h-4 w-4 shrink-0" />
-          <div className="flex bg-black rounded-xl p-1 border border-white/5">
-            {(['all', 'Lara', 'Maturín'] as const).map(loc => (
-              <button key={loc} onClick={() => setLocationFilter(loc)}
-                className={`px-5 py-2 rounded-lg text-[10px] font-black uppercase transition-all
-                  ${locationFilter === loc ? 'bg-[#E1AD01] text-black shadow-lg' : 'text-slate-500 hover:text-white'}`}>
-                {loc === 'all' ? 'Ver Todo' : loc}
-              </button>
-            ))}
+      {/* ── Toolbar con filtro jerárquico ── */}
+      <div className="bg-[#0f0f0f] p-5 rounded-2xl border border-white/10 space-y-4">
+
+        {/* Fila superior: título + botón agregar */}
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <Warehouse className="text-[#E1AD01] h-4 w-4 shrink-0" />
+            <span className="text-[10px] font-black uppercase tracking-widest text-white/60">
+              Almacenes
+            </span>
           </div>
+          <button onClick={() => setIsAddOpen(true)}
+            className="bg-[#E1AD01] text-black px-6 py-2.5 rounded-xl font-black text-[10px]
+                       uppercase tracking-widest hover:bg-white transition-all flex items-center gap-2">
+            <Plus className="h-4 w-4" /> Ingreso Certificado
+          </button>
         </div>
-        <button onClick={() => setIsAddOpen(true)}
-          className="bg-[#E1AD01] text-black px-6 py-2.5 rounded-xl font-black text-[10px]
-                     uppercase tracking-widest hover:bg-white transition-all flex items-center gap-2">
-          <Plus className="h-4 w-4" /> Ingreso Certificado
-        </button>
+
+        {/* Filtro jerárquico: Ver Todo → Sede → Almacén */}
+        <div className="flex flex-wrap gap-2">
+
+          {/* Ver todo */}
+          <button onClick={() => setLocationFilter('all')}
+            className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all border
+              ${locationFilter === 'all'
+                ? 'bg-[#E1AD01] text-black border-[#E1AD01]'
+                : 'bg-black text-white/40 border-white/10 hover:border-white/20 hover:text-white/70'}`}>
+            Todo ({counts.all})
+          </button>
+
+          {/* Por sede */}
+          {SEDES.map(sede => (
+            <div key={sede} className="flex items-center gap-1">
+              {/* Botón sede */}
+              <button
+                onClick={() => setLocationFilter(sede)}
+                className={`px-4 py-2 rounded-l-xl text-[9px] font-black uppercase tracking-wider transition-all border-y border-l
+                  ${locationFilter === sede
+                    ? 'bg-[#E1AD01]/20 text-[#E1AD01] border-[#E1AD01]/40'
+                    : 'bg-black text-white/40 border-white/10 hover:border-white/20 hover:text-white/70'}`}>
+                <MapPin className="inline h-3 w-3 mr-1 -mt-0.5" />
+                {sede} ({counts[sede] ?? 0})
+              </button>
+
+              {/* Almacenes de la sede */}
+              {ALMACENES[sede].map((alm, i) => {
+                const isLast = i === ALMACENES[sede].length - 1;
+                const label = alm.includes('OMA') ? 'OMA' : 'OPER.';
+                return (
+                  <button key={alm}
+                    onClick={() => setLocationFilter(alm)}
+                    className={`px-3 py-2 text-[8px] font-black uppercase tracking-wider transition-all border-y border-r
+                      ${isLast ? 'rounded-r-xl' : ''}
+                      ${locationFilter === alm
+                        ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30'
+                        : 'bg-black/60 text-white/25 border-white/[0.07] hover:text-white/50 hover:border-white/15'}`}>
+                    {label} ({counts[alm] ?? 0})
+                  </button>
+                );
+              })}
+
+              {/* Separador entre sedes */}
+              {sede !== SEDES[SEDES.length - 1] && (
+                <div className="w-px h-6 bg-white/[0.07] mx-1" />
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Breadcrumb del filtro activo */}
+        {locationFilter !== 'all' && (
+          <div className="flex items-center gap-2">
+            <span className="text-[8px] text-white/20 font-mono uppercase tracking-widest">Viendo:</span>
+            <span className="text-[8px] font-black text-[#E1AD01] uppercase tracking-widest">
+              {locationFilter in ALMACEN_LABEL
+                ? ALMACEN_LABEL[locationFilter as HangarLocation]
+                : locationFilter === 'Lara'
+                ? 'Lara · Todos los almacenes'
+                : 'Maturín · Todos los almacenes'}
+            </span>
+            <span className="text-[8px] text-white/20 font-mono">({filteredParts.length} repuestos)</span>
+            <button onClick={() => setLocationFilter('all')}
+              className="text-white/20 hover:text-white/50 transition-colors ml-1">
+              <X size={10} />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ── Tabs ── */}
       <div className="flex gap-1 border-b border-white/5 overflow-x-auto">
         {[
-          { id: 'parts',         label: 'Existencias (WAC)', icon: Package      },
-          { id: 'log',           label: 'Trazabilidad MRO',  icon: ClipboardList },
-          { id: 'scan',          label: 'Terminal Scan',     icon: ScanLine     },
-          { id: 'requisiciones', label: 'Requisiciones',     icon: FileText     },
+          { id: 'parts',         label: 'Existencias (WAC)', icon: Package       },
+          { id: 'log',           label: 'Trazabilidad MRO',  icon: ClipboardList  },
+          { id: 'scan',          label: 'Terminal Scan',     icon: ScanLine       },
+          { id: 'requisiciones', label: 'Requisiciones',     icon: FileText       },
         ].map(tab => (
           <button key={tab.id} onClick={() => handleTabChange(tab.id as any)}
             className={`flex items-center gap-2 px-6 py-4 text-[9px] font-black uppercase
@@ -387,30 +498,20 @@ export const InventoryPanel = ({
 
       <div className="min-h-[400px]">
 
-        {/* ══════════════════════════════════════════════════════
-            TAB — EXISTENCIAS
-        ══════════════════════════════════════════════════════ */}
+        {/* ══ TAB — EXISTENCIAS ══ */}
         {activeTab === 'parts' && (
           <div className="space-y-4">
-
-            {/* Buscador */}
             <div className="relative">
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
-              <input
-                type="text"
-                placeholder="Buscar por nombre o P/N..."
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
+              <input type="text" placeholder="Buscar por nombre o P/N..."
+                value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
                 className="w-full bg-[#0a0a0a] border border-white/10 rounded-2xl
                            pl-11 pr-4 py-4 text-white text-[11px] font-mono uppercase
                            outline-none focus:border-[#E1AD01] transition-all
-                           placeholder:text-white/20 placeholder:normal-case"
-              />
+                           placeholder:text-white/20 placeholder:normal-case" />
               {searchQuery && (
-                <button
-                  onClick={() => setSearchQuery('')}
-                  className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-600 hover:text-white transition-all"
-                >
+                <button onClick={() => setSearchQuery('')}
+                  className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-600 hover:text-white transition-all">
                   <X className="h-4 w-4" />
                 </button>
               )}
@@ -424,7 +525,7 @@ export const InventoryPanel = ({
                     <th className="p-5">P/N — Componente</th>
                     <th className="p-5 text-center">Stock</th>
                     <th className="p-5">Costo Unit.</th>
-                    <th className="p-5">Ubicación</th>
+                    <th className="p-5">Almacén</th>
                     <th className="p-5 text-center">Acciones</th>
                   </tr>
                 </thead>
@@ -447,26 +548,19 @@ export const InventoryPanel = ({
                             : isLow ? 'text-orange-400'
                             : 'text-white'
                           }`}>{part.quantity}</span>
-                          {isZero && (
-                            <span className="block text-[7px] text-red-500/70 font-black uppercase tracking-widest mt-0.5">
-                              AGOTADO
-                            </span>
-                          )}
-                          {isLow && (
-                            <span className="block text-[7px] text-orange-400/70 font-black uppercase tracking-widest mt-0.5">
-                              BAJO MIN
-                            </span>
-                          )}
+                          {isZero && <span className="block text-[7px] text-red-500/70 font-black uppercase tracking-widest mt-0.5">AGOTADO</span>}
+                          {isLow  && <span className="block text-[7px] text-orange-400/70 font-black uppercase tracking-widest mt-0.5">BAJO MIN</span>}
                         </td>
                         <td className="p-5 text-white font-black">${part.unitPrice.toFixed(2)}</td>
-                        <td className="p-5 text-slate-500 uppercase font-bold text-[9px]">{part.location}</td>
+                        <td className="p-5">
+                          <span className="text-[9px] font-black uppercase text-white/50 block">
+                            {ALMACEN_LABEL[part.location]}
+                          </span>
+                        </td>
                         <td className="p-5">
                           <div className="flex items-center justify-center gap-2">
-                            {/* Reposición rápida si stock = 0 */}
                             {isZero && (
-                              <button
-                                onClick={() => openReqFromZeroStock(part)}
-                                title="Solicitar reposición"
+                              <button onClick={() => openReqFromZeroStock(part)}
                                 className="p-2 rounded-lg bg-red-500/10 border border-red-500/20
                                            text-red-400 hover:bg-red-500/20 hover:border-red-500/40
                                            transition-all text-[8px] font-black uppercase flex items-center gap-1">
@@ -474,19 +568,13 @@ export const InventoryPanel = ({
                                 <span className="hidden md:inline">Reponer</span>
                               </button>
                             )}
-                            {/* Editar */}
-                            <button
-                              onClick={() => openEdit(part)}
-                              title="Editar"
+                            <button onClick={() => openEdit(part)}
                               className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.07]
                                          text-zinc-500 hover:text-[#E1AD01] hover:border-[#E1AD01]/30
                                          transition-all opacity-0 group-hover:opacity-100">
                               <Pencil size={13} />
                             </button>
-                            {/* Eliminar */}
-                            <button
-                              onClick={() => openDelete(part)}
-                              title="Eliminar"
+                            <button onClick={() => openDelete(part)}
                               className="p-2 rounded-lg bg-white/[0.03] border border-white/[0.07]
                                          text-zinc-500 hover:text-red-400 hover:border-red-500/30
                                          transition-all opacity-0 group-hover:opacity-100">
@@ -500,7 +588,7 @@ export const InventoryPanel = ({
                   {filteredParts.length === 0 && (
                     <tr>
                       <td colSpan={5} className="p-12 text-center text-zinc-700 text-[10px] font-black uppercase tracking-widest">
-                        {searchQuery ? `Sin resultados para "${searchQuery}"` : 'Sin repuestos registrados'}
+                        {searchQuery ? `Sin resultados para "${searchQuery}"` : 'Sin repuestos en este almacén'}
                       </td>
                     </tr>
                   )}
@@ -510,11 +598,14 @@ export const InventoryPanel = ({
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════════════
-            TAB — LOG MRO
-        ══════════════════════════════════════════════════════ */}
+        {/* ══ TAB — LOG MRO ══ */}
         {activeTab === 'log' && (
           <div className="space-y-4">
+            {filteredTransactions.length === 0 && (
+              <div className="text-center py-16 text-zinc-700 text-[10px] font-black uppercase tracking-widest">
+                Sin transacciones para este almacén
+              </div>
+            )}
             {filteredTransactions.map((tx, idx) => (
               <div key={idx}
                 className="bg-[#0f0f0f] border border-white/10 p-5 rounded-2xl flex items-center justify-between text-left">
@@ -525,6 +616,7 @@ export const InventoryPanel = ({
                   <div>
                     <h4 className="text-[10px] font-black uppercase tracking-widest text-white">{tx.itemName}</h4>
                     <p className="text-[9px] text-slate-500 font-mono mt-1">P/N: {tx.itemId} | MOV: {tx.quantity}</p>
+                    <p className="text-[8px] text-white/20 font-mono mt-0.5">{ALMACEN_LABEL[tx.location as HangarLocation] ?? tx.location}</p>
                   </div>
                 </div>
                 <div className="text-right">
@@ -536,9 +628,7 @@ export const InventoryPanel = ({
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════════════
-            TAB — SCAN
-        ══════════════════════════════════════════════════════ */}
+        {/* ══ TAB — SCAN ══ */}
         {activeTab === 'scan' && (
           <div className="max-w-2xl mx-auto space-y-8 py-10 animate-in fade-in">
             <div className="text-center space-y-4">
@@ -549,8 +639,7 @@ export const InventoryPanel = ({
                   className="w-full bg-black border-2 border-white/10 rounded-2xl p-6 text-center
                              text-xl font-black tracking-widest text-[#E1AD01] outline-none focus:border-[#E1AD01]"
                   placeholder="P/N O ESCANEE CÓDIGO"
-                  value={scanInput}
-                  onChange={e => setScanInput(e.target.value)} />
+                  value={scanInput} onChange={e => setScanInput(e.target.value)} />
               </form>
             </div>
             {scanResult && scanResult !== 'NOT_FOUND' && (
@@ -568,8 +657,10 @@ export const InventoryPanel = ({
                     <p className="text-2xl font-black text-white">{scanResult.quantity}</p>
                   </div>
                   <div className="bg-black/50 p-4 rounded-xl border border-white/5">
-                    <p className="text-[8px] text-slate-500 uppercase font-black">Ubicación</p>
-                    <p className="text-2xl font-black text-[#E1AD01] uppercase italic">{scanResult.location}</p>
+                    <p className="text-[8px] text-slate-500 uppercase font-black">Almacén</p>
+                    <p className="text-xl font-black text-[#E1AD01] uppercase italic leading-tight">
+                      {ALMACEN_LABEL[scanResult.location]}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -583,19 +674,13 @@ export const InventoryPanel = ({
           </div>
         )}
 
-        {/* ══════════════════════════════════════════════════════
-            TAB — REQUISICIONES
-        ══════════════════════════════════════════════════════ */}
+        {/* ══ TAB — REQUISICIONES ══ */}
         {activeTab === 'requisiciones' && (
           <div className="space-y-6">
-
-            {/* Header requisiciones */}
             <div className="flex items-center justify-between">
-              <div>
-                <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">
-                  {isAdminOrCEO ? 'Panel de Aprobación · ADMIN / CEO' : 'Mis Solicitudes'}
-                </p>
-              </div>
+              <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">
+                {isAdminOrCEO ? 'Panel de Aprobación · ADMIN / CEO' : 'Mis Solicitudes'}
+              </p>
               <div className="flex items-center gap-3">
                 <button onClick={fetchRequisiciones}
                   className="p-2.5 rounded-xl border border-white/10 text-slate-500 hover:text-white hover:border-white/20 transition-all">
@@ -608,8 +693,6 @@ export const InventoryPanel = ({
                 </button>
               </div>
             </div>
-
-            {/* Lista */}
             {reqLoading ? (
               <div className="flex items-center justify-center py-20">
                 <Loader2 className="h-6 w-6 animate-spin text-[#E1AD01]" />
@@ -647,10 +730,8 @@ export const InventoryPanel = ({
                           {new Date(req.created_at).toLocaleDateString('es-VE')}
                         </p>
                       </div>
-                      {/* Solo ADMIN/CEO puede revisar pendientes */}
                       {isAdminOrCEO && req.status === 'PENDIENTE' && (
-                        <button
-                          onClick={() => { setTargetReq(req); setAdminNota(''); setIsReviewOpen(true); }}
+                        <button onClick={() => { setTargetReq(req); setAdminNota(''); setIsReviewOpen(true); }}
                           className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl
                                      bg-[#E1AD01]/10 border border-[#E1AD01]/30 text-[#E1AD01]
                                      text-[8px] font-black uppercase hover:bg-[#E1AD01]/20 transition-all">
@@ -671,9 +752,7 @@ export const InventoryPanel = ({
         )}
       </div>
 
-      {/* ══════════════════════════════════════════════════════════════
-          MODAL — AGREGAR
-      ══════════════════════════════════════════════════════════════ */}
+      {/* ══ MODAL — AGREGAR ══ */}
       {isAddOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/95 backdrop-blur-md p-4">
           <div className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl">
@@ -714,12 +793,9 @@ export const InventoryPanel = ({
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
-                  <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Ubicación</label>
-                  <select className={SELECT_CLS} value={newPart.location}
-                    onChange={e => setNewPart({ ...newPart, location: e.target.value as HangarLocation })}>
-                    <option value="Lara">LARA</option>
-                    <option value="Maturín">MATURÍN</option>
-                  </select>
+                  <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Almacén *</label>
+                  <LocationSelect value={newPart.location}
+                    onChange={v => setNewPart({ ...newPart, location: v })} />
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Proveedor *</label>
@@ -749,7 +825,7 @@ export const InventoryPanel = ({
                   <p className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest mb-0.5">Vista Previa</p>
                   <p className="text-[11px] text-white font-black uppercase">{newPart.name}</p>
                   <p className="text-[9px] text-zinc-400 font-mono">
-                    {newPart.quantity} unid · ${(newPart.unitPrice * newPart.quantity).toFixed(2)} total · {newPart.location}
+                    {newPart.quantity} unid · ${(newPart.unitPrice * newPart.quantity).toFixed(2)} total · {ALMACEN_LABEL[newPart.location]}
                   </p>
                 </div>
               )}
@@ -764,9 +840,7 @@ export const InventoryPanel = ({
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════
-          MODAL — EDITAR REPUESTO
-      ══════════════════════════════════════════════════════════════ */}
+      {/* ══ MODAL — EDITAR ══ */}
       {isEditOpen && targetPart && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/95 backdrop-blur-md p-4">
           <div className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl">
@@ -781,8 +855,6 @@ export const InventoryPanel = ({
               <button onClick={() => { setIsEditOpen(false); setTargetPart(null); }}
                 className="text-white hover:rotate-90 transition-all"><X className="h-5 w-5" /></button>
             </div>
-
-            {/* Banner reposición si stock = 0 */}
             {targetPart.quantity === 0 && (
               <div className="bg-red-500/10 border-b border-red-500/20 px-8 py-3 flex items-center gap-2">
                 <AlertCircle className="h-4 w-4 text-red-400 shrink-0" />
@@ -791,19 +863,16 @@ export const InventoryPanel = ({
                 </p>
               </div>
             )}
-
             <form onSubmit={handleEditSave} className="p-8 space-y-4 text-left font-mono">
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Part Number *</label>
-                  <input required className={INPUT_CLS}
-                    value={editForm.partNumber}
+                  <input required className={INPUT_CLS} value={editForm.partNumber}
                     onChange={e => setEditForm({ ...editForm, partNumber: e.target.value })} />
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Nombre *</label>
-                  <input required className={INPUT_CLS}
-                    value={editForm.name}
+                  <input required className={INPUT_CLS} value={editForm.name}
                     onChange={e => setEditForm({ ...editForm, name: e.target.value })} />
                 </div>
               </div>
@@ -820,19 +889,15 @@ export const InventoryPanel = ({
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Precio Unit. ($)</label>
                   <input type="number" min="0" step="0.01"
-                    className={`${INPUT_CLS} text-2xl font-black`}
-                    value={editForm.unitPrice}
+                    className={`${INPUT_CLS} text-2xl font-black`} value={editForm.unitPrice}
                     onChange={e => setEditForm({ ...editForm, unitPrice: parseFloat(e.target.value) || 0 })} />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
-                  <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Ubicación</label>
-                  <select className={SELECT_CLS} value={editForm.location}
-                    onChange={e => setEditForm({ ...editForm, location: e.target.value as HangarLocation })}>
-                    <option value="Lara">LARA</option>
-                    <option value="Maturín">MATURÍN</option>
-                  </select>
+                  <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Almacén</label>
+                  <LocationSelect value={editForm.location}
+                    onChange={v => setEditForm({ ...editForm, location: v })} />
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Proveedor</label>
@@ -852,8 +917,7 @@ export const InventoryPanel = ({
                 </div>
                 <div className="space-y-1.5">
                   <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Form 8130 / Cert.</label>
-                  <input className={INPUT_CLS}
-                    value={editForm.certificateNumber}
+                  <input className={INPUT_CLS} value={editForm.certificateNumber}
                     onChange={e => setEditForm({ ...editForm, certificateNumber: e.target.value })} />
                 </div>
               </div>
@@ -868,9 +932,7 @@ export const InventoryPanel = ({
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════
-          MODAL — CONFIRMAR ELIMINACIÓN
-      ══════════════════════════════════════════════════════════════ */}
+      {/* ══ MODAL — ELIMINAR ══ */}
       {isDeleteOpen && targetPart && (
         <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/95 backdrop-blur-md p-4">
           <div className="bg-[#050505] border border-red-500/30 w-full max-w-sm rounded-3xl overflow-hidden shadow-2xl">
@@ -883,11 +945,12 @@ export const InventoryPanel = ({
                 <p className="text-[9px] text-red-400 font-black uppercase tracking-widest mb-1">Repuesto a eliminar</p>
                 <p className="text-[13px] text-white font-black uppercase">{targetPart.name}</p>
                 <p className="text-[10px] text-[#E1AD01] font-mono">{targetPart.partNumber}</p>
-                <p className="text-[9px] text-zinc-500 mt-1">{targetPart.quantity} unid · {targetPart.location}</p>
+                <p className="text-[9px] text-zinc-500 mt-1">
+                  {targetPart.quantity} unid · {ALMACEN_LABEL[targetPart.location]}
+                </p>
               </div>
               <p className="text-[10px] text-zinc-500 leading-relaxed">
-                Esta acción eliminará el repuesto de la base de datos permanentemente.
-                El historial de trazabilidad MRO se conserva.
+                Esta acción eliminará el repuesto permanentemente. El historial MRO se conserva.
               </p>
               <div className="flex gap-3">
                 <button onClick={() => setIsDeleteOpen(false)}
@@ -908,9 +971,7 @@ export const InventoryPanel = ({
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════
-          MODAL — CREAR REQUISICIÓN
-      ══════════════════════════════════════════════════════════════ */}
+      {/* ══ MODAL — CREAR REQUISICIÓN ══ */}
       {isReqOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/95 backdrop-blur-md p-4">
           <div className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl">
@@ -927,7 +988,7 @@ export const InventoryPanel = ({
                     onChange={e => setReqForm({ ...reqForm, part_number: e.target.value })} />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Nombre del Repuesto *</label>
+                  <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Nombre *</label>
                   <input required className={INPUT_CLS} placeholder="EJ: FILTRO ACEITE"
                     value={reqForm.part_name}
                     onChange={e => setReqForm({ ...reqForm, part_name: e.target.value })} />
@@ -935,7 +996,7 @@ export const InventoryPanel = ({
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
-                  <label className="text-[9px] font-black text-[#E1AD01] uppercase ml-1">Cantidad Solicitada *</label>
+                  <label className="text-[9px] font-black text-[#E1AD01] uppercase ml-1">Cantidad *</label>
                   <input type="number" min="1" step="1" required
                     className={`${INPUT_CLS} text-2xl font-black`}
                     value={reqForm.cantidad_solicitada}
@@ -953,7 +1014,7 @@ export const InventoryPanel = ({
                 <textarea required rows={3}
                   className="w-full bg-black border border-white/10 rounded-xl p-4 text-white text-xs
                              outline-none focus:border-[#E1AD01] transition-all placeholder:text-white/20 resize-none"
-                  placeholder="DESCRIBE POR QUÉ SE NECESITA ESTE REPUESTO..."
+                  placeholder="DESCRIBE POR QUÉ SE NECESITA..."
                   value={reqForm.justificacion}
                   onChange={e => setReqForm({ ...reqForm, justificacion: e.target.value })} />
               </div>
@@ -968,9 +1029,7 @@ export const InventoryPanel = ({
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════
-          MODAL — REVISAR REQUISICIÓN (ADMIN / CEO)
-      ══════════════════════════════════════════════════════════════ */}
+      {/* ══ MODAL — REVISAR REQUISICIÓN ══ */}
       {isReviewOpen && targetReq && (
         <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/95 backdrop-blur-md p-4">
           <div className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-md rounded-3xl overflow-hidden shadow-2xl">
@@ -982,16 +1041,13 @@ export const InventoryPanel = ({
                 className="text-white hover:rotate-90 transition-all"><X className="h-5 w-5" /></button>
             </div>
             <div className="p-8 space-y-5 font-mono">
-              {/* Detalle */}
               <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-5 space-y-3">
                 <div className="flex items-start justify-between gap-2">
                   <div>
                     <p className="text-white font-black uppercase text-sm">{targetReq.part_name}</p>
                     <p className="text-[#E1AD01] text-[10px]">P/N: {targetReq.part_number}</p>
                   </div>
-                  <span className="text-lg font-black text-white shrink-0">
-                    × {targetReq.cantidad_solicitada}
-                  </span>
+                  <span className="text-lg font-black text-white shrink-0">× {targetReq.cantidad_solicitada}</span>
                 </div>
                 <p className="text-[10px] text-slate-400 leading-relaxed border-t border-white/5 pt-3">
                   {targetReq.justificacion}
@@ -1001,19 +1057,14 @@ export const InventoryPanel = ({
                   {' · '}{new Date(targetReq.created_at).toLocaleString('es-VE')}
                 </p>
               </div>
-              {/* Nota admin */}
               <div className="space-y-1.5">
-                <label className="text-[9px] font-black text-slate-500 uppercase ml-1">
-                  Nota para el solicitante (opcional)
-                </label>
+                <label className="text-[9px] font-black text-slate-500 uppercase ml-1">Nota (opcional)</label>
                 <textarea rows={2}
                   className="w-full bg-black border border-white/10 rounded-xl p-4 text-white text-xs
                              outline-none focus:border-[#E1AD01] transition-all resize-none placeholder:text-white/20"
                   placeholder="EJ: PENDIENTE HASTA SIGUIENTE COMPRA..."
-                  value={adminNota}
-                  onChange={e => setAdminNota(e.target.value)} />
+                  value={adminNota} onChange={e => setAdminNota(e.target.value)} />
               </div>
-              {/* Botones */}
               <div className="flex gap-3">
                 <button onClick={() => handleReviewReq('RECHAZADA')} disabled={loading}
                   className="flex-1 py-4 rounded-xl bg-red-600/20 border border-red-500/30 text-red-400

@@ -2,7 +2,13 @@
 // Evolución: Núcleo Financiero, Flujo de Caja Real, Requisiciones y Estatus de Vuelo
 // REGLA DE ORO: CERO OMISIONES. EVOLUCIÓN TOTAL. GRADO MILITAR.
 
-export type HangarLocation = 'Lara' | 'Maturín' | 'Base Central';
+// En Types/Maintenance.ts
+// Types/Maintenance.ts
+export type HangarLocation = 
+  | 'Lara-OMA'
+  | 'Lara-OPERACIONES'
+  | 'Maturín-OMA'
+  | 'Maturín-OPERACIONES';
 export type TaskStatus = 'Open' | 'In Progress' | 'Completed' | 'AOG';
 
 // --- NUEVOS TIPOS ERP (REQUISICIONES) ---
