@@ -1,7 +1,5 @@
 // src/pages/Index.tsx
-// VALKYRON OS v4.18 — FIX CRÍTICO: .maybeSingle() en fetch de perfiles (evita 406)
-// FIX v4.16 preservado: InventoryCheckout autónomo
-// FIX REALTIME: canal único 'index-fleet-monitor'
+// VALKYRON OS v4.19 — FIX: OPERACIONES añadido al filtro de tabs (misma vista que MECANICO)
 // Regla de Oro: Cero Omisiones. Grado Militar. Siempre evolución.
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -59,7 +57,6 @@ const normalizeStatus = (raw: string): AircraftStatus => {
 };
 
 // ─── NORMALIZACIÓN DE ROL ─────────────────────────────────────────────────────
-// Prioridad: prop userRole → user_metadata → tabla perfiles → fallback MECANICO
 const resolveRol = (
   userRoleProp: string | undefined,
   metaRol:      string | undefined,
@@ -83,7 +80,6 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   } | null>(null);
   const navigate = useNavigate();
 
-  // Fuentes de verdad compartidas entre módulos
   const [fleetData,        setFleetData]        = useState<Aircraft[]>([]);
   const [partsData,        setPartsData]        = useState<SparePart[]>([]);
   const [transactionsData, setTransactionsData] = useState<any[]>([]);
@@ -122,9 +118,6 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           const metaRol  = user.user_metadata?.rol  as string | undefined;
           const metaRole = user.user_metadata?.role as string | undefined;
 
-          // FIX v4.17: .maybeSingle() — devuelve null si la fila no existe
-          // .single() lanzaba HTTP 406 cuando el usuario no tenía fila en perfiles,
-          // rompiendo todo el bloque y dejando userProfile como null → rol = MECANICO
           const { data: profile } = await supabase
             .from('perfiles')
             .select('nombre_completo, sede, rol')
@@ -138,9 +131,9 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           );
 
           console.log('[ÁGUILAS OS] Rol resuelto:', rolResuelto, {
-            prop:    userRole,
-            meta:    metaRol || metaRole,
-            perfil:  profile?.rol,
+            prop:   userRole,
+            meta:   metaRol || metaRole,
+            perfil: profile?.rol,
           });
 
           setUserProfile({
@@ -197,7 +190,6 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 
     syncTerminalData();
 
-    // CANAL ÚNICO — FleetDashboard y App.tsx NO deben tener canales propios para flota_aviones
     const fleetChannel = supabase
       .channel('index-fleet-monitor')
       .on('postgres_changes',
@@ -229,7 +221,8 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
     if (rol === 'ADMIN' || rol.includes('ADMIN'))
       return ['home', 'inventory', 'fuel', 'finance', 'vendors', 'flights', 'fleet', 'calendario'].includes(tab.key);
 
-    if (rol === 'MECANICO')
+    // ── FIX v4.19: OPERACIONES comparte exactamente la misma vista que MECANICO ──
+    if (rol === 'MECANICO' || rol === 'OPERACIONES')
       return ['home', 'fleet', 'inventory', 'control-hub', 'checkout', 'fuel'].includes(tab.key);
 
     if (rol === 'PILOTO' || rol === 'ESTUDIANTE')
@@ -421,7 +414,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           Águilas Pilot — Strategic Division 2026
         </div>
         <div className="text-[8px] text-[#E1AD01] font-black uppercase tracking-[0.3em] italic text-right">
-          Valkyron OS v4.18
+          Valkyron OS v4.19
         </div>
       </footer>
     </div>

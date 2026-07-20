@@ -1,23 +1,25 @@
 // src/components/auth/Register.tsx
-// VALKYRON OS v2.1 — Alta de Personal Águilas Pilot
-// FIX CRÍTICO: Inserción directa en tabla `perfiles` post-signUp
+// VALKYRON OS v2.3 — Alta de Personal Águilas Pilot
+// UPDATE: grid inline style para 5 columnas garantizado
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import { useState } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import {
   ShieldCheck, UserPlus, Loader2, X,
-  Wrench, Shield, Plane, Landmark, CheckCircle2, AlertTriangle
+  Wrench, Shield, Plane, Landmark, CheckCircle2, AlertTriangle,
+  ClipboardList
 } from 'lucide-react';
 
-type Rol  = 'CEO' | 'ADMIN' | 'MECANICO' | 'PILOTO';
+type Rol  = 'CEO' | 'ADMIN' | 'MECANICO' | 'OPERACIONES' | 'PILOTO';
 type Sede = 'Lara' | 'Maturín';
 
 const ROLES: { id: Rol; label: string; desc: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { id: 'MECANICO', label: 'Técnico MRO',    desc: 'Hangar & Stock',      icon: Wrench   },
-  { id: 'PILOTO',   label: 'Piloto',          desc: 'Vuelos & AVGAS',     icon: Plane    },
-  { id: 'ADMIN',    label: 'Administrador',   desc: 'Finanzas & Almacén', icon: Landmark },
-  { id: 'CEO',      label: 'CEO',             desc: 'Control Total',      icon: Shield   },
+  { id: 'MECANICO',    label: 'Técnico MRO',  desc: 'Hangar & Stock',     icon: Wrench        },
+  { id: 'OPERACIONES', label: 'Operaciones',  desc: 'Rutas & MRO',        icon: ClipboardList },
+  { id: 'PILOTO',      label: 'Piloto',       desc: 'Vuelos & AVGAS',     icon: Plane         },
+  { id: 'ADMIN',       label: 'Administrador',desc: 'Finanzas & Almacén', icon: Landmark      },
+  { id: 'CEO',         label: 'CEO',          desc: 'Control Total',      icon: Shield        },
 ];
 
 const INPUT_CLS = `w-full bg-black/60 border border-white/10 p-4 rounded-2xl text-white text-xs
@@ -51,7 +53,7 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
       options: {
         data: {
           nombre_completo: formData.nombre.toUpperCase(),
-          rol:             formData.rol,        // ← guardado en user_metadata
+          rol:             formData.rol,
           sede:            formData.sede,
         },
       },
@@ -64,8 +66,6 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
     }
 
     // ── PASO 2: Insertar en tabla `perfiles` con el rol correcto ────────────
-    // CRÍTICO: user_metadata puede no estar disponible en el primer login
-    // La tabla `perfiles` es la fuente de verdad para el rol
     const userId = authData.user?.id;
     if (userId) {
       const { error: profileError } = await supabase
@@ -73,15 +73,13 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
         .upsert({
           id:              userId,
           nombre_completo: formData.nombre.toUpperCase(),
-          rol:             formData.rol,   // ← fuente de verdad
+          rol:             formData.rol,
           sede:            formData.sede,
           email:           formData.email.toLowerCase(),
         }, { onConflict: 'id' });
 
       if (profileError) {
-        // No bloqueamos el flujo — el usuario se creó, solo logueamos el error
         console.error('[REGISTER] Error insertando perfil:', profileError.message);
-        // Avisamos pero no falla el registro completo
         setError(`Usuario creado pero hubo un error guardando el perfil: ${profileError.message}`);
         setLoading(false);
         return;
@@ -159,7 +157,10 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
             <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-[0.25em] block">
               Rango de Autoridad
             </label>
-            <div className="grid grid-cols-4 gap-2">
+            <div
+              className="gap-2"
+              style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)' }}
+            >
               {ROLES.map(rol => {
                 const Icon   = rol.icon;
                 const active = formData.rol === rol.id;
