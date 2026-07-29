@@ -1,23 +1,34 @@
 // src/components/FleetDashboard.tsx
-// VALKYRON OS v5.1 — FIX CRÍTICO: Canal Realtime eliminado (lo maneja Index.tsx)
+// VALKYRON OS v5.2 — EDICIÓN DE ÓRDENES DE TRABAJO EN MANTENIMIENTO
+// v5.2 NUEVO:
+//   — Botón "Editar" en tarjetas de aeronaves con estado maintenance
+//   — Modal de edición que hace UPDATE a ordenes_trabajo por matrícula
+//   — Permite agregar daños adicionales sin crear una nueva orden
+//   — Campo "nuevos hallazgos" se concatena al campo observaciones existente
+//     con timestamp para trazabilidad de auditoría
+// v5.1 PRESERVADO: Canal Realtime eliminado (lo maneja Index.tsx)
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import React, { useState } from 'react';
-import { Aircraft, HangarLocation } from '@/Types/Maintenance';
+import { Aircraft } from '@/Types/Maintenance';
 import AircraftCard from './AircraftCard';
 import AircraftDetail from './AircraftDetail';
 import { supabase } from '../lib/supabaseClient';
 import {
   Plane, Plus, X, Gauge, ShieldCheck, Loader2,
-  Wrench, ShieldAlert, AlertCircle
+  Wrench, ShieldAlert, AlertCircle, Pencil, PlusCircle,
+  ClipboardList, CheckCircle2,
 } from 'lucide-react';
 
 // ─── NORMALIZACIÓN ────────────────────────────────────────────────────────────
-const normalizeAircraftStatus = (rawStatus: string): 'operational' | 'maintenance' | 'grounded' | 'flight' => {
+
+const normalizeAircraftStatus = (
+  rawStatus: string
+): 'operational' | 'maintenance' | 'grounded' | 'flight' => {
   if (!rawStatus) return 'operational';
-  const s = rawStatus.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const s = rawStatus.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   if (s.includes('mantenimiento') || s.includes('maintenance')) return 'maintenance';
-  if (s.includes('vuelo') || s.includes('flight')) return 'flight';
+  if (s.includes('vuelo') || s.includes('flight'))               return 'flight';
   if (s.includes('tierra') || s.includes('grounded') || s.includes('aog')) return 'grounded';
   return 'operational';
 };
@@ -25,6 +36,9 @@ const normalizeAircraftStatus = (rawStatus: string): 'operational' | 'maintenanc
 const SELECT_CLS = `w-full bg-[#0d0d0d] border border-white/10 rounded-xl p-4 text-white text-[10px]
   font-black outline-none focus:border-[#E1AD01] transition-all
   [&>option]:bg-[#0d0d0d] [&>option]:text-white`;
+
+const INPUT_CLS = `w-full bg-black border border-white/10 rounded-xl p-4 text-white text-xs
+  uppercase outline-none focus:border-[#E1AD01] transition-all placeholder:text-white/20 font-mono`;
 
 const RAZONES_PREDEFINIDAS = [
   'Mantenimiento Preventivo 100H',
@@ -40,7 +54,21 @@ const RAZONES_PREDEFINIDAS = [
   'Otra (especificar)',
 ];
 
+// ─── TIPOS INTERNOS ───────────────────────────────────────────────────────────
+
+interface OrdenExistente {
+  id:                string;
+  matricula:         string;
+  modelo:            string;
+  descripcion_tarea: string;
+  nombre_mecanico:   string;
+  observaciones:     string;
+  estado:            string;
+  sede:              string;
+}
+
 // ─── COMPONENTE ───────────────────────────────────────────────────────────────
+
 const FleetDashboard = ({
   fleetData,
   setFleetData,
@@ -49,10 +77,19 @@ const FleetDashboard = ({
   setFleetData: React.Dispatch<React.SetStateAction<Aircraft[]>>;
 }) => {
   const [selectedAircraft, setSelectedAircraft] = useState<Aircraft | null>(null);
-  const [isModalOpen, setIsModalOpen]           = useState(false);
-  const [isRazonOpen, setIsRazonOpen]           = useState(false);
-  const [loading, setLoading]                   = useState(false);
-  const [pendingAircraft, setPendingAircraft]   = useState<any>(null);
+  const [isModalOpen,      setIsModalOpen]       = useState(false);
+  const [isRazonOpen,      setIsRazonOpen]       = useState(false);
+  const [isEditOpen,       setIsEditOpen]        = useState(false);
+  const [loading,          setLoading]           = useState(false);
+  const [pendingAircraft,  setPendingAircraft]   = useState<any>(null);
+
+  // Orden de trabajo existente que se está editando
+  const [ordenEditing, setOrdenEditing] = useState<OrdenExistente | null>(null);
+  const [editForm, setEditForm] = useState({
+    nuevosHallazgos: '',   // daños adicionales encontrados durante la revisión
+    mecanico:        '',   // puede cambiar/confirmar el técnico asignado
+    estado:          'In Progress' as string,
+  });
 
   const [newAircraft, setNewAircraft] = useState({
     tailNumber:  '',
@@ -73,7 +110,86 @@ const FleetDashboard = ({
     ? razonForm.razonCustom.trim()
     : razonForm.razon;
 
+  // ── ABRIR MODAL DE EDICIÓN ────────────────────────────────────────────────
+
+  const handleEditarMantenimiento = async (ac: Aircraft) => {
+    setLoading(true);
+    try {
+      // Buscar la orden de trabajo activa por matrícula
+      const { data, error } = await supabase
+        .from('ordenes_trabajo')
+        .select('*')
+        .eq('matricula', ac.tailNumber ?? (ac as any).matricula)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (error || !data) {
+        alert('No se encontró una orden de trabajo activa para esta aeronave.');
+        return;
+      }
+
+      setOrdenEditing(data as OrdenExistente);
+      setEditForm({
+        nuevosHallazgos: '',
+        mecanico:        data.nombre_mecanico ?? '',
+        estado:          data.estado ?? 'In Progress',
+      });
+      setIsEditOpen(true);
+    } catch (err: any) {
+      alert('Error al cargar la orden: ' + err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── GUARDAR EDICIÓN ───────────────────────────────────────────────────────
+
+  const handleGuardarEdicion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!ordenEditing) return;
+    if (!editForm.nuevosHallazgos.trim() && editForm.mecanico === ordenEditing.nombre_mecanico && editForm.estado === ordenEditing.estado) {
+      alert('No hay cambios para guardar.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      // Construir observaciones actualizadas con timestamp de auditoría
+      const timestamp  = new Date().toLocaleString('es-VE', {
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+
+      const obsActual = ordenEditing.observaciones ?? '';
+      const obsNueva  = editForm.nuevosHallazgos.trim()
+        ? `${obsActual}\n[${timestamp}] NUEVO HALLAZGO: ${editForm.nuevosHallazgos.trim().toUpperCase()}`
+        : obsActual;
+
+      const { error } = await supabase
+        .from('ordenes_trabajo')
+        .update({
+          nombre_mecanico: editForm.mecanico.trim() || ordenEditing.nombre_mecanico,
+          estado:          editForm.estado,
+          observaciones:   obsNueva,
+        })
+        .eq('id', ordenEditing.id);
+
+      if (error) throw error;
+
+      setIsEditOpen(false);
+      setOrdenEditing(null);
+      setEditForm({ nuevosHallazgos: '', mecanico: '', estado: 'In Progress' });
+      alert(`✓ Orden de trabajo actualizada.\n${editForm.nuevosHallazgos ? 'Hallazgo registrado con timestamp.' : 'Datos actualizados.'}`);
+    } catch (err: any) {
+      alert('Error al actualizar: ' + err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // ── PASO 1: Submit del form principal ─────────────────────────────────────
+
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (newAircraft.status === 'maintenance') {
@@ -87,6 +203,7 @@ const FleetDashboard = ({
   };
 
   // ── PASO 2: Confirmar razón → insertar aeronave + orden de trabajo ─────────
+
   const handleRazonConfirm = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!razonFinal) {
@@ -104,8 +221,7 @@ const FleetDashboard = ({
   };
 
   // ── INSERT CENTRAL ────────────────────────────────────────────────────────
-  // NOTA: El Realtime en Index.tsx escucha flota_aviones y llama syncFleet()
-  // automáticamente — NO necesitamos actualizar fleetData manualmente aquí.
+
   const insertAircraft = async (
     ac: typeof newAircraft,
     hangarData: { razon: string; mecanico: string; descripcion: string } | null
@@ -115,7 +231,7 @@ const FleetDashboard = ({
     const dbEntry = {
       matricula:           ac.tailNumber.toUpperCase(),
       modelo:              ac.model.toUpperCase(),
-      estado:              ac.status,       // siempre inglés: 'operational' | 'maintenance' | 'grounded'
+      estado:              ac.status,
       horas_vuelo_totales: ac.totalHours,
       sede:                ac.sede,
     };
@@ -129,7 +245,6 @@ const FleetDashboard = ({
       return;
     }
 
-    // Si maintenance → crear orden de trabajo automáticamente en ControlHub
     if (ac.status === 'maintenance' && hangarData && data?.length) {
       const { error: ordenError } = await supabase
         .from('ordenes_trabajo').insert([{
@@ -147,7 +262,6 @@ const FleetDashboard = ({
       }
     }
 
-    // Reset form — el Realtime de Index.tsx actualizará fleetData automáticamente
     setIsModalOpen(false);
     setNewAircraft({ tailNumber: '', model: '', totalHours: 0, status: 'operational', sede: 'LARA' });
     setLoading(false);
@@ -159,11 +273,11 @@ const FleetDashboard = ({
   };
 
   // ── RENDER ────────────────────────────────────────────────────────────────
+
   if (selectedAircraft) {
     return <AircraftDetail aircraft={selectedAircraft} onBack={() => setSelectedAircraft(null)} />;
   }
 
-  // Mapear status para AircraftCard — normalizar valores que vengan de DB en español
   const normalizedFleet = fleetData.map(ac => ({
     ...ac,
     status: normalizeAircraftStatus(ac.status as string),
@@ -191,9 +305,183 @@ const FleetDashboard = ({
       {/* Grid de tarjetas */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {normalizedFleet.map(ac => (
-          <AircraftCard key={ac.id} aircraft={ac} onSelect={setSelectedAircraft} />
+          <div key={ac.id} className="relative group">
+            <AircraftCard aircraft={ac} onSelect={setSelectedAircraft} />
+
+            {/* Botón Editar — solo visible en aeronaves en mantenimiento */}
+            {ac.status === 'maintenance' && (
+              <button
+                onClick={e => { e.stopPropagation(); handleEditarMantenimiento(ac); }}
+                disabled={loading}
+                className="absolute top-3 right-3 flex items-center gap-1.5 px-3 py-1.5
+                           bg-[#E1AD01] text-black text-[8px] font-black uppercase tracking-widest
+                           rounded-lg shadow-lg hover:bg-white transition-all
+                           opacity-0 group-hover:opacity-100 disabled:opacity-30 z-10"
+              >
+                {loading
+                  ? <Loader2 size={10} className="animate-spin" />
+                  : <Pencil size={10} />
+                }
+                Editar Orden
+              </button>
+            )}
+          </div>
         ))}
       </div>
+
+      {/* ════════════════════════════════════════════════════════════
+          MODAL — EDITAR ORDEN DE TRABAJO EN MANTENIMIENTO
+      ════════════════════════════════════════════════════════════ */}
+      {isEditOpen && ordenEditing && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/98
+                        backdrop-blur-xl p-4 animate-in fade-in duration-200">
+          <div className="bg-[#0a0a0a] border border-[#E1AD01]/40 w-full max-w-lg
+                          rounded-[2.5rem] shadow-[0_0_80px_rgba(225,173,1,0.12)] overflow-hidden">
+
+            {/* Header */}
+            <div className="bg-[#E1AD01]/10 border-b border-[#E1AD01]/20 px-7 py-5
+                            flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <div className="w-10 h-10 rounded-xl bg-[#E1AD01] flex items-center justify-center shrink-0">
+                  <ClipboardList size={18} className="text-black" />
+                </div>
+                <div>
+                  <p className="text-[11px] font-black text-white uppercase tracking-wider">
+                    Actualizar Orden de Trabajo
+                  </p>
+                  <p className="text-[9px] text-[#E1AD01]/70 font-mono uppercase tracking-widest mt-0.5">
+                    {ordenEditing.matricula} · {ordenEditing.modelo}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => { setIsEditOpen(false); setOrdenEditing(null); }}
+                className="text-zinc-600 hover:text-white hover:rotate-90 transition-all">
+                <X size={20} />
+              </button>
+            </div>
+
+            <form onSubmit={handleGuardarEdicion} className="p-7 space-y-5 font-mono">
+
+              {/* Resumen de la orden actual */}
+              <div className="bg-white/[0.02] border border-white/[0.07] rounded-2xl p-4 space-y-2">
+                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-3">
+                  Estado actual de la orden
+                </p>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <p className="text-[8px] text-zinc-600 uppercase tracking-widest">Tarea</p>
+                    <p className="text-[10px] text-white font-black uppercase mt-0.5 leading-snug">
+                      {ordenEditing.descripcion_tarea}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[8px] text-zinc-600 uppercase tracking-widest">Técnico</p>
+                    <p className="text-[10px] text-white font-black uppercase mt-0.5">
+                      {ordenEditing.nombre_mecanico}
+                    </p>
+                  </div>
+                </div>
+                {ordenEditing.observaciones && (
+                  <div className="border-t border-white/5 pt-3 mt-2">
+                    <p className="text-[8px] text-zinc-600 uppercase tracking-widest mb-1">
+                      Observaciones registradas
+                    </p>
+                    <p className="text-[9px] text-zinc-400 font-mono leading-relaxed whitespace-pre-line
+                                  max-h-20 overflow-y-auto">
+                      {ordenEditing.observaciones}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Nuevos hallazgos — campo principal */}
+              <div className="space-y-1.5">
+                <label className="text-[9px] font-black text-[#E1AD01] uppercase tracking-widest
+                                  flex items-center gap-2">
+                  <PlusCircle size={12} /> Daños Adicionales
+                </label>
+                <textarea
+                  rows={3}
+                  className="w-full bg-black border border-[#E1AD01]/30 rounded-xl p-4 text-white
+                             text-xs resize-none outline-none focus:border-[#E1AD01] transition-all
+                             placeholder:text-white/20 uppercase font-mono"
+                  placeholder="Describir daños o hallazgos adicionales encontrados durante la revisión..."
+                  value={editForm.nuevosHallazgos}
+                  onChange={e => setEditForm(prev => ({ ...prev, nuevosHallazgos: e.target.value }))}
+                />
+                <p className="text-[8px] text-zinc-700 font-mono">
+                  Se registrará con timestamp automático en el historial de la orden.
+                </p>
+              </div>
+
+              {/* Técnico asignado */}
+              <div className="space-y-1.5">
+                <label className="text-[9px] font-black text-zinc-400 uppercase tracking-widest block">
+                  Técnico Asignado
+                </label>
+                <input
+                  className={INPUT_CLS}
+                  placeholder="Nombre del técnico"
+                  value={editForm.mecanico}
+                  onChange={e => setEditForm(prev => ({ ...prev, mecanico: e.target.value }))}
+                />
+              </div>
+
+              {/* Estado de la orden */}
+              <div className="space-y-1.5">
+                <label className="text-[9px] font-black text-zinc-400 uppercase tracking-widest block">
+                  Estado de la Orden
+                </label>
+                <select
+                  className={SELECT_CLS}
+                  value={editForm.estado}
+                  onChange={e => setEditForm(prev => ({ ...prev, estado: e.target.value }))}
+                >
+                  <option value="In Progress">EN PROGRESO</option>
+                  <option value="Pending Parts">ESPERANDO REPUESTOS</option>
+                  <option value="Completed">COMPLETADA</option>
+                  <option value="On Hold">EN ESPERA</option>
+                </select>
+              </div>
+
+              {/* Alerta informativa */}
+              <div className="flex items-start gap-2 bg-[#E1AD01]/5 border border-[#E1AD01]/15 rounded-xl p-3">
+                <AlertCircle size={13} className="text-[#E1AD01] shrink-0 mt-0.5" />
+                <p className="text-[9px] text-[#E1AD01]/70 leading-relaxed">
+                  Los nuevos hallazgos se <span className="font-black text-[#E1AD01]">agregan al historial</span> de
+                  la orden existente con fecha y hora. No se crea una orden nueva.
+                </p>
+              </div>
+
+              {/* Botones */}
+              <div className="flex gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setIsEditOpen(false); setOrdenEditing(null); }}
+                  className="flex-1 py-4 rounded-xl border border-white/10 text-zinc-400
+                             text-[10px] font-black uppercase hover:bg-white/5 transition-all"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="flex-1 py-4 rounded-xl bg-[#E1AD01] text-black text-[10px] font-black
+                             uppercase hover:bg-white transition-all disabled:opacity-40
+                             flex items-center justify-center gap-2"
+                >
+                  {loading
+                    ? <Loader2 size={14} className="animate-spin" />
+                    : <CheckCircle2 size={14} />
+                  }
+                  {loading ? 'Guardando...' : 'Guardar Cambios'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* ════════════════════════════════════════════════════════════
           MODAL PASO 1 — REGISTRO DE AERONAVE

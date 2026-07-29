@@ -1,20 +1,16 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v10.0 — HARDENED
-// FIXES CRÍTICOS v10.0:
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v11.0 — CxC ALUMNOS + HORAS DE VUELO
+// FIXES CRÍTICOS v10.0 (preservados):
 //   FIX 1 — Race condition eliminada: realtime ES la única fuente de actualización.
-//            fetchAll() manual solo en mount. Post-insert: NO fetchAll(), el realtime lo maneja.
-//            fetchLock ref previene ejecuciones concurrentes del mismo fetch.
 //   FIX 2 — Montos BS guardados en BS nativo, sin conversión a USD.
-//            La tasa BCV solo se usa para DISPLAY en reportes consolidados.
-//            Floating point: todos los montos se roundean a 2 decimales antes de guardar.
 //   FIX 3 — Tasa BCV dinámica: configurable en runtime, no hardcodeada.
-//   FIX 4 — Optimistic updates: el registro aparece al instante en UI,
-//            se revierte si el insert falla.
-//   FIX 5 — Lock por formulario: cada form tiene su propio flag de envío,
-//            botón se deshabilita hasta confirmar éxito o error.
-//   FIX 6 — Idempotency key: cada transacción lleva client_tx_id (UUID v4)
-//            para que el servidor rechace duplicados.
-//   FIX 7 — Errores mostrados inline (no alert()), con auto-clear a 5s.
-// PRESERVADO: toda la UI, tabs, cajas chicas, CxC/CxP, cierre.
+//   FIX 4 — Optimistic updates.
+//   FIX 5 — Lock por formulario.
+//   FIX 6 — Idempotency key (client_tx_id).
+//   FIX 7 — Errores mostrados inline (no alert()).
+// NUEVO v11.0:
+//   — CxC ahora vive en tabla `cuentas_por_cobrar` (alumno + horas), separada de CxP (`cuentas_generales`).
+//   — Selector de alumno (lista de perfiles_estudiantes, role=student).
+//   — Al marcar "Cobrado" se acreditan horas_compradas = horas_prometidas → las lee FlightRegister y useStudentData.
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -47,6 +43,28 @@ interface CuentaGeneral {
   monto_total: number; monto_pendiente: number; concepto: string;
   fecha_emision: string; fecha_vencimiento?: string;
   estatus: 'PENDIENTE' | 'PAGADO' | 'PARCIAL'; notas?: string;
+}
+// NUEVO v11.0 — CxC de alumnos (tabla cuentas_por_cobrar)
+interface CuentaPorCobrar {
+  id: string;
+  student_id: string;
+  alumno_id: string;
+  nombre_alumno: string;
+  student_serial: string;
+  monto_total: number;
+  monto_pagado: number;
+  monto_pendiente: number;
+  horas_prometidas: number;
+  horas_compradas: number;
+  concepto: string;
+  fecha_emision: string;
+  estatus: 'PENDIENTE' | 'COBRADO' | 'PARCIAL';
+}
+interface AlumnoCxC {
+  student_id: string;
+  nombre: string;
+  serial: string;
+  sede: string;
 }
 interface FinancePanelProps {
   vendors: Vendor[]; inventory: any[]; userRole?: string;
@@ -136,8 +154,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [requests,     setRequests]     = useState<any[]>([]);
   const [cajas,        setCajas]        = useState<CajaChica[]>([]);
   const [movCajas,     setMovCajas]     = useState<MovimientoCaja[]>([]);
-  const [cuentas,      setCuentas]      = useState<CuentaGeneral[]>([]);
+  const [cuentas,      setCuentas]      = useState<CuentaGeneral[]>([]);   // CXP (cuentas_generales)
   const [capitanes,    setCapitanes]    = useState<any[]>([]);
+  const [alumnos,      setAlumnos]      = useState<AlumnoCxC[]>([]);        // NUEVO v11.0
+  const [cuentasCxC,   setCuentasCxC]   = useState<CuentaPorCobrar[]>([]);  // NUEVO v11.0 (cuentas_por_cobrar)
 
   // UI state
   const [loading,       setLoading]       = useState(true);
@@ -169,9 +189,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
     monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
   });
+  // NUEVO v11.0 — cuentaForm ahora soporta CXC (alumno + horas) y CXP (proveedor/libre)
   const [cuentaForm, setCuentaForm] = useState({
-    tipo: 'CXC' as 'CXC' | 'CXP', entidad_nombre: '', entidad_tipo: 'LIBRE',
-    proveedor_id: '', moneda: 'USDT' as PaymentMethod,
+    tipo: 'CXC' as 'CXC' | 'CXP',
+    // CxC — alumno
+    alumno_student_id: '',
+    horas_prometidas: '',
+    ya_pagado: false, // NUEVO — si el pago fue directo, no queda como pendiente
+    // CxP — proveedor/libre
+    entidad_nombre: '', entidad_tipo: 'LIBRE',
+    proveedor_id: '',
+    moneda: 'USDT' as PaymentMethod,
     monto_total: '', concepto: '',
     fecha_emision: new Date().toISOString().split('T')[0],
     fecha_vencimiento: '', notas: '',
@@ -189,13 +217,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     if (!silent) setLoading(true);
 
     try {
-      const [txRes, reqRes, cajasRes, movRes, cuentasRes, capRes] = await Promise.all([
+      const [txRes, reqRes, cajasRes, movRes, cuentasRes, capRes, alumnosRes, cxcRes] = await Promise.all([
         supabase.from('transacciones_finanzas').select('*').order('issue_date', { ascending: false }),
         supabase.from('solicitudes_compra').select('*').order('created_at', { ascending: false }),
         supabase.from('cajas_chicas').select('*').order('nombre'),
         supabase.from('movimientos_caja_chica').select('*').order('fecha', { ascending: false }),
-        supabase.from('cuentas_generales').select('*').order('fecha_emision', { ascending: false }),
+        supabase.from('cuentas_generales').select('*').eq('tipo', 'CXP').order('fecha_emision', { ascending: false }),
         supabase.from('capitanes').select('*').order('nombre'),
+        supabase.from('perfiles_estudiantes').select('id, nombre_completo, student_serial, sede').eq('role', 'student').order('nombre_completo'),
+        supabase.from('cuentas_por_cobrar').select('*').order('fecha_emision', { ascending: false }),
       ]);
 
       if (txRes.data) {
@@ -221,6 +251,20 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         monto_pendiente: round2(Number(c.monto_pendiente) || 0),
       })));
       if (capRes.data)     setCapitanes(capRes.data);
+      if (alumnosRes.data) setAlumnos(alumnosRes.data.map((a: any) => ({
+        student_id: a.id,
+        nombre: a.nombre_completo || 'SIN NOMBRE',
+        serial: a.student_serial || '—',
+        sede: a.sede || '—',
+      })));
+      if (cxcRes.data) setCuentasCxC(cxcRes.data.map((c: any) => ({
+        ...c,
+        monto_total:      round2(Number(c.monto_total) || 0),
+        monto_pagado:     round2(Number(c.monto_pagado) || 0),
+        monto_pendiente:  round2(Number(c.monto_pendiente) || 0),
+        horas_prometidas: Number(c.horas_prometidas) || 0,
+        horas_compradas:  Number(c.horas_compradas) || 0,
+      })));
     } catch (e) {
       console.error('[FinancePanel] fetchAll error:', e);
     } finally {
@@ -240,12 +284,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   useEffect(() => {
     fetchAll();
 
-    const ch = supabase.channel('finance-v10')
+    const ch = supabase.channel('finance-v11')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' },  handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' },       handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cajas_chicas' },             handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'movimientos_caja_chica' },   handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_generales' },        handleRealtimeChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_por_cobrar' },       handleRealtimeChange)
       .subscribe();
 
     return () => {
@@ -271,10 +316,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       .reduce((acc, m) => round2(m.tipo === 'ENTRADA' ? acc + m.monto : acc - m.monto), 0),
   [movCajas]);
 
+  // NUEVO v11.0 — totalCxC ahora viene de cuentas_por_cobrar
   const totalCxC = useMemo(() =>
-    cuentas.filter(c => c.tipo === 'CXC' && c.estatus !== 'PAGADO')
+    cuentasCxC.filter(c => c.estatus !== 'COBRADO')
       .reduce((a, c) => round2(a + c.monto_pendiente), 0),
-  [cuentas]);
+  [cuentasCxC]);
   const totalCxP = useMemo(() =>
     cuentas.filter(c => c.tipo === 'CXP' && c.estatus !== 'PAGADO')
       .reduce((a, c) => round2(a + c.monto_pendiente), 0),
@@ -379,20 +425,62 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
   };
 
-  // ─── HANDLER: CUENTA GENERAL ──────────────────────────────────────────────
+  // ─── HANDLER: CUENTA (CxC alumno / CxP proveedor) ─────────────────────────
+  // NUEVO v11.0 — ramifica según tipo: CXC va a cuentas_por_cobrar, CXP a cuentas_generales
   const handleCuenta = async (e: React.FormEvent) => {
     e.preventDefault();
     setCuentaError(null);
 
+    // ── CXC: alumno + horas → tabla cuentas_por_cobrar ──────────────────
+    if (cuentaForm.tipo === 'CXC') {
+      const horas = parseFloat(cuentaForm.horas_prometidas);
+      const monto = round2(parseFloat(cuentaForm.monto_total));
+      if (!cuentaForm.alumno_student_id) { setCuentaError('Selecciona un alumno.'); return; }
+      if (isNaN(horas) || horas <= 0)    { setCuentaError('Horas inválidas.'); return; }
+      if (isNaN(monto) || monto <= 0)    { setCuentaError('Monto inválido.'); return; }
+      if (!cuentaForm.concepto.trim())   { setCuentaError('Concepto requerido.'); return; }
+
+      const alumno = alumnos.find(a => a.student_id === cuentaForm.alumno_student_id);
+      if (!alumno) { setCuentaError('Alumno no encontrado.'); return; }
+
+      setSavingCuenta(true);
+      try {
+        const pagado = cuentaForm.ya_pagado;
+        const { error } = await supabase.from('cuentas_por_cobrar').insert([{
+          student_id:       alumno.student_id,
+          alumno_id:        alumno.student_id,
+          nombre_alumno:    alumno.nombre,
+          student_serial:   alumno.serial,
+          monto_total:      monto,
+          monto_pagado:     pagado ? monto : 0,
+          monto_pendiente:  pagado ? 0 : monto,
+          horas_prometidas: horas,
+          horas_compradas:  pagado ? horas : 0, // si ya pagó, acredita horas de inmediato
+          concepto:         cuentaForm.concepto.toUpperCase().trim(),
+          fecha_emision:    cuentaForm.fecha_emision,
+          estatus:          pagado ? 'COBRADO' : 'PENDIENTE',
+        }]);
+        if (error) { setCuentaError(`Error: ${error.message}`); return; }
+        setCuentaForm(p => ({ ...p, alumno_student_id: '', horas_prometidas: '', monto_total: '', concepto: '', notas: '', ya_pagado: false }));
+        setShowCuentaForm(false);
+      } catch (err) {
+        setCuentaError(err instanceof Error ? err.message : 'Error de conexión.');
+      } finally {
+        setSavingCuenta(false);
+      }
+      return;
+    }
+
+    // ── CXP: proveedor/libre → tabla cuentas_generales (flujo original) ─
     const num = round2(parseFloat(cuentaForm.monto_total));
-    if (isNaN(num) || num <= 0) { setCuentaError('Monto inválido.'); return; }
-    if (!cuentaForm.entidad_nombre.trim()) { setCuentaError('Nombre de entidad requerido.'); return; }
-    if (!cuentaForm.concepto.trim()) { setCuentaError('Concepto requerido.'); return; }
+    if (isNaN(num) || num <= 0)              { setCuentaError('Monto inválido.'); return; }
+    if (!cuentaForm.entidad_nombre.trim())   { setCuentaError('Nombre de entidad requerido.'); return; }
+    if (!cuentaForm.concepto.trim())         { setCuentaError('Concepto requerido.'); return; }
 
     setSavingCuenta(true);
     try {
       const { error } = await supabase.from('cuentas_generales').insert([{
-        tipo:              cuentaForm.tipo,
+        tipo:              'CXP',
         entidad_nombre:    cuentaForm.entidad_nombre.toUpperCase().trim(),
         entidad_tipo:      cuentaForm.entidad_tipo,
         proveedor_id:      cuentaForm.proveedor_id || null,
@@ -422,27 +510,46 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
   };
 
-  // ─── HANDLER: PAGAR CUENTA ────────────────────────────────────────────────
-  const handlePagarCuenta = async (id: string) => {
+  // ─── HANDLER: PAGAR / COBRAR CUENTA ───────────────────────────────────────
+  // NUEVO v11.0 — segundo parámetro indica si es CxC (alumno) o CxP (proveedor)
+  // Al cobrar CxC: acredita horas_compradas = horas_prometidas
+  const handlePagarCuenta = async (id: string, esCxC: boolean) => {
     if (savingAction) return;
     setSavingAction(id);
     try {
-      const { error } = await supabase
-        .from('cuentas_generales')
-        .update({ estatus: 'PAGADO', monto_pendiente: 0 })
-        .eq('id', id);
-      if (error) console.error('[FinancePanel] pagar cuenta:', error.message);
+      if (esCxC) {
+        const registro = cuentasCxC.find(c => c.id === id);
+        if (!registro) return;
+        const { error } = await supabase
+          .from('cuentas_por_cobrar')
+          .update({
+            estatus:          'COBRADO',
+            monto_pagado:     registro.monto_total,
+            monto_pendiente:  0,
+            horas_compradas:  registro.horas_prometidas, // acredita horas al cobrar
+          })
+          .eq('id', id);
+        if (error) console.error('[FinancePanel] pagar CxC:', error.message);
+      } else {
+        const { error } = await supabase
+          .from('cuentas_generales')
+          .update({ estatus: 'PAGADO', monto_pendiente: 0 })
+          .eq('id', id);
+        if (error) console.error('[FinancePanel] pagar CxP:', error.message);
+      }
     } finally {
       setSavingAction(null);
     }
   };
 
-  const handleDeleteCuenta = async (id: string) => {
+  // NUEVO v11.0 — segundo parámetro indica si es CxC o CxP
+  const handleDeleteCuenta = async (id: string, esCxC: boolean) => {
     if (!window.confirm('¿Eliminar esta cuenta?')) return;
     if (savingAction) return;
     setSavingAction(id);
     try {
-      await supabase.from('cuentas_generales').delete().eq('id', id);
+      if (esCxC) await supabase.from('cuentas_por_cobrar').delete().eq('id', id);
+      else       await supabase.from('cuentas_generales').delete().eq('id', id);
     } finally {
       setSavingAction(null);
     }
@@ -581,7 +688,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
       <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">
-        Valkyron Financial Core v10.0...
+        Valkyron Financial Core v11.0...
       </p>
     </div>
   );
@@ -594,7 +701,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
           <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">
-            Valkyron Financial Core v10.0
+            Valkyron Financial Core v11.0
           </p>
           <button onClick={() => fetchAll(true)} title="Recargar datos"
             className="text-zinc-700 hover:text-[#E1AD01] transition-colors">
@@ -1054,6 +1161,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic flex items-center gap-2">
                 <ReceiptText className="text-[#E1AD01] h-4 w-4" /> Registrar Cuenta
               </h3>
+              {/* NUEVO v11.0 — formulario ramificado CXC (alumno+horas) / CXP (proveedor/libre) */}
               <form onSubmit={handleCuenta} className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10 md:col-span-1">
                   {(['CXC','CXP'] as const).map(tipo => (
@@ -1067,39 +1175,76 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </button>
                   ))}
                 </div>
-                <select value={cuentaForm.moneda} onChange={e=>setCuentaForm(p=>({...p,moneda:e.target.value as any}))} className={inp}>
-                  <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
-                  <option value="CASH">CASH</option><option value="BS">BS</option>
-                </select>
-                <select value={cuentaForm.entidad_tipo} onChange={e=>setCuentaForm(p=>({...p,entidad_tipo:e.target.value,entidad_nombre:e.target.value==='PROVEEDOR'?'':p.entidad_nombre,proveedor_id:''}))} className={inp}>
-                  <option value="LIBRE">Entidad Libre</option>
-                  <option value="PROVEEDOR">Proveedor Registrado</option>
-                  <option value="CLIENTE">Cliente</option>
-                </select>
-                {cuentaForm.entidad_tipo === 'PROVEEDOR' ? (
-                  <select required value={cuentaForm.proveedor_id}
-                    onChange={e => { const v=vendors.find(v=>v.id===e.target.value); setCuentaForm(p=>({...p,proveedor_id:e.target.value,entidad_nombre:v?.name||''})); }}
-                    className={inp}>
-                    <option value="">— PROVEEDOR —</option>
-                    {vendors.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}
-                  </select>
+
+                {cuentaForm.tipo === 'CXC' ? (
+                  <>
+                    <select required value={cuentaForm.alumno_student_id}
+                      onChange={e => setCuentaForm(p=>({...p, alumno_student_id: e.target.value}))}
+                      className={inp}>
+                      <option value="">— ALUMNO —</option>
+                      {alumnos.map(a => (
+                        <option key={a.student_id} value={a.student_id}>
+                          {a.nombre} · {a.sede}
+                        </option>
+                      ))}
+                    </select>
+                    <input type="number" step="0.5" min="0.5" required value={cuentaForm.horas_prometidas}
+                      onChange={e => setCuentaForm(p=>({...p, horas_prometidas: e.target.value}))}
+                      placeholder="HORAS COMPRADAS" className={inp} />
+                    <input type="number" step="0.01" min="0.01" required value={cuentaForm.monto_total}
+                      onChange={e=>setCuentaForm(p=>({...p,monto_total:e.target.value}))}
+                      onBlur={e=>{ const n=parseFloat(e.target.value); if(!isNaN(n)) setCuentaForm(p=>({...p,monto_total:round2(n).toString()})); }}
+                      placeholder="MONTO ($)" className={inp} />
+                    <input required value={cuentaForm.concepto} onChange={e=>setCuentaForm(p=>({...p,concepto:e.target.value}))}
+                      placeholder="CONCEPTO (ej: PAQUETE 10 HORAS)" className={`${inp} md:col-span-2`} />
+                    <input type="date" required value={cuentaForm.fecha_emision}
+                      onChange={e=>setCuentaForm(p=>({...p,fecha_emision:e.target.value}))} className={inp} style={{textTransform:'none'}} />
+                    <label className="flex items-center gap-3 bg-black/40 border border-white/10 rounded-2xl p-4 cursor-pointer md:col-span-3">
+                      <input type="checkbox" checked={cuentaForm.ya_pagado}
+                        onChange={e => setCuentaForm(p => ({ ...p, ya_pagado: e.target.checked }))}
+                        className="w-4 h-4 accent-[#E1AD01]" />
+                      <span className="text-[9px] font-black uppercase tracking-widest text-zinc-300">
+                        Pago recibido de una vez — acredita horas inmediatamente (no queda como pendiente)
+                      </span>
+                    </label>
+                  </>
                 ) : (
-                  <input required value={cuentaForm.entidad_nombre}
-                    onChange={e=>setCuentaForm(p=>({...p,entidad_nombre:e.target.value}))}
-                    placeholder="NOMBRE ENTIDAD / DEUDOR" className={inp} />
+                  <>
+                    <select value={cuentaForm.moneda} onChange={e=>setCuentaForm(p=>({...p,moneda:e.target.value as any}))} className={inp}>
+                      <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
+                      <option value="CASH">CASH</option><option value="BS">BS</option>
+                    </select>
+                    <select value={cuentaForm.entidad_tipo} onChange={e=>setCuentaForm(p=>({...p,entidad_tipo:e.target.value,entidad_nombre:e.target.value==='PROVEEDOR'?'':p.entidad_nombre,proveedor_id:''}))} className={inp}>
+                      <option value="LIBRE">Entidad Libre</option>
+                      <option value="PROVEEDOR">Proveedor Registrado</option>
+                    </select>
+                    {cuentaForm.entidad_tipo === 'PROVEEDOR' ? (
+                      <select required value={cuentaForm.proveedor_id}
+                        onChange={e => { const v=vendors.find(v=>v.id===e.target.value); setCuentaForm(p=>({...p,proveedor_id:e.target.value,entidad_nombre:v?.name||''})); }}
+                        className={inp}>
+                        <option value="">— PROVEEDOR —</option>
+                        {vendors.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}
+                      </select>
+                    ) : (
+                      <input required value={cuentaForm.entidad_nombre}
+                        onChange={e=>setCuentaForm(p=>({...p,entidad_nombre:e.target.value}))}
+                        placeholder="NOMBRE ENTIDAD / DEUDOR" className={inp} />
+                    )}
+                    <input type="number" step="0.01" min="0.01" required value={cuentaForm.monto_total}
+                      onChange={e=>setCuentaForm(p=>({...p,monto_total:e.target.value}))}
+                      onBlur={e=>{ const n=parseFloat(e.target.value); if(!isNaN(n)) setCuentaForm(p=>({...p,monto_total:round2(n).toString()})); }}
+                      placeholder="MONTO" className={inp} />
+                    <input required value={cuentaForm.concepto} onChange={e=>setCuentaForm(p=>({...p,concepto:e.target.value}))}
+                      placeholder="CONCEPTO / DESCRIPCIÓN" className={inp} />
+                    <input type="date" required value={cuentaForm.fecha_emision}
+                      onChange={e=>setCuentaForm(p=>({...p,fecha_emision:e.target.value}))} className={inp} style={{textTransform:'none'}} />
+                    <input type="date" value={cuentaForm.fecha_vencimiento}
+                      onChange={e=>setCuentaForm(p=>({...p,fecha_vencimiento:e.target.value}))} className={inp} style={{textTransform:'none'}} />
+                    <input value={cuentaForm.notas||''} onChange={e=>setCuentaForm(p=>({...p,notas:e.target.value}))}
+                      placeholder="NOTAS (opcional)" className={inp} />
+                  </>
                 )}
-                <input type="number" step="0.01" min="0.01" required value={cuentaForm.monto_total}
-                  onChange={e=>setCuentaForm(p=>({...p,monto_total:e.target.value}))}
-                  onBlur={e=>{ const n=parseFloat(e.target.value); if(!isNaN(n)) setCuentaForm(p=>({...p,monto_total:round2(n).toString()})); }}
-                  placeholder="MONTO" className={inp} />
-                <input required value={cuentaForm.concepto} onChange={e=>setCuentaForm(p=>({...p,concepto:e.target.value}))}
-                  placeholder="CONCEPTO / DESCRIPCIÓN" className={inp} />
-                <input type="date" required value={cuentaForm.fecha_emision}
-                  onChange={e=>setCuentaForm(p=>({...p,fecha_emision:e.target.value}))} className={inp} style={{textTransform:'none'}} />
-                <input type="date" value={cuentaForm.fecha_vencimiento}
-                  onChange={e=>setCuentaForm(p=>({...p,fecha_vencimiento:e.target.value}))} className={inp} style={{textTransform:'none'}} />
-                <input value={cuentaForm.notas||''} onChange={e=>setCuentaForm(p=>({...p,notas:e.target.value}))}
-                  placeholder="NOTAS (opcional)" className={inp} />
+
                 <ErrorBanner msg={cuentaError} onClose={() => setCuentaError(null)} />
                 <div className="md:col-span-3 flex gap-3">
                   <button type="submit" disabled={savingCuenta}
@@ -1115,69 +1260,117 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
           )}
 
+          {/* NUEVO v11.0 — CxC (cuentas_por_cobrar, alumnos) y CxP (cuentas_generales, proveedores) separados */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {['CXC','CXP'].map(tipo => {
-              const esCxC = tipo === 'CXC';
-              const lista = cuentas.filter(c => c.tipo === tipo);
-              const total = lista.filter(c=>c.estatus!=='PAGADO').reduce((a,c)=>round2(a+c.monto_pendiente),0);
-              return (
-                <div key={tipo} className={`${glass} rounded-3xl overflow-hidden`}>
-                  <div className={`p-5 border-b border-white/5 ${esCxC ? 'bg-yellow-500/5' : 'bg-red-500/5'}`}>
-                    <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
-                      {esCxC ? <ArrowUpCircle className="text-yellow-400 h-4 w-4" /> : <ArrowDownCircle className="text-red-400 h-4 w-4" />}
-                      {esCxC ? 'Cuentas por Cobrar' : 'Cuentas por Pagar'}
-                      <span className={`ml-auto font-mono ${esCxC ? 'text-yellow-400' : 'text-red-400'}`}>
-                        ${total.toLocaleString('es-VE',{minimumFractionDigits:2})}
-                      </span>
-                    </h3>
-                  </div>
-                  <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
-                    {lista.map(c => (
-                      <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all
-                                                  ${c.estatus==='PAGADO' ? 'border-emerald-500/10 opacity-50' : esCxC ? 'border-yellow-500/10 hover:bg-white/[0.04]' : 'border-red-500/10 hover:bg-white/[0.04]'}`}>
-                        <div className="flex justify-between items-start mb-2">
-                          <div>
-                            <p className="text-[10px] font-black uppercase">{c.entidad_nombre}</p>
-                            <p className="text-[8px] text-zinc-600 font-mono">{c.concepto} · {fmtDate(c.fecha_emision)}</p>
-                            {c.fecha_vencimiento && !esCxC && (
-                              <p className="text-[8px] text-orange-400/70 font-mono mt-0.5">Vence: {fmtDate(c.fecha_vencimiento)}</p>
-                            )}
-                          </div>
-                          <div className="text-right">
-                            <p className={`font-black italic text-base ${c.estatus==='PAGADO' ? 'text-emerald-400' : esCxC ? 'text-yellow-400' : 'text-red-400'}`}>
-                              {fmtMonto(c.monto_pendiente, c.moneda)}
-                            </p>
-                            <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full
-                              ${c.estatus==='PAGADO' ? 'bg-emerald-500/10 text-emerald-500'
-                                : c.estatus==='PARCIAL' ? 'bg-blue-500/10 text-blue-400'
-                                : esCxC ? 'bg-yellow-500/10 text-yellow-500' : 'bg-red-500/10 text-red-500'}`}>
-                              {c.estatus}
-                            </span>
-                          </div>
-                        </div>
-                        {c.estatus !== 'PAGADO' && (
-                          <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
-                            <button onClick={() => handlePagarCuenta(c.id)} disabled={savingAction === c.id}
-                              className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
-                              {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><CheckCircle2 size={11}/> {esCxC ? 'Cobrado' : 'Pagado'}</>}
-                            </button>
-                            <button onClick={() => handleDeleteCuenta(c.id)} disabled={savingAction === c.id}
-                              className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
-                              <Trash2 size={12}/>
-                            </button>
-                          </div>
-                        )}
+
+            {/* CxC — alumnos */}
+            <div className={`${glass} rounded-3xl overflow-hidden`}>
+              <div className="p-5 border-b border-white/5 bg-yellow-500/5">
+                <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
+                  <ArrowUpCircle className="text-yellow-400 h-4 w-4" /> Cuentas por Cobrar (Alumnos)
+                  <span className="ml-auto font-mono text-yellow-400">
+                    ${totalCxC.toLocaleString('es-VE',{minimumFractionDigits:2})}
+                  </span>
+                </h3>
+              </div>
+              <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
+                {cuentasCxC.map(c => (
+                  <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all
+                                              ${c.estatus==='COBRADO' ? 'border-emerald-500/10 opacity-50' : 'border-yellow-500/10 hover:bg-white/[0.04]'}`}>
+                    <div className="flex justify-between items-start mb-2">
+                      <div>
+                        <p className="text-[10px] font-black uppercase">{c.nombre_alumno}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono">{c.concepto} · {fmtDate(c.fecha_emision)}</p>
+                        <p className="text-[8px] text-[#E1AD01] font-mono mt-0.5">
+                          {c.horas_prometidas}h prometidas
+                          {c.estatus === 'COBRADO' && ` · ${c.horas_compradas}h acreditadas`}
+                        </p>
                       </div>
-                    ))}
-                    {lista.length === 0 && (
-                      <div className="text-center py-12 text-zinc-700">
-                        <p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas {esCxC ? 'por cobrar' : 'por pagar'}</p>
+                      <div className="text-right">
+                        <p className={`font-black italic text-base ${c.estatus==='COBRADO' ? 'text-emerald-400' : 'text-yellow-400'}`}>
+                          ${c.monto_pendiente.toLocaleString('es-VE',{minimumFractionDigits:2})}
+                        </p>
+                        <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full
+                          ${c.estatus==='COBRADO' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-yellow-500/10 text-yellow-500'}`}>
+                          {c.estatus}
+                        </span>
+                      </div>
+                    </div>
+                    {c.estatus !== 'COBRADO' && (
+                      <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
+                        <button onClick={() => handlePagarCuenta(c.id, true)} disabled={savingAction === c.id}
+                          className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
+                          {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><CheckCircle2 size={11}/> Cobrado (acredita horas)</>}
+                        </button>
+                        <button onClick={() => handleDeleteCuenta(c.id, true)} disabled={savingAction === c.id}
+                          className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
+                          <Trash2 size={12}/>
+                        </button>
                       </div>
                     )}
                   </div>
-                </div>
-              );
-            })}
+                ))}
+                {cuentasCxC.length === 0 && (
+                  <div className="text-center py-12 text-zinc-700">
+                    <p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por cobrar</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* CxP — proveedores */}
+            <div className={`${glass} rounded-3xl overflow-hidden`}>
+              <div className="p-5 border-b border-white/5 bg-red-500/5">
+                <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
+                  <ArrowDownCircle className="text-red-400 h-4 w-4" /> Cuentas por Pagar
+                  <span className="ml-auto font-mono text-red-400">
+                    ${totalCxP.toLocaleString('es-VE',{minimumFractionDigits:2})}
+                  </span>
+                </h3>
+              </div>
+              <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
+                {cuentas.map(c => (
+                  <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all
+                                              ${c.estatus==='PAGADO' ? 'border-emerald-500/10 opacity-50' : 'border-red-500/10 hover:bg-white/[0.04]'}`}>
+                    <div className="flex justify-between items-start mb-2">
+                      <div>
+                        <p className="text-[10px] font-black uppercase">{c.entidad_nombre}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono">{c.concepto} · {fmtDate(c.fecha_emision)}</p>
+                        {c.fecha_vencimiento && (
+                          <p className="text-[8px] text-orange-400/70 font-mono mt-0.5">Vence: {fmtDate(c.fecha_vencimiento)}</p>
+                        )}
+                      </div>
+                      <div className="text-right">
+                        <p className={`font-black italic text-base ${c.estatus==='PAGADO' ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {fmtMonto(c.monto_pendiente, c.moneda)}
+                        </p>
+                        <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full
+                          ${c.estatus==='PAGADO' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-500'}`}>
+                          {c.estatus}
+                        </span>
+                      </div>
+                    </div>
+                    {c.estatus !== 'PAGADO' && (
+                      <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
+                        <button onClick={() => handlePagarCuenta(c.id, false)} disabled={savingAction === c.id}
+                          className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
+                          {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><CheckCircle2 size={11}/> Pagado</>}
+                        </button>
+                        <button onClick={() => handleDeleteCuenta(c.id, false)} disabled={savingAction === c.id}
+                          className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
+                          <Trash2 size={12}/>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {cuentas.length === 0 && (
+                  <div className="text-center py-12 text-zinc-700">
+                    <p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por pagar</p>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}
