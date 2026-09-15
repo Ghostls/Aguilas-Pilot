@@ -1,12 +1,26 @@
 // src/components/ControlHub.tsx
-// VALKYRON OS v5.1 — EDICIÓN DE ÓRDENES ACTIVAS + NUEVOS HALLAZGOS
-// v5.1 NUEVO:
-//   — Botón "Editar" en cada tarjeta activa de mantenimiento
-//   — Modal de edición: nuevos hallazgos se concatenan a observaciones con timestamp
-//   — Permite actualizar técnico asignado y estado de la orden sin crear una nueva
-//   — Mismo patrón de auditoría que FleetDashboard v5.2
-// v5.0 PRESERVADO: Modal confirmación 2 pasos, razón de entrada obligatoria,
-//   flota_id UUID fix, liberación de aeronave, fallback sin JOIN
+// VALKYRON OS v5.4 — Hardening: race condition fix, fecha_cierre, doble filtro, legacy sync
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v5.4:
+//   [FIX] handleFinalCertification: query de OT adicionales excluye task.id actual
+//         con .neq('id', task.id) — elimina falso positivo por lag de replicación
+//   [FIX] fecha_cierre removido del update (no existe en tipo WorkOrder) — el
+//         timestamp de cierre queda en observaciones via AircraftDetail
+//   [FIX] activeTasks = externalTasks directo — fetchOrders ya filtra Completed en DB,
+//         doble filter() eliminado
+//   [FIX] doc en handleConfirmAndSend aclara que YV-118 legacy requiere SQL manual
+// CHANGELOG v5.3 PRESERVADO:
+//   [NEW] prop onFleetChange?: () => Promise<void> — llamado tras handleConfirmAndSend
+//         y handleFinalCertification para forzar syncFleet() en Index.tsx
+//   [FIX] Garantiza que FleetDashboard refleje cambios MRO sin recargar página
+// CHANGELOG v5.2 PRESERVADO:
+//   [FIX] handleFinalCertification: elimina flota_id (siempre null, no hay FK UUID)
+//         → siempre actualiza flota_aviones por matricula TEXT
+//   [FIX] Verifica OT adicionales antes de liberar aeronave (puede haber >1 OT activa)
+//   [FIX] setFleet matchea por tailNumber O matricula (cubre ambos módulos)
+//   [FIX] handleConfirmAndSend: actualiza flota_aviones.estado='maintenance' por matricula
+// v5.1 PRESERVADO: Modal edición con hallazgos+timestamp, botón Editar en tarjetas,
+//   modal confirmación 2 pasos, razón de entrada obligatoria, fallback sin JOIN
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import React, { useState, useEffect } from 'react';
@@ -29,6 +43,8 @@ interface ControlHubProps {
   setFleet?:      React.Dispatch<React.SetStateAction<any[]>>;
   inventory?:     SparePart[];
   onPartsUsage?:  (partsUsed: { pn: string; qty: number }[], aircraftId: string) => void;
+  // [v5.3] Callback para forzar re-fetch de flota desde Index.tsx tras ops MRO
+  onFleetChange?: () => Promise<void>;
 }
 
 interface EditForm {
@@ -69,6 +85,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
   fleet = [],
   setFleet = () => {},
   inventory = [],
+  onFleetChange,
 }) => {
   const [isFormOpen,    setIsFormOpen]    = useState(false);
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
@@ -98,41 +115,32 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     : newTask.razon;
 
   const targetAircraft = fleet.find(
-    ac => ac.tailNumber === newTask.matricula.toUpperCase()
+    ac => (ac.tailNumber ?? ac.matricula) === newTask.matricula.toUpperCase()
   );
 
   // ─── CARGAR ÓRDENES ───────────────────────────────────────────────────────
+  // DB ya filtra Completed — externalTasks contiene solo activas
 
   useEffect(() => {
     const fetchOrders = async () => {
       const { data, error } = await supabase
         .from('ordenes_trabajo')
-        .select('*, flota_aviones(id)')
+        .select('*')
         .neq('estado', 'Completed')
         .order('created_at', { ascending: false });
 
       if (!error && data) {
-        const mapped = data.map((t: any) => ({
-          ...t,
-          flota_id: Array.isArray(t.flota_aviones)
-            ? t.flota_aviones[0]?.id ?? null
-            : t.flota_aviones?.id ?? null,
-        }));
-        setExternalTasks(mapped);
+        setExternalTasks(data);
       } else if (error) {
-        console.warn('[ControlHub] JOIN flota_aviones falló, fallback:', error.message);
-        const { data: fallback } = await supabase
-          .from('ordenes_trabajo')
-          .select('*')
-          .neq('estado', 'Completed')
-          .order('created_at', { ascending: false });
-        if (fallback) setExternalTasks(fallback);
+        console.error('[ControlHub] fetchOrders error:', error.message);
       }
     };
     fetchOrders();
   }, [setExternalTasks]);
 
-  const activeTasks = externalTasks.filter(t => t.estado !== 'Completed');
+  // [FIX v5.4] activeTasks directo — fetchOrders ya filtra Completed en DB.
+  // Eliminado el .filter(t => t.estado !== 'Completed') redundante.
+  const activeTasks = externalTasks;
 
   // ─── ABRIR MODAL DE EDICIÓN ───────────────────────────────────────────────
 
@@ -174,20 +182,18 @@ export const ControlHub: React.FC<ControlHubProps> = ({
         ? `${obsActual}\n[${timestamp}] NUEVO HALLAZGO: ${editForm.nuevosHallazgos.trim().toUpperCase()}`
         : obsActual;
 
-      const { data: updated, error } = await supabase
+      const { error } = await supabase
         .from('ordenes_trabajo')
         .update({
           nombre_mecanico: editForm.mecanico.trim() || editingTask.nombre_mecanico,
           estado:          editForm.estado,
           observaciones:   obsNueva,
         })
-        .eq('id', editingTask.id)
-        .select()
-        .single();
+        .eq('id', editingTask.id);
 
       if (error) throw error;
 
-      // Actualizar la tarjeta en estado local sin re-fetch
+      // Actualizar tarjeta en estado local sin re-fetch
       setExternalTasks(prev =>
         prev.map(t => t.id === editingTask.id
           ? {
@@ -229,6 +235,9 @@ export const ControlHub: React.FC<ControlHubProps> = ({
   };
 
   // ─── PASO 2: Confirmar → escribir en DB ───────────────────────────────────
+  // NOTA: aeronaves con OT legacy (ej. YV-118) creadas antes de v5.2 pueden
+  // tener flota_aviones.estado='operational' incorrecto. Fix manual en Supabase:
+  //   UPDATE flota_aviones SET estado='maintenance' WHERE matricula='YV-118';
 
   const handleConfirmAndSend = async () => {
     if (!pendingTask) return;
@@ -238,8 +247,15 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     const razon = pendingTask.razon === 'Otra (especificar)'
       ? pendingTask.razonCustom.trim()
       : pendingTask.razon;
+
     const modeloDetectado =
-      fleet.find(ac => ac.tailNumber === matriculaUpper)?.model || 'MODELO NO DETECTADO';
+      fleet.find(ac =>
+        (ac.tailNumber ?? ac.matricula) === matriculaUpper
+      )?.model ??
+      fleet.find(ac =>
+        (ac.tailNumber ?? ac.matricula) === matriculaUpper
+      )?.modelo ??
+      'MODELO NO DETECTADO';
 
     const dbEntry = {
       matricula:         matriculaUpper,
@@ -255,17 +271,21 @@ export const ControlHub: React.FC<ControlHubProps> = ({
       .from('ordenes_trabajo').insert([dbEntry]).select();
 
     if (!error && data) {
+      // [v5.2] Actualizar flota_aviones siempre por matricula TEXT (no UUID)
       const { error: fleetError } = await supabase
         .from('flota_aviones')
         .update({ estado: 'maintenance' })
         .eq('matricula', matriculaUpper);
 
       if (fleetError) {
-        console.error('FALLA CAMBIO ESTATUS FLOTA:', fleetError);
+        console.error('[ControlHub] FALLA CAMBIO ESTATUS FLOTA:', fleetError.message);
       } else {
-        setFleet(prev =>
+        // Actualizar estado local — matchea por tailNumber o matricula
+        setFleet((prev: any[]) =>
           prev.map(ac =>
-            ac.tailNumber === matriculaUpper ? { ...ac, status: 'maintenance' } : ac
+            (ac.tailNumber === matriculaUpper || ac.matricula === matriculaUpper)
+              ? { ...ac, status: 'maintenance', estado: 'maintenance' }
+              : ac
           )
         );
       }
@@ -273,7 +293,12 @@ export const ControlHub: React.FC<ControlHubProps> = ({
       setExternalTasks([data[0], ...externalTasks]);
       setIsConfirmOpen(false);
       setPendingTask(null);
-      setNewTask({ matricula: '', descripcion: '', sede: 'Lara', mecanico: '', razon: '', razonCustom: '' });
+      setNewTask({
+        matricula: '', descripcion: '', sede: 'Lara',
+        mecanico: '', razon: '', razonCustom: '',
+      });
+      // [v5.3] Re-fetch flota desde DB para reflejar cambio en FleetDashboard
+      await onFleetChange?.();
     } else {
       alert(`FALLA TÁCTICA: ${error?.message}`);
       setIsConfirmOpen(false);
@@ -287,45 +312,71 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     setIsFormOpen(true);
   };
 
-  // ─── LIBERACIÓN DE AERONAVE ───────────────────────────────────────────────
+  // ─── LIBERACIÓN DE AERONAVE v5.4 ─────────────────────────────────────────
+  // [FIX v5.4] Query de OT adicionales excluye task.id con .neq('id', task.id)
+  //            Elimina falso positivo por lag de replicación Supabase:
+  //            la OT recién cerrada podía aparecer aún como activa en la 2da query.
+  // [FIX v5.4] fecha_cierre removido del update — no existe en tipo WorkOrder.
+  //            El timestamp de cierre queda registrado en observaciones (AircraftDetail).
+  // [v5.2] Siempre actualiza por matricula TEXT. Verifica OT adicionales antes de liberar.
 
   const handleFinalCertification = async (task: any) => {
     try {
-      const { error } = await supabase
+      // 1. Cerrar la orden de trabajo — sin fecha_cierre (no está en el tipo)
+      const { error: otError } = await supabase
         .from('ordenes_trabajo')
-        .update({ estado: 'Completed', fecha_cierre: new Date().toISOString() })
+        .update({ estado: 'Completed' })
         .eq('id', task.id);
-      if (error) throw error;
 
-      const fleetFilter = task.flota_id
-        ? { field: 'id',       value: task.flota_id  }
-        : { field: 'matricula', value: task.matricula };
+      if (otError) throw otError;
 
-      const { error: fleetError } = await supabase
-        .from('flota_aviones')
-        .update({ estado: 'operational' })
-        .eq(fleetFilter.field, fleetFilter.value);
+      // 2. Verificar OT adicionales activas para la misma aeronave
+      //    [FIX v5.4] .neq('id', task.id) excluye la OT recién cerrada
+      //    para evitar falso positivo por replicación tardía en Supabase
+      const { data: otrasOT } = await supabase
+        .from('ordenes_trabajo')
+        .select('id')
+        .eq('matricula', task.matricula)
+        .neq('id', task.id)
+        .in('estado', ['In Progress', 'Pending Parts', 'On Hold']);
 
-      if (fleetError) {
-        console.error('FALLA LIBERACIÓN FLOTA:', fleetError);
-      } else {
+      const tieneOtrasOT = (otrasOT ?? []).length > 0;
+
+      // 3. Solo liberar aeronave si no quedan OT activas
+      if (!tieneOtrasOT) {
+        const { error: fleetError } = await supabase
+          .from('flota_aviones')
+          .update({ estado: 'operational' })
+          .eq('matricula', task.matricula);
+
+        if (fleetError) throw fleetError;
+
         setFleet((prev: any[]) =>
           prev.map(ac =>
-            (task.flota_id && ac.id === task.flota_id) || ac.tailNumber === task.matricula
+            (ac.tailNumber === task.matricula || ac.matricula === task.matricula)
               ? { ...ac, status: 'operational', estado: 'operational' }
               : ac
           )
         );
       }
 
+      // 4. Quitar la tarjeta del hub (estado local)
       setExternalTasks((prev: any[]) => prev.filter(t => t.id !== task.id));
-      alert(`[CERTIFICADO] ${task.matricula} LIBERADA Y OPERATIVA.`);
+
+      // [v5.3] Re-fetch flota desde DB para reflejar liberación en FleetDashboard
+      await onFleetChange?.();
+
+      alert(
+        tieneOtrasOT
+          ? `[ORDEN CERRADA] ${task.matricula} — quedan otras órdenes activas. La aeronave permanece en mantenimiento.`
+          : `[CERTIFICADO] ${task.matricula} LIBERADA Y OPERATIVA.`
+      );
     } catch (err: any) {
       alert(`ERROR: ${err.message}`);
     }
   };
 
-  // ─── HELPER ───────────────────────────────────────────────────────────────
+  // ─── HELPERS ─────────────────────────────────────────────────────────────
 
   const extractRazon = (obs: string): string => {
     if (!obs) return '—';
@@ -333,7 +384,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     return match ? match[1] : obs.split('|')[0].trim();
   };
 
-  // Contar hallazgos adicionales en observaciones (líneas con timestamp)
   const contarHallazgos = (obs: string): number => {
     if (!obs) return 0;
     return (obs.match(/\[.*?\] NUEVO HALLAZGO:/g) ?? []).length;
@@ -354,7 +404,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
               Hangar Operations Hub
             </h2>
             <p className="text-[9px] text-slate-500 font-mono uppercase tracking-tighter italic">
-              MIA v5.1 // Confirmación Táctica + Edición de Órdenes
+              MIA v5.4 // Race Condition Fix + Hardening Completo
             </p>
           </div>
         </div>
@@ -375,7 +425,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
           <div className="bg-[#0a0a0a] border border-[#E1AD01]/40 w-full max-w-lg
                           rounded-[2.5rem] shadow-[0_0_80px_rgba(225,173,1,0.12)] overflow-hidden">
 
-            {/* Header */}
             <div className="bg-[#E1AD01]/10 border-b border-[#E1AD01]/20 px-7 py-5
                             flex items-center justify-between">
               <div className="flex items-center gap-4">
@@ -400,7 +449,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
 
             <form onSubmit={handleGuardarEdicion} className="p-7 space-y-5 font-mono">
 
-              {/* Resumen de la orden actual — solo lectura */}
               <div className="bg-white/[0.02] border border-white/[0.07] rounded-2xl p-4 space-y-3">
                 <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">
                   Estado actual de la orden
@@ -435,10 +483,9 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                 )}
               </div>
 
-              {/* Nuevos hallazgos */}
               <div className="space-y-1.5">
                 <label className="text-[9px] font-black text-[#E1AD01] uppercase tracking-widest
-                                  flex items-center gap-2 ">
+                                  flex items-center gap-2">
                   <PlusCircleIcon size={12} /> Daños Adicionales
                 </label>
                 <textarea
@@ -446,7 +493,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                   className="w-full bg-black border border-[#E1AD01]/30 rounded-xl p-4 text-white
                              text-xs resize-none outline-none focus:border-[#E1AD01] transition-all
                              placeholder:text-white/20 uppercase font-mono"
-                  placeholder="Describir daños o hallazgos adicionales encontrados durante la revisión..."
+                  placeholder="Describir daños o hallazgos adicionales..."
                   value={editForm.nuevosHallazgos}
                   onChange={e => setEditForm(prev => ({ ...prev, nuevosHallazgos: e.target.value }))}
                 />
@@ -455,7 +502,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                 </p>
               </div>
 
-              {/* Técnico asignado */}
               <div className="space-y-1.5">
                 <label className="text-[9px] font-black text-zinc-400 uppercase tracking-widest block">
                   Técnico Asignado
@@ -468,7 +514,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                 />
               </div>
 
-              {/* Estado de la orden */}
               <div className="space-y-1.5">
                 <label className="text-[9px] font-black text-zinc-400 uppercase tracking-widest block">
                   Estado de la Orden
@@ -487,17 +532,16 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                 </p>
               </div>
 
-              {/* Info */}
               <div className="flex items-start gap-2 bg-[#E1AD01]/5 border border-[#E1AD01]/15
                               rounded-xl p-3">
                 <AlertCircle size={13} className="text-[#E1AD01] shrink-0 mt-0.5" />
                 <p className="text-[9px] text-[#E1AD01]/70 leading-relaxed">
-                  Los nuevos hallazgos se <span className="font-black text-[#E1AD01]">agregan al historial</span> de
-                  la orden con fecha y hora. No se crea una orden nueva.
+                  Los nuevos hallazgos se{' '}
+                  <span className="font-black text-[#E1AD01]">agregan al historial</span>{' '}
+                  con fecha y hora. No se crea una orden nueva.
                 </p>
               </div>
 
-              {/* Botones */}
               <div className="flex gap-3 pt-1">
                 <button
                   type="button"
@@ -556,7 +600,9 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                     onChange={e => setNewTask({ ...newTask, matricula: e.target.value })}>
                     <option value="">— SELECCIONAR —</option>
                     {fleet.map(ac => (
-                      <option key={ac.id} value={ac.tailNumber}>{ac.tailNumber}</option>
+                      <option key={ac.id} value={ac.tailNumber ?? ac.matricula}>
+                        {ac.tailNumber ?? ac.matricula}
+                      </option>
                     ))}
                   </select>
                 </div>
@@ -679,7 +725,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                 </p>
                 {targetAircraft && (
                   <p className="text-[10px] text-[#E1AD01] font-mono mt-1 italic">
-                    {targetAircraft.model}
+                    {targetAircraft.model ?? targetAircraft.modelo}
                   </p>
                 )}
                 <div className="flex items-center gap-1.5 mt-2">
@@ -716,7 +762,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                 <p className="text-[9px] text-red-400/80 leading-relaxed">
                   La aeronave cambiará a estado{' '}
                   <span className="font-black text-red-400">MANTENIMIENTO</span> inmediatamente
-                  y dejará de aparecer como operativa.
+                  y dejará de estar disponible para vuelos.
                 </p>
               </div>
 
@@ -766,7 +812,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                                      text-[#E1AD01] font-black uppercase">
                       {task.estado}
                     </span>
-                    {/* Botón Editar */}
                     <button
                       onClick={() => handleAbrirEdicion(task)}
                       title="Agregar hallazgos o actualizar orden"
@@ -783,7 +828,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
 
               <CardContent className="pt-5 space-y-4 text-left font-mono">
 
-                {/* Razón de entrada */}
                 <div className="bg-[#E1AD01]/5 border border-[#E1AD01]/15 rounded-xl px-3 py-2.5">
                   <p className="text-[8px] text-[#E1AD01]/60 font-black uppercase tracking-widest mb-0.5">
                     Razón de Entrada
@@ -793,7 +837,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                   </p>
                 </div>
 
-                {/* Descripción técnica */}
                 <div className="flex items-start gap-2">
                   <ClipboardList className="h-3 w-3 text-slate-600 mt-0.5 shrink-0" />
                   <p className="text-[10px] text-slate-300 uppercase leading-relaxed line-clamp-3">
@@ -801,7 +844,6 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                   </p>
                 </div>
 
-                {/* Badge de hallazgos adicionales */}
                 {hallazgos > 0 && (
                   <div className="flex items-center gap-2 px-3 py-1.5 bg-orange-500/5
                                   border border-orange-500/20 rounded-xl">

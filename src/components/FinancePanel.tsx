@@ -1,13 +1,16 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v12.0 — HORAS PAGADAS + CxC LIMPIO
-// NUEVO v12.0:
-//   — Flujo de horas rediseñado: 3 cards en tab CUENTAS:
-//       1. CxC (Pendientes): alumno debe → queda pendiente → al cobrar se acreditan horas
-//       2. Horas Pagadas: alumno pagó en el momento → estatus COBRADO de inmediato, nunca es deuda
-//       3. CxP: proveedores, flujo original
-//   — KPI strip actualizado: Por Cobrar · Horas Acreditadas · Por Pagar
-//   — Formulario "Nueva Cuenta" ramifica en 3 tipos con UI distinta por tipo
-//   — Campo moneda agregado a cuentas_por_cobrar (columna ya creada en DB)
-// PRESERVADO v11.0: todos los fixes 1-7, Ledger, Bóvedas, Cajas, Requisiciones, Cierre
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v13.0 — INTERCONEXIÓN DE CAJAS
+// NUEVO v13.0:
+//   — Transferencia entre cajas: Roberto → Ederson genera 3 asientos vinculados
+//     con transfer_id común: (1) salida caja origen, (2) entrada caja destino,
+//     (3) CxP de reposición categorizada como REPOSICION_CAJA
+//   — Card "Reposiciones Internas" separado en tab CUENTAS, distinto de CxP proveedores
+//   — Al marcar reposición como PAGADA: se genera automáticamente entrada a la caja
+//     original desde Bóveda + asiento EXPENSE en Ledger (afecta bóvedas globales)
+//   — Modal de eliminación de transferencia muestra los 3 registros vinculados
+//     y permite elegir cuáles borrar (protegido por clave del Director)
+//   — Nuevo botón "⇄ Transferir entre cajas" en el toolbar de CAJAS
+// PRESERVADO v12.0: HORAS_PAGADAS vs CxC, edición protegida, Ledger, Bóvedas,
+//   Cajas, Requisiciones, Cierre Multi-Moneda, todos los fixes 1-7 previos.
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -16,7 +19,8 @@ import {
   ArrowUpCircle, ArrowDownCircle, PlusCircle, X, Loader2,
   Wallet, UserCheck, ShieldCheck, Calculator, Landmark, CheckCircle2,
   FileSignature, Lock, Activity, Trash2, Download, Coins, Banknote,
-  AlertTriangle, RefreshCw, ReceiptText, Plane,
+  AlertTriangle, RefreshCw, ReceiptText, Plane, Pencil, KeyRound,
+  ArrowLeftRight, Repeat,
 } from 'lucide-react';
 
 // ─── TIPOS ────────────────────────────────────────────────────────────────────
@@ -31,6 +35,10 @@ interface MovimientoCaja {
   id: string; caja_id: string; tipo: 'ENTRADA' | 'SALIDA';
   moneda: PaymentMethod; monto: number;
   concepto: string; referencia: string; fecha: string; registrado_por: string;
+  // v13.0 — trazabilidad de transferencia
+  transfer_id?: string | null;
+  transfer_role?: 'SALIDA' | 'ENTRADA' | null;
+  transfer_peer_id?: string | null;
 }
 interface CuentaGeneral {
   id: string; tipo: 'CXC' | 'CXP'; entidad_nombre: string; entidad_tipo: string;
@@ -38,6 +46,9 @@ interface CuentaGeneral {
   monto_total: number; monto_pendiente: number; concepto: string;
   fecha_emision: string; fecha_vencimiento?: string;
   estatus: 'PENDIENTE' | 'PAGADO' | 'PARCIAL'; notas?: string;
+  // v13.0 — vínculo con transferencia
+  transfer_id?: string | null;
+  categoria_interna?: 'REPOSICION_CAJA' | null;
 }
 interface CuentaPorCobrar {
   id: string; student_id: string; alumno_id: string;
@@ -55,12 +66,28 @@ interface FinancePanelProps {
   setGlobalFinance?: React.Dispatch<React.SetStateAction<{CASH:number;ZELLE:number;USDT:number;BS:number}>>;
 }
 
+// v13.0 — Estructura para el modal de eliminación de transferencia
+interface TransferChain {
+  transferId: string;
+  salida: MovimientoCaja | null;
+  entrada: MovimientoCaja | null;
+  reposicion: CuentaGeneral | null;
+  cajaOrigenNombre: string;
+  cajaDestinoNombre: string;
+}
+
 // ─── ESTILOS ──────────────────────────────────────────────────────────────────
 
 const glass = "bg-white/[0.02] backdrop-blur-[40px] border border-white/[0.07] shadow-[0_20px_50px_rgba(0,0,0,0.5)]";
 const inp   = "bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-[#E1AD01]/60 focus:ring-1 focus:ring-[#E1AD01]/20 transition-all w-full uppercase placeholder:text-white/20";
 
 const DEFAULT_TASA_BS = 36.50;
+const DIRECTOR_FINANCE_CODE = '4827';
+
+const normalizePaymentMethod = (value: unknown): PaymentMethod => {
+  const v = String(value ?? '').toUpperCase().trim();
+  return v === 'USD' ? 'USDT' : (['USDT','ZELLE','CASH','BS'].includes(v) ? v as PaymentMethod : 'USDT');
+};
 
 const MONEDA_COLOR: Record<PaymentMethod, string> = {
   USDT: 'text-emerald-400', ZELLE: 'text-blue-400',
@@ -141,13 +168,56 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [cajaError,    setCajaError]    = useState<string | null>(null);
   const [cuentaError,  setCuentaError]  = useState<string | null>(null);
   const [reqError,     setReqError]     = useState<string | null>(null);
+  const [transferError, setTransferError] = useState<string | null>(null);
 
   // Saving locks
-  const [savingLedger,  setSavingLedger]  = useState(false);
-  const [savingCaja,    setSavingCaja]    = useState(false);
-  const [savingCuenta,  setSavingCuenta]  = useState(false);
-  const [savingReq,     setSavingReq]     = useState(false);
-  const [savingAction,  setSavingAction]  = useState<string | null>(null);
+  const [savingLedger,   setSavingLedger]  = useState(false);
+  const [savingCaja,     setSavingCaja]    = useState(false);
+  const [savingCuenta,   setSavingCuenta]  = useState(false);
+  const [savingReq,      setSavingReq]     = useState(false);
+  const [savingTransfer, setSavingTransfer]= useState(false);
+  const [savingAction,   setSavingAction]  = useState<string | null>(null);
+
+  // Seguridad
+  const [directorAuthOpen, setDirectorAuthOpen] = useState(false);
+  const [directorCode, setDirectorCode] = useState('');
+  const [directorAuthError, setDirectorAuthError] = useState<string | null>(null);
+  const [pendingSecureAction, setPendingSecureAction] = useState<(() => Promise<void>) | null>(null);
+
+  // Edición Ledger
+  const [editingTx, setEditingTx] = useState<FinanceTransaction | null>(null);
+  const [editTxForm, setEditTxForm] = useState({
+    amount: '', currency: 'USDT' as PaymentMethod, type: 'INCOME' as TransactionType,
+    description: '', fecha: new Date().toISOString().split('T')[0],
+  });
+
+  // Edición Caja
+  const [editingMov, setEditingMov] = useState<MovimientoCaja | null>(null);
+  const [editMovForm, setEditMovForm] = useState({
+    tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
+    monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
+  });
+
+  // v13.0 — Transferencia entre cajas
+  const [transferModalOpen, setTransferModalOpen] = useState(false);
+  const [transferForm, setTransferForm] = useState({
+    caja_origen_id:  '',
+    caja_destino_id: '',
+    moneda:          'USDT' as PaymentMethod,
+    monto:           '',
+    concepto:        '',
+    fecha:           new Date().toISOString().split('T')[0],
+  });
+
+  // v13.0 — Modal de eliminación de transferencia (selectivo)
+  const [deleteTransferModal, setDeleteTransferModal] = useState<TransferChain | null>(null);
+  const [deleteTransferSelection, setDeleteTransferSelection] = useState<{ salida: boolean; entrada: boolean; reposicion: boolean }>({
+    salida: true, entrada: true, reposicion: true,
+  });
+
+  // v13.0 — Modal para elegir bóveda al pagar reposición
+  const [pagarReposicionModal, setPagarReposicionModal] = useState<CuentaGeneral | null>(null);
+  const [pagarReposicionMoneda, setPagarReposicionMoneda] = useState<PaymentMethod>('USDT');
 
   // Forms
   const [ledger, setLedger] = useState({
@@ -158,13 +228,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
     monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
   });
-  // v12.0 — formulario unificado con 3 tipos
   const [cuentaForm, setCuentaForm] = useState({
     tipo:              'HORAS_PAGADAS' as FormTipo,
     alumno_student_id: '',
     horas_prometidas:  '',
-    moneda_pago:       'USD' as string,
-    // CxP
+    moneda_pago:       'USDT' as string,
     entidad_nombre:    '', entidad_tipo: 'LIBRE',
     proveedor_id:      '',
     moneda:            'USDT' as PaymentMethod,
@@ -202,15 +270,23 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         invoiceNumber: t.invoice_number || 'S/N',
         description: t.description || '', status: t.status || 'PENDING',
         issueDate: t.issue_date, category: t.category || 'General',
-        payment_method: t.payment_method as PaymentMethod,
+        payment_method: normalizePaymentMethod(t.payment_method),
       })));
       if (reqRes.data)     setRequests(reqRes.data);
       if (cajasRes.data)   setCajas(cajasRes.data);
-      if (movRes.data)     setMovCajas(movRes.data.map((m: any) => ({ ...m, monto: round2(Number(m.monto) || 0) })));
+      if (movRes.data)     setMovCajas(movRes.data.map((m: any) => ({
+        ...m,
+        monto: round2(Number(m.monto) || 0),
+        transfer_id:      m.transfer_id       ?? null,
+        transfer_role:    m.transfer_role     ?? null,
+        transfer_peer_id: m.transfer_peer_id  ?? null,
+      })));
       if (cuentasRes.data) setCuentas(cuentasRes.data.map((c: any) => ({
         ...c,
-        monto_total:     round2(Number(c.monto_total) || 0),
-        monto_pendiente: round2(Number(c.monto_pendiente) || 0),
+        monto_total:      round2(Number(c.monto_total) || 0),
+        monto_pendiente:  round2(Number(c.monto_pendiente) || 0),
+        transfer_id:      c.transfer_id       ?? null,
+        categoria_interna:c.categoria_interna ?? null,
       })));
       if (capRes.data)     setCapitanes(capRes.data);
       if (alumnosRes.data) setAlumnos(alumnosRes.data.map((a: any) => ({
@@ -219,16 +295,21 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         serial: a.student_serial || '—',
         sede: a.sede || '—',
       })));
-      if (cxcRes.data) setCuentasCxC(cxcRes.data.map((c: any) => ({
-        ...c,
-        monto_total:      round2(Number(c.monto_total) || 0),
-        monto_pagado:     round2(Number(c.monto_pagado) || 0),
-        monto_pendiente:  round2(Number(c.monto_pendiente) || 0),
-        horas_prometidas: Number(c.horas_prometidas) || 0,
-        horas_compradas:  Number(c.horas_compradas) || 0,
-      })));
+      if (cxcRes.data) {
+        const normalizedCxC = cxcRes.data.map((c: any) => ({
+          ...c,
+          monto_total:      round2(Number(c.monto_total) || 0),
+          monto_pagado:     round2(Number(c.monto_pagado) || 0),
+          monto_pendiente:  round2(Number(c.monto_pendiente) || 0),
+          horas_prometidas: Number(c.horas_prometidas) || 0,
+          horas_compradas:  Number(c.horas_compradas) || 0,
+          moneda: normalizePaymentMethod(c.moneda),
+        }));
+        setCuentasCxC(normalizedCxC);
+        await syncPaidAccountsToLedger(normalizedCxC);
+      }
     } catch (e) {
-      console.error('[FinancePanel] fetchAll error:', e);
+      console.error('[FinancePanel v13.0] fetchAll error:', e);
     } finally {
       setLoading(false);
       fetchLockRef.current = false;
@@ -243,7 +324,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchAll();
-    const ch = supabase.channel('finance-v12')
+    const ch = supabase.channel('finance-v13-interconnect')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' },  handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' },       handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cajas_chicas' },             handleRealtimeChange)
@@ -268,20 +349,246 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }, 0),
   [transactions]);
 
+  useEffect(() => {
+    const totals = (['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).reduce((acc, method) => {
+      acc[method] = getVaultBalance(method);
+      return acc;
+    }, { USDT: 0, ZELLE: 0, CASH: 0, BS: 0 } as {USDT:number;ZELLE:number;CASH:number;BS:number});
+    setGlobalFinance(totals);
+  }, [transactions, getVaultBalance, setGlobalFinance]);
+
   const getCajaBalance = useCallback((cajaId: string, moneda: PaymentMethod) =>
     movCajas
       .filter(m => m.caja_id === cajaId && m.moneda === moneda)
       .reduce((acc, m) => round2(m.tipo === 'ENTRADA' ? acc + m.monto : acc - m.monto), 0),
   [movCajas]);
 
-  // v12.0 — CxC = solo pendientes, Horas Pagadas = cobradas
   const cxcPendientes   = useMemo(() => cuentasCxC.filter(c => c.estatus === 'PENDIENTE'),  [cuentasCxC]);
   const horasPagadas    = useMemo(() => cuentasCxC.filter(c => c.estatus === 'COBRADO'),    [cuentasCxC]);
   const totalCxC        = useMemo(() => cxcPendientes.reduce((a, c) => round2(a + c.monto_pendiente), 0), [cxcPendientes]);
   const totalHorasAcred = useMemo(() => horasPagadas.reduce((a, c) => a + c.horas_compradas, 0), [horasPagadas]);
+
+  // v13.0 — separación de CxP: reposiciones internas vs proveedores externos
+  const cuentasProveedores  = useMemo(() => cuentas.filter(c => c.categoria_interna !== 'REPOSICION_CAJA'), [cuentas]);
+  const cuentasReposiciones = useMemo(() => cuentas.filter(c => c.categoria_interna === 'REPOSICION_CAJA'), [cuentas]);
   const totalCxP        = useMemo(() =>
-    cuentas.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + c.monto_pendiente), 0),
-  [cuentas]);
+    cuentasProveedores.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + c.monto_pendiente), 0),
+  [cuentasProveedores]);
+  const totalReposiciones = useMemo(() =>
+    cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + c.monto_pendiente), 0),
+  [cuentasReposiciones]);
+
+  // ─── SEGURIDAD ─────────────────────────────────────────────────────────────
+
+  const canManageFinance = ['CEO', 'ADMIN', 'DIRECTOR'].includes(String(userRole).toUpperCase());
+
+  const requireDirectorCode = useCallback((action: () => Promise<void>) => {
+    if (!canManageFinance) {
+      alert('Acceso denegado. Solo personal autorizado puede modificar este módulo.');
+      return;
+    }
+    setDirectorCode('');
+    setDirectorAuthError(null);
+    setPendingSecureAction(() => action);
+    setDirectorAuthOpen(true);
+  }, [canManageFinance]);
+
+  const confirmDirectorCode = async () => {
+    if (!/^\d{4}$/.test(directorCode)) {
+      setDirectorAuthError('La clave debe contener exactamente 4 dígitos.');
+      return;
+    }
+    if (directorCode !== DIRECTOR_FINANCE_CODE) {
+      setDirectorAuthError('Clave del Director incorrecta.');
+      setDirectorCode('');
+      return;
+    }
+    const action = pendingSecureAction;
+    setDirectorAuthOpen(false);
+    setDirectorCode('');
+    setDirectorAuthError(null);
+    setPendingSecureAction(null);
+    if (action) {
+      try { await action(); }
+      catch (err) { console.error('[FinancePanel] acción protegida:', err); }
+    }
+  };
+
+  const cancelDirectorAuth = () => {
+    setDirectorAuthOpen(false);
+    setDirectorCode('');
+    setDirectorAuthError(null);
+    setPendingSecureAction(null);
+  };
+
+  // ─── EDICIÓN LEDGER / CAJA ────────────────────────────────────────────────
+
+  const openEditTx = (tx: FinanceTransaction) => {
+    const d = tx.issueDate ? new Date(tx.issueDate) : new Date();
+    setEditingTx(tx);
+    setEditTxForm({
+      amount: String(round2(Number(tx.amount) || 0)),
+      currency: normalizePaymentMethod(tx.payment_method),
+      type: tx.type as TransactionType,
+      description: tx.description || '',
+      fecha: Number.isNaN(d.getTime()) ? new Date().toISOString().split('T')[0] : d.toISOString().split('T')[0],
+    });
+  };
+
+  const saveEditedTx = async () => {
+    if (!editingTx) return;
+    const amount = round2(parseFloat(editTxForm.amount));
+    if (!Number.isFinite(amount) || amount <= 0) { setLedgerError('Monto inválido.'); return; }
+    setSavingAction(editingTx.id);
+    try {
+      const { error } = await supabase.from('transacciones_finanzas').update({
+        amount,
+        payment_method: editTxForm.currency,
+        type: editTxForm.type,
+        description: editTxForm.description.trim() || 'MOVIMIENTO EDITADO',
+        issue_date: new Date(editTxForm.fecha).toISOString(),
+      }).eq('id', editingTx.id);
+      if (error) throw new Error(error.message);
+      setEditingTx(null);
+      await fetchAll(true);
+    } catch (err) {
+      setLedgerError(err instanceof Error ? err.message : 'No se pudo editar la transacción.');
+    } finally {
+      setSavingAction(null);
+    }
+  };
+
+  const deleteTxProtected = (id: string) => requireDirectorCode(async () => {
+    setSavingAction(id);
+    try {
+      const tx = transactions.find(t => t.id === id);
+      const { error } = await supabase.from('transacciones_finanzas').delete().eq('id', id);
+      if (error) throw new Error(error.message);
+      if (tx?.invoiceNumber?.startsWith('CXC-') || tx?.invoiceNumber?.startsWith('HORA-')) {
+        const cxcId = tx.invoiceNumber.replace(/^CXC-/, '').replace(/^HORA-/, '');
+        await supabase.from('cuentas_por_cobrar').delete().eq('id', cxcId);
+      }
+      await fetchAll(true);
+    } catch (err) {
+      setLedgerError(err instanceof Error ? err.message : 'No se pudo eliminar la transacción.');
+    } finally {
+      setSavingAction(null);
+    }
+  });
+
+  const openEditMov = (mov: MovimientoCaja) => {
+    // v13.0 — no permitir editar movimientos que forman parte de una transferencia
+    if (mov.transfer_id) {
+      alert('Este movimiento forma parte de una transferencia entre cajas. Para modificarlo, elimine la transferencia completa y créela de nuevo.');
+      return;
+    }
+    setEditingMov(mov);
+    const d = new Date(mov.fecha);
+    setEditMovForm({
+      tipo: mov.tipo,
+      moneda: normalizePaymentMethod(mov.moneda),
+      monto: String(round2(Number(mov.monto) || 0)),
+      concepto: mov.concepto || '',
+      referencia: mov.referencia || '',
+      fecha: Number.isNaN(d.getTime()) ? new Date().toISOString().split('T')[0] : d.toISOString().split('T')[0],
+    });
+  };
+
+  const saveEditedMov = async () => {
+    if (!editingMov) return;
+    const monto = round2(parseFloat(editMovForm.monto));
+    if (!Number.isFinite(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
+    if (!editMovForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
+    setSavingAction(editingMov.id);
+    try {
+      const { error } = await supabase.from('movimientos_caja_chica').update({
+        tipo: editMovForm.tipo,
+        moneda: editMovForm.moneda,
+        monto,
+        concepto: editMovForm.concepto.toUpperCase().trim(),
+        referencia: editMovForm.referencia.toUpperCase().trim() || null,
+        fecha: new Date(editMovForm.fecha).toISOString(),
+      }).eq('id', editingMov.id);
+      if (error) throw new Error(error.message);
+      setEditingMov(null);
+      await fetchAll(true);
+    } catch (err) {
+      setCajaError(err instanceof Error ? err.message : 'No se pudo editar el movimiento de caja.');
+    } finally {
+      setSavingAction(null);
+    }
+  };
+
+  // v13.0 — Al eliminar un movimiento vinculado a una transferencia, abrimos el modal selectivo
+  const deleteMovProtected = (id: string) => {
+    const mov = movCajas.find(m => m.id === id);
+    if (mov?.transfer_id) {
+      openDeleteTransferModal(mov.transfer_id);
+      return;
+    }
+    requireDirectorCode(async () => {
+      setSavingAction(id);
+      try {
+        const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', id);
+        if (error) throw new Error(error.message);
+        await fetchAll(true);
+      } catch (err) {
+        setCajaError(err instanceof Error ? err.message : 'No se pudo eliminar el movimiento de caja.');
+      } finally {
+        setSavingAction(null);
+      }
+    });
+  };
+
+  const deleteCuentaProtected = (id: string, esCxC: boolean) => {
+    // v13.0 — si es reposición vinculada a transferencia, abrir modal selectivo
+    if (!esCxC) {
+      const cuenta = cuentas.find(c => c.id === id);
+      if (cuenta?.transfer_id) {
+        openDeleteTransferModal(cuenta.transfer_id);
+        return;
+      }
+    }
+    requireDirectorCode(async () => {
+      setSavingAction(id);
+      try {
+        if (esCxC) {
+          const { error } = await supabase.from('cuentas_por_cobrar').delete().eq('id', id);
+          if (error) throw new Error(error.message);
+          await supabase.from('transacciones_finanzas').delete().in('invoice_number', [`CXC-${id}`, `HORA-${id}`]);
+        } else {
+          const { error } = await supabase.from('cuentas_generales').delete().eq('id', id);
+          if (error) throw new Error(error.message);
+        }
+        await fetchAll(true);
+      } catch (err) {
+        setCuentaError(err instanceof Error ? err.message : 'No se pudo eliminar la cuenta.');
+      } finally {
+        setSavingAction(null);
+      }
+    });
+  };
+
+  // Sincroniza pagos históricos COBRADOS que no tengan asiento en el Ledger
+  const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[]) => {
+    const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0);
+    if (!paid.length) return;
+    for (const c of paid) {
+      const invoiceNumber = `${c.horas_compradas > 0 ? 'HORA' : 'CXC'}-${c.id}`;
+      const { data: exists, error: checkError } = await supabase
+        .from('transacciones_finanzas').select('id').eq('invoice_number', invoiceNumber).limit(1);
+      if (checkError || (exists && exists.length)) continue;
+      await supabase.from('transacciones_finanzas').insert([{
+        id: uuid4(), type: 'INCOME', entity_id: c.student_id,
+        entity_name: c.nombre_alumno || 'ALUMNO',
+        amount: round2(Number(c.monto_total) || 0), invoice_number: invoiceNumber,
+        description: `${c.concepto || 'COBRO'} · SINCRONIZACIÓN HISTÓRICA`,
+        status: 'PAID', category: 'Academia',
+        payment_method: normalizePaymentMethod(c.moneda),
+        issue_date: c.fecha_emision ? new Date(c.fecha_emision).toISOString() : new Date().toISOString(),
+      }]);
+    }
+  }, []);
 
   // ─── HANDLER: LEDGER ──────────────────────────────────────────────────────
 
@@ -296,16 +603,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const cap  = capitanes.find(c => c.id === ledger.capitanId);
     try {
       const { error } = await supabase.from('transacciones_finanzas').insert([{
-        id:             txId,
-        type:           ledger.type,
-        entity_name:    ledger.type === 'INSTRUCTOR_PAY' ? `NÓMINA: ${cap?.nombre ?? 'CAPITÁN'}` : `${ledger.type} ${ledger.currency}`,
-        amount:         num,
-        invoice_number: `TX-${genHash(txId)}`,
-        description:    ledger.reference.trim() || 'REGISTRO MANUAL',
-        status:         'PAID',
-        category:       ledger.type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
+        id: txId, type: ledger.type,
+        entity_name: ledger.type === 'INSTRUCTOR_PAY' ? `NÓMINA: ${cap?.nombre ?? 'CAPITÁN'}` : `${ledger.type} ${ledger.currency}`,
+        amount: num, invoice_number: `TX-${genHash(txId)}`,
+        description: ledger.reference.trim() || 'REGISTRO MANUAL',
+        status: 'PAID',
+        category: ledger.type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
         payment_method: ledger.currency,
-        issue_date:     new Date(ledger.fecha).toISOString(),
+        issue_date: new Date(ledger.fecha).toISOString(),
       }]);
       if (error) {
         setLedgerError(error.code === '23505' ? 'Duplicado detectado.' : `Error: ${error.message}`);
@@ -345,10 +650,258 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
   };
 
+  // ─── HANDLER v13.0: TRANSFERENCIA ENTRE CAJAS ─────────────────────────────
+  // Genera 3 asientos vinculados por transfer_id:
+  //   1. movimientos_caja_chica: SALIDA de caja origen (transfer_role='SALIDA')
+  //   2. movimientos_caja_chica: ENTRADA a caja destino (transfer_role='ENTRADA')
+  //   3. cuentas_generales: CxP categoría REPOSICION_CAJA de Águilas → caja origen
+  // Si cualquier paso falla, se hace rollback de los anteriores para mantener integridad.
+
+  const handleTransferencia = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTransferError(null);
+
+    if (!transferForm.caja_origen_id)  { setTransferError('Selecciona la caja de origen.'); return; }
+    if (!transferForm.caja_destino_id) { setTransferError('Selecciona la caja de destino.'); return; }
+    if (transferForm.caja_origen_id === transferForm.caja_destino_id) {
+      setTransferError('La caja origen y destino no pueden ser la misma.');
+      return;
+    }
+    const monto = round2(parseFloat(transferForm.monto));
+    if (isNaN(monto) || monto <= 0) { setTransferError('Monto inválido.'); return; }
+    if (!transferForm.concepto.trim()) { setTransferError('Concepto obligatorio.'); return; }
+
+    const cajaOrigen  = cajas.find(c => c.id === transferForm.caja_origen_id);
+    const cajaDestino = cajas.find(c => c.id === transferForm.caja_destino_id);
+    if (!cajaOrigen || !cajaDestino) { setTransferError('Caja no encontrada.'); return; }
+
+    // Verificar saldo disponible en caja origen
+    const saldoOrigen = getCajaBalance(transferForm.caja_origen_id, transferForm.moneda);
+    if (saldoOrigen < monto) {
+      const confirmar = window.confirm(
+        `⚠️ Saldo insuficiente en caja ${cajaOrigen.nombre}\n\n` +
+        `Saldo disponible: ${fmtMonto(saldoOrigen, transferForm.moneda)}\n` +
+        `Monto a transferir: ${fmtMonto(monto, transferForm.moneda)}\n\n` +
+        `La caja quedará en negativo. ¿Continuar?`
+      );
+      if (!confirmar) return;
+    }
+
+    setSavingTransfer(true);
+    const transferId = uuid4();
+    const salidaId   = uuid4();
+    const entradaId  = uuid4();
+    const fechaISO   = new Date(transferForm.fecha).toISOString();
+    const conceptoUpper = transferForm.concepto.toUpperCase().trim();
+
+    try {
+      // 1. SALIDA de caja origen
+      const { error: errSalida } = await supabase.from('movimientos_caja_chica').insert([{
+        id: salidaId,
+        caja_id: transferForm.caja_origen_id,
+        tipo: 'SALIDA',
+        moneda: transferForm.moneda,
+        monto,
+        concepto: `TRANSFERENCIA → ${cajaDestino.nombre.toUpperCase()} · ${conceptoUpper}`,
+        referencia: `TRF-${genHash(transferId)}`,
+        fecha: fechaISO,
+        registrado_por: userRole,
+        transfer_id: transferId,
+        transfer_role: 'SALIDA',
+        transfer_peer_id: transferForm.caja_destino_id,
+      }]);
+      if (errSalida) throw new Error(`Salida: ${errSalida.message}`);
+
+      // 2. ENTRADA a caja destino
+      const { error: errEntrada } = await supabase.from('movimientos_caja_chica').insert([{
+        id: entradaId,
+        caja_id: transferForm.caja_destino_id,
+        tipo: 'ENTRADA',
+        moneda: transferForm.moneda,
+        monto,
+        concepto: `TRANSFERENCIA ← ${cajaOrigen.nombre.toUpperCase()} · ${conceptoUpper}`,
+        referencia: `TRF-${genHash(transferId)}`,
+        fecha: fechaISO,
+        registrado_por: userRole,
+        transfer_id: transferId,
+        transfer_role: 'ENTRADA',
+        transfer_peer_id: transferForm.caja_origen_id,
+      }]);
+      if (errEntrada) {
+        // Rollback: eliminar salida
+        await supabase.from('movimientos_caja_chica').delete().eq('id', salidaId);
+        throw new Error(`Entrada: ${errEntrada.message}`);
+      }
+
+      // 3. CxP de reposición: Águilas debe a la caja origen
+      const { error: errCxP } = await supabase.from('cuentas_generales').insert([{
+        tipo: 'CXP',
+        entidad_nombre: `REPOSICIÓN CAJA ${cajaOrigen.nombre.toUpperCase()}`,
+        entidad_tipo: 'INTERNO',
+        proveedor_id: null,
+        moneda: transferForm.moneda,
+        monto_total: monto,
+        monto_pendiente: monto,
+        concepto: `Reposición por transferencia a ${cajaDestino.nombre.toUpperCase()} · ${conceptoUpper}`,
+        fecha_emision: fechaISO,
+        fecha_vencimiento: null,
+        estatus: 'PENDIENTE',
+        notas: `Transferencia interna entre cajas · Ref: TRF-${genHash(transferId)}`,
+        transfer_id: transferId,
+        categoria_interna: 'REPOSICION_CAJA',
+      }]);
+      if (errCxP) {
+        // Rollback: eliminar ambos movimientos
+        await supabase.from('movimientos_caja_chica').delete().in('id', [salidaId, entradaId]);
+        throw new Error(`Reposición: ${errCxP.message}`);
+      }
+
+      // Reset form + cerrar modal
+      setTransferForm({
+        caja_origen_id: '', caja_destino_id: '', moneda: 'USDT',
+        monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0],
+      });
+      setTransferModalOpen(false);
+      await fetchAll(true);
+
+    } catch (err) {
+      setTransferError(err instanceof Error ? err.message : 'Error al procesar transferencia.');
+    } finally {
+      setSavingTransfer(false);
+    }
+  };
+
+  // ─── v13.0: PAGO DE REPOSICIÓN ────────────────────────────────────────────
+  // Al marcar una reposición como PAGADA:
+  //   1. Marca la CxP como PAGADA
+  //   2. Genera ENTRADA en la caja origen (el dinero regresa a la caja)
+  //   3. Genera EXPENSE en Ledger (afecta bóveda global — sale de Bóveda principal)
+
+  const openPagarReposicion = (cuenta: CuentaGeneral) => {
+    setPagarReposicionMoneda(cuenta.moneda);
+    setPagarReposicionModal(cuenta);
+  };
+
+  const confirmarPagoReposicion = async () => {
+    if (!pagarReposicionModal) return;
+    const cuenta = pagarReposicionModal;
+    if (!cuenta.transfer_id) {
+      alert('Esta reposición no tiene transferencia asociada. Use el flujo normal de CxP.');
+      return;
+    }
+    setSavingAction(cuenta.id);
+    try {
+      // Buscar el movimiento SALIDA original para saber a qué caja debe regresar el dinero
+      const salidaOriginal = movCajas.find(m => m.transfer_id === cuenta.transfer_id && m.transfer_role === 'SALIDA');
+      if (!salidaOriginal) throw new Error('No se encontró el movimiento original de la transferencia.');
+
+      const cajaOrigen = cajas.find(c => c.id === salidaOriginal.caja_id);
+      if (!cajaOrigen) throw new Error('Caja origen no encontrada.');
+
+      // 1. Marcar CxP como pagada
+      const { error: errCxP } = await supabase.from('cuentas_generales').update({
+        estatus: 'PAGADO', monto_pendiente: 0,
+      }).eq('id', cuenta.id);
+      if (errCxP) throw new Error(errCxP.message);
+
+      // 2. Generar ENTRADA en la caja origen (reposición del dinero)
+      const { error: errEntrada } = await supabase.from('movimientos_caja_chica').insert([{
+        id: uuid4(),
+        caja_id: cajaOrigen.id,
+        tipo: 'ENTRADA',
+        moneda: pagarReposicionMoneda,
+        monto: cuenta.monto_total,
+        concepto: `REPOSICIÓN DESDE BÓVEDA · ${cuenta.concepto}`,
+        referencia: `REP-${genHash(cuenta.id)}`,
+        fecha: new Date().toISOString(),
+        registrado_por: userRole,
+        transfer_id: cuenta.transfer_id,
+        transfer_role: null,
+        transfer_peer_id: null,
+      }]);
+      if (errEntrada) {
+        // Rollback CxP
+        await supabase.from('cuentas_generales').update({
+          estatus: 'PENDIENTE', monto_pendiente: cuenta.monto_total,
+        }).eq('id', cuenta.id);
+        throw new Error(`Entrada a caja: ${errEntrada.message}`);
+      }
+
+      // 3. EXPENSE en Ledger — la Bóveda global pierde ese monto
+      const { error: errTx } = await supabase.from('transacciones_finanzas').insert([{
+        id: uuid4(),
+        type: 'EXPENSE',
+        entity_name: `REPOSICIÓN CAJA ${cajaOrigen.nombre.toUpperCase()}`,
+        amount: cuenta.monto_total,
+        invoice_number: `REP-${genHash(cuenta.id)}`,
+        description: `Reposición interna · ${cuenta.concepto}`,
+        status: 'PAID',
+        category: 'Reposición Interna',
+        payment_method: pagarReposicionMoneda,
+        issue_date: new Date().toISOString(),
+        transfer_id: cuenta.transfer_id,
+      }]);
+      if (errTx) {
+        console.error('[v13.0] Fallo el asiento Ledger de reposición:', errTx.message);
+        // No hacemos rollback aquí — la CxP y la entrada ya se hicieron; solo advertimos
+        alert('⚠️ Reposición aplicada a caja, pero el asiento en Ledger falló. Verifique manualmente.');
+      }
+
+      setPagarReposicionModal(null);
+      await fetchAll(true);
+
+    } catch (err) {
+      alert('Error al procesar pago de reposición: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setSavingAction(null);
+    }
+  };
+
+  // ─── v13.0: MODAL DE ELIMINACIÓN SELECTIVA DE TRANSFERENCIA ───────────────
+
+  const openDeleteTransferModal = (transferId: string) => {
+    const salida = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'SALIDA') || null;
+    const entrada = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'ENTRADA') || null;
+    const reposicion = cuentas.find(c => c.transfer_id === transferId && c.categoria_interna === 'REPOSICION_CAJA') || null;
+
+    const cajaOrigenNombre  = cajas.find(c => c.id === salida?.caja_id)?.nombre ?? '—';
+    const cajaDestinoNombre = cajas.find(c => c.id === entrada?.caja_id)?.nombre ?? '—';
+
+    setDeleteTransferModal({ transferId, salida, entrada, reposicion, cajaOrigenNombre, cajaDestinoNombre });
+    setDeleteTransferSelection({ salida: !!salida, entrada: !!entrada, reposicion: !!reposicion });
+  };
+
+  const confirmDeleteTransferSelection = () => {
+    if (!deleteTransferModal) return;
+    const { salida, entrada, reposicion } = deleteTransferModal;
+    const sel = deleteTransferSelection;
+
+    requireDirectorCode(async () => {
+      setSavingAction('transfer-delete');
+      try {
+        if (sel.salida && salida) {
+          const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', salida.id);
+          if (error) throw new Error(`Salida: ${error.message}`);
+        }
+        if (sel.entrada && entrada) {
+          const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', entrada.id);
+          if (error) throw new Error(`Entrada: ${error.message}`);
+        }
+        if (sel.reposicion && reposicion) {
+          const { error } = await supabase.from('cuentas_generales').delete().eq('id', reposicion.id);
+          if (error) throw new Error(`Reposición: ${error.message}`);
+        }
+        setDeleteTransferModal(null);
+        await fetchAll(true);
+      } catch (err) {
+        alert('Error al eliminar: ' + (err instanceof Error ? err.message : String(err)));
+      } finally {
+        setSavingAction(null);
+      }
+    });
+  };
+
   // ─── HANDLER: CUENTA (3 tipos) ────────────────────────────────────────────
-  // v12.0: HORAS_PAGADAS → cobrado de inmediato, nunca deuda
-  //        CXC           → pendiente hasta que pague
-  //        CXP           → proveedor, tabla cuentas_generales
 
   const handleCuenta = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -365,28 +918,39 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       const alumno = alumnos.find(a => a.student_id === cuentaForm.alumno_student_id);
       if (!alumno) { setCuentaError('Alumno no encontrado.'); return; }
 
-      // HORAS_PAGADAS → cobrado y acreditado de inmediato
-      // CXC           → pendiente, se acredita al marcar cobrado
       const esPagado = cuentaForm.tipo === 'HORAS_PAGADAS';
 
       setSavingCuenta(true);
       try {
-        const { error } = await supabase.from('cuentas_por_cobrar').insert([{
-          student_id:       alumno.student_id,
-          alumno_id:        alumno.student_id,
-          nombre_alumno:    alumno.nombre,
-          student_serial:   alumno.serial,
-          monto_total:      monto,
-          monto_pagado:     esPagado ? monto : 0,
-          monto_pendiente:  esPagado ? 0 : monto,
-          horas_prometidas: horas,
-          horas_compradas:  esPagado ? horas : 0,
-          concepto:         cuentaForm.concepto.toUpperCase().trim(),
-          fecha_emision:    cuentaForm.fecha_emision,
-          moneda:           cuentaForm.moneda_pago,
-          estatus:          esPagado ? 'COBRADO' : 'PENDIENTE',
-        }]);
+        const { data, error } = await supabase.from('cuentas_por_cobrar').insert([{
+          student_id: alumno.student_id, alumno_id: alumno.student_id,
+          nombre_alumno: alumno.nombre, student_serial: alumno.serial,
+          monto_total: monto, monto_pagado: esPagado ? monto : 0,
+          monto_pendiente: esPagado ? 0 : monto,
+          horas_prometidas: horas, horas_compradas: esPagado ? horas : 0,
+          concepto: cuentaForm.concepto.toUpperCase().trim(),
+          fecha_emision: cuentaForm.fecha_emision, moneda: cuentaForm.moneda_pago,
+          estatus: esPagado ? 'COBRADO' : 'PENDIENTE',
+        }]).select('id').single();
         if (error) { setCuentaError(`Error: ${error.message}`); return; }
+
+        if (esPagado) {
+          if (!data?.id) throw new Error('No se pudo obtener el ID de la cuenta creada.');
+          const invoiceNumber = `HORA-${String(data.id)}`;
+          const { error: txError } = await supabase.from('transacciones_finanzas').insert([{
+            id: uuid4(), type: 'INCOME', entity_id: alumno.student_id, entity_name: alumno.nombre,
+            amount: monto, invoice_number: invoiceNumber,
+            description: `HORAS PAGADAS · ${cuentaForm.concepto.toUpperCase().trim()}`,
+            status: 'PAID', category: 'Academia',
+            payment_method: normalizePaymentMethod(cuentaForm.moneda_pago),
+            issue_date: new Date(cuentaForm.fecha_emision).toISOString(),
+          }]);
+          if (txError) {
+            await supabase.from('cuentas_por_cobrar').delete().eq('id', data?.id || '');
+            throw new Error(`No se pudo registrar el ingreso: ${txError.message}`);
+          }
+        }
+
         setCuentaForm(p => ({ ...p, alumno_student_id: '', horas_prometidas: '', monto_total: '', concepto: '' }));
         setShowCuentaForm(false);
       } catch (err) {
@@ -399,14 +963,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
     // CXP
     const num = round2(parseFloat(cuentaForm.monto_total));
-    if (isNaN(num) || num <= 0)              { setCuentaError('Monto inválido.'); return; }
-    if (!cuentaForm.entidad_nombre.trim())   { setCuentaError('Nombre de entidad requerido.'); return; }
-    if (!cuentaForm.concepto.trim())         { setCuentaError('Concepto requerido.'); return; }
+    if (isNaN(num) || num <= 0)            { setCuentaError('Monto inválido.'); return; }
+    if (!cuentaForm.entidad_nombre.trim()) { setCuentaError('Nombre de entidad requerido.'); return; }
+    if (!cuentaForm.concepto.trim())       { setCuentaError('Concepto requerido.'); return; }
     setSavingCuenta(true);
     try {
       const { error } = await supabase.from('cuentas_generales').insert([{
         tipo: 'CXP', entidad_nombre: cuentaForm.entidad_nombre.toUpperCase().trim(),
-        entidad_tipo: cuentaForm.entidad_tipo, proveedor_id: cuentaForm.proveedor_id || null,
+        entidad_tipo: cuentaForm.entidad_tipo,
+        proveedor_id: cuentaForm.proveedor_id || null,
         moneda: cuentaForm.moneda, monto_total: num, monto_pendiente: num,
         concepto: cuentaForm.concepto.toUpperCase().trim(),
         fecha_emision: new Date(cuentaForm.fecha_emision).toISOString(),
@@ -425,45 +990,50 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   const handlePagarCuenta = async (id: string, esCxC: boolean) => {
     if (savingAction) return;
+
+    // v13.0 — si es reposición interna, usar flujo especial con modal de bóveda
+    if (!esCxC) {
+      const cuenta = cuentas.find(c => c.id === id);
+      if (cuenta?.categoria_interna === 'REPOSICION_CAJA') {
+        openPagarReposicion(cuenta);
+        return;
+      }
+    }
+
     setSavingAction(id);
     try {
       if (esCxC) {
         const reg = cuentasCxC.find(c => c.id === id);
         if (!reg) return;
-        const { error } = await supabase.from('cuentas_por_cobrar')
-          .update({ estatus: 'COBRADO', monto_pagado: reg.monto_total, monto_pendiente: 0, horas_compradas: reg.horas_prometidas })
-          .eq('id', id);
-        if (error) console.error('[FinancePanel] pagar CxC:', error.message);
+        const previous = { ...reg };
+        const { error } = await supabase.from('cuentas_por_cobrar').update({
+          estatus: 'COBRADO', monto_pagado: reg.monto_total, monto_pendiente: 0,
+          horas_compradas: reg.horas_prometidas,
+        }).eq('id', id);
+        if (error) throw new Error(error.message);
+        const invoiceNumber = `CXC-${id}`;
+        const { data: existingTx } = await supabase.from('transacciones_finanzas').select('id').eq('invoice_number', invoiceNumber).limit(1);
+        if (!existingTx?.length) {
+          const { error: txError } = await supabase.from('transacciones_finanzas').insert([{
+            id: uuid4(), type: 'INCOME', entity_id: reg.student_id, entity_name: reg.nombre_alumno,
+            amount: round2(Number(reg.monto_total) || 0), invoice_number: invoiceNumber,
+            description: `COBRO CXC · ${reg.concepto || 'CUENTA POR COBRAR'}`,
+            status: 'PAID', category: 'Academia',
+            payment_method: normalizePaymentMethod(reg.moneda),
+            issue_date: new Date().toISOString(),
+          }]);
+          if (txError) {
+            await supabase.from('cuentas_por_cobrar').update({
+              estatus: previous.estatus, monto_pagado: previous.monto_pagado,
+              monto_pendiente: previous.monto_pendiente, horas_compradas: previous.horas_compradas,
+            }).eq('id', id);
+            throw new Error(`No se pudo registrar el ingreso: ${txError.message}`);
+          }
+        }
       } else {
         await supabase.from('cuentas_generales').update({ estatus: 'PAGADO', monto_pendiente: 0 }).eq('id', id);
       }
     } finally { setSavingAction(null); }
-  };
-
-  const handleDeleteCuenta = async (id: string, esCxC: boolean) => {
-    if (!window.confirm('¿Eliminar esta cuenta?')) return;
-    if (savingAction) return;
-    setSavingAction(id);
-    try {
-      if (esCxC) await supabase.from('cuentas_por_cobrar').delete().eq('id', id);
-      else       await supabase.from('cuentas_generales').delete().eq('id', id);
-    } finally { setSavingAction(null); }
-  };
-
-  const handleDeleteTx = async (id: string) => {
-    if (!window.confirm('¿Eliminar esta transacción?')) return;
-    if (savingAction) return;
-    setSavingAction(id);
-    try { await supabase.from('transacciones_finanzas').delete().eq('id', id); }
-    finally { setSavingAction(null); }
-  };
-
-  const handleDeleteMovCaja = async (id: string) => {
-    if (!window.confirm('¿Revertir este movimiento?')) return;
-    if (savingAction) return;
-    setSavingAction(id);
-    try { await supabase.from('movimientos_caja_chica').delete().eq('id', id); }
-    finally { setSavingAction(null); }
   };
 
   const handleCreateRequest = async (e: React.FormEvent) => {
@@ -516,8 +1086,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const caja = cajas.find(c => c.id === cajaId);
     if (!caja) return;
     const movs = movCajas.filter(m => m.caja_id === cajaId);
-    const rows = [`CAJA: ${caja.nombre.toUpperCase()}`, `Exportado: ${new Date().toLocaleDateString('es-VE')}`, '', 'Fecha,Tipo,Moneda,Monto,Concepto,Referencia,Por',
-      ...movs.map(m => [fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2), `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.registrado_por||'Sistema'].join(','))];
+    const rows = [`CAJA: ${caja.nombre.toUpperCase()}`, `Exportado: ${new Date().toLocaleDateString('es-VE')}`, '',
+      'Fecha,Tipo,Moneda,Monto,Concepto,Referencia,Por',
+      ...movs.map(m => [fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2),
+        `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.registrado_por||'Sistema'].join(','))];
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8;' }));
     a.download = `Caja_${caja.nombre.replace(/\s+/g,'_')}_${new Date().toISOString().split('T')[0]}.csv`;
@@ -529,7 +1101,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     cajas.forEach(caja => {
       const movs = movCajas.filter(m => m.caja_id === caja.id);
       all.push(`CAJA: ${caja.nombre.toUpperCase()}`, 'Fecha,Tipo,Moneda,Monto,Concepto,Referencia');
-      movs.forEach(m => all.push([fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2), `"${m.concepto||''}"`, `"${m.referencia||''}"` ].join(',')));
+      movs.forEach(m => all.push([fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2),
+        `"${m.concepto||''}"`, `"${m.referencia||''}"`].join(',')));
       all.push('');
     });
     const a = document.createElement('a');
@@ -543,7 +1116,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   if (loading) return (
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v12.0...</p>
+      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v13.0...</p>
     </div>
   );
 
@@ -555,7 +1128,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       {/* HEADER */}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
-          <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v12.0</p>
+          <div>
+            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v13.0</p>
+            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Interconexión de Cajas · Edición/Eliminación: clave del Director</p>
+          </div>
           <button onClick={() => fetchAll(true)} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors">
             <RefreshCw size={12} className={fetchLockRef.current ? 'animate-spin' : ''} />
           </button>
@@ -581,7 +1157,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       </div>
 
-      {/* KPI STRIP */}
+      {/* KPI STRIP BÓVEDAS */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m => {
           const ing   = transactions.filter(t=>t.payment_method===m&&t.status==='PAID'&&(t.type==='INCOME'||t.type==='RECEIVABLE')).reduce((a,t)=>round2(a+t.amount),0);
@@ -608,13 +1184,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         })}
       </div>
 
-      {/* v12.0 — KPI CUENTAS: 3 métricas */}
-      <div className="grid grid-cols-3 gap-3">
+      {/* KPI CUENTAS — v13.0: 4 métricas incluyendo Reposiciones */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <div className={`${glass} bg-yellow-500/5 border border-yellow-500/10 rounded-2xl p-4 flex items-center justify-between`}>
           <div>
-            <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Por Cobrar (Deuda)</p>
+            <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Por Cobrar (Alumnos)</p>
             <p className="text-yellow-400 font-black text-lg italic">${totalCxC.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
-            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{cxcPendientes.length} alumnos pendientes</p>
+            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{cxcPendientes.length} pendientes</p>
           </div>
           <ArrowUpCircle className="text-yellow-400/20 h-9 w-9" />
         </div>
@@ -622,17 +1198,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           <div>
             <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Horas Acreditadas</p>
             <p className="text-emerald-400 font-black text-lg italic">{totalHorasAcred.toFixed(1)}h</p>
-            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{horasPagadas.length} registros pagados</p>
+            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{horasPagadas.length} pagados</p>
           </div>
           <Plane className="text-emerald-400/20 h-9 w-9" />
         </div>
         <div className={`${glass} bg-orange-500/5 border border-orange-500/10 rounded-2xl p-4 flex items-center justify-between`}>
           <div>
-            <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Por Pagar</p>
+            <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Por Pagar (Proveedores)</p>
             <p className="text-orange-400 font-black text-lg italic">${totalCxP.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
-            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{cuentas.filter(c=>c.estatus!=='PAGADO').length} proveedores</p>
+            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{cuentasProveedores.filter(c=>c.estatus!=='PAGADO').length} pendientes</p>
           </div>
           <ArrowDownCircle className="text-orange-400/20 h-9 w-9" />
+        </div>
+        <div className={`${glass} bg-purple-500/5 border border-purple-500/10 rounded-2xl p-4 flex items-center justify-between`}>
+          <div>
+            <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Reposiciones Internas</p>
+            <p className="text-purple-400 font-black text-lg italic">${totalReposiciones.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
+            <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{cuentasReposiciones.filter(c=>c.estatus!=='PAGADO').length} entre cajas</p>
+          </div>
+          <ArrowLeftRight className="text-purple-400/20 h-9 w-9" />
         </div>
       </div>
 
@@ -700,7 +1284,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                       {(t.type==='INCOME'||t.type==='RECEIVABLE')?'+':'-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
                     </span>
                     {t.status==='PAID'?<CheckCircle2 className="h-4 w-4 text-emerald-500/40 shrink-0"/>:<Loader2 className="h-4 w-4 text-[#E1AD01] animate-spin shrink-0"/>}
-                    <button onClick={()=>handleDeleteTx(t.id)} disabled={savingAction===t.id}
+                    <button onClick={()=>openEditTx(t)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
+                      <Pencil size={13}/>
+                    </button>
+                    <button onClick={()=>deleteTxProtected(t.id)} disabled={savingAction===t.id}
                       className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
                       {savingAction===t.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
                     </button>
@@ -756,7 +1343,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     <span className={`font-black text-lg italic ${(t.type==='INCOME'||t.type==='RECEIVABLE')?'text-emerald-400':'text-red-400'}`}>
                       {(t.type==='INCOME'||t.type==='RECEIVABLE')?'+':'-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
                     </span>
-                    <button onClick={()=>handleDeleteTx(t.id)} disabled={savingAction===t.id}
+                    <button onClick={()=>deleteTxProtected(t.id)} disabled={savingAction===t.id}
                       className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
                       {savingAction===t.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
                     </button>
@@ -771,9 +1358,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ TAB: CAJAS ══════════════════════════════════════════════════════ */}
+      {/* ══ TAB: CAJAS — v13.0 con Transferencia ════════════════════════════ */}
       {activeTab === 'CAJAS' && (
         <div className="space-y-6">
+
+          {/* Toolbar con botón de transferencia */}
+          <div className="flex justify-between items-center flex-wrap gap-3">
+            <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">
+              {cajas.length} cajas operativas · Selecciona una para registrar movimientos
+            </p>
+            <div className="flex gap-2">
+              <button onClick={()=>setTransferModalOpen(true)}
+                className="bg-purple-500/10 text-purple-400 border border-purple-500/20 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-purple-500/20 transition-all flex items-center gap-2">
+                <ArrowLeftRight size={13}/> Transferir entre cajas
+              </button>
+              <button onClick={handleExportCajasExcel} className="bg-emerald-500/10 text-emerald-400 px-5 py-3 rounded-xl border border-emerald-500/20 text-[10px] font-black uppercase tracking-widest hover:bg-emerald-500/20 transition-all flex items-center gap-2">
+                <Download size={12}/> Exportar
+              </button>
+            </div>
+          </div>
+
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {cajas.map(caja => {
               const active  = cajaActiva===caja.id;
@@ -800,11 +1404,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               );
             })}
           </div>
-          <div className="flex justify-end">
-            <button onClick={handleExportCajasExcel} className="bg-emerald-500/10 text-emerald-400 px-5 py-3 rounded-xl border border-emerald-500/20 text-[9px] font-black uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-2">
-              <Download size={12}/> Exportar Cajas
-            </button>
-          </div>
+
           {cajaActiva&&(()=>{
             const caja = cajas.find(c=>c.id===cajaActiva)!;
             const movs = movCajas.filter(m=>m.caja_id===cajaActiva);
@@ -872,17 +1472,29 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </div>
                   <div className="flex-1 overflow-y-auto max-h-[400px] p-4 space-y-2">
                     {movs.map(m=>(
-                      <div key={m.id} className="bg-white/[0.02] border border-white/[0.05] p-4 rounded-2xl flex justify-between items-center group">
-                        <div>
-                          <div className="flex items-center gap-2 mb-0.5">
+                      <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${
+                        m.transfer_id ? 'border-purple-500/20' : 'border-white/[0.05]'
+                      }`}>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                             <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full border ${MONEDA_BG[m.moneda]} ${MONEDA_COLOR[m.moneda]}`}>{m.moneda}</span>
-                            <p className="text-[10px] font-black uppercase">{m.concepto||'—'}</p>
+                            {m.transfer_id && (
+                              <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center gap-1">
+                                <ArrowLeftRight size={8}/> Transferencia
+                              </span>
+                            )}
+                            <p className="text-[10px] font-black uppercase truncate">{m.concepto||'—'}</p>
                           </div>
                           <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(m.fecha)}{m.referencia?` · ${m.referencia}`:''}</p>
                         </div>
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-3 ml-3">
                           <span className={`font-black text-base italic ${m.tipo==='ENTRADA'?'text-emerald-400':'text-red-400'}`}>{m.tipo==='ENTRADA'?'+':'-'}{fmtMonto(m.monto,m.moneda)}</span>
-                          <button onClick={()=>handleDeleteMovCaja(m.id)} disabled={savingAction===m.id}
+                          {!m.transfer_id && (
+                            <button onClick={()=>openEditMov(m)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
+                              <Pencil size={13}/>
+                            </button>
+                          )}
+                          <button onClick={()=>deleteMovProtected(m.id)} disabled={savingAction===m.id}
                             className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
                             {savingAction===m.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
                           </button>
@@ -900,11 +1512,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ TAB: CUENTAS v12.0 ══════════════════════════════════════════════ */}
+      {/* ══ TAB: CUENTAS v13.0 — 4 CARDS ═══════════════════════════════════ */}
       {activeTab === 'CUENTAS' && (
         <div className="space-y-6">
-
-          {/* Toolbar */}
           <div className="flex justify-end">
             <button onClick={()=>setShowCuentaForm(!showCuentaForm)}
               className="bg-[#E1AD01] text-black px-6 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-white transition-all flex items-center gap-2">
@@ -912,7 +1522,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </button>
           </div>
 
-          {/* Formulario v12.0 — 3 tipos */}
           {showCuentaForm && (
             <div className={`${glass} rounded-3xl p-7 border-t-2 border-t-[#E1AD01] animate-in slide-in-from-top-4 duration-300`}>
               <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic flex items-center gap-2">
@@ -920,12 +1529,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </h3>
               <form onSubmit={handleCuenta} className="grid grid-cols-1 md:grid-cols-3 gap-4">
 
-                {/* Selector de tipo — 3 opciones */}
                 <div className="md:col-span-3 flex bg-black/50 rounded-2xl p-1 border border-white/10 gap-1">
                   {([
                     { key: 'HORAS_PAGADAS', label: '✓ Horas Pagadas', hint: 'Alumno pagó ahora — acredita de inmediato' },
                     { key: 'CXC',           label: '⏳ Cuenta por Cobrar', hint: 'Alumno debe — queda pendiente' },
-                    { key: 'CXP',           label: '↙ Cuenta por Pagar',  hint: 'Proveedor / gasto' },
+                    { key: 'CXP',           label: '↙ Cuenta por Pagar',  hint: 'Proveedor / gasto externo' },
                   ] as { key: FormTipo; label: string; hint: string }[]).map(({ key, label, hint }) => (
                     <button key={key} type="button" onClick={()=>setCuentaForm(p=>({...p,tipo:key}))}
                       className={`flex-1 py-3 px-4 rounded-xl transition-all text-left ${
@@ -941,7 +1549,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   ))}
                 </div>
 
-                {/* Campos comunes a HORAS_PAGADAS y CXC */}
                 {(cuentaForm.tipo === 'HORAS_PAGADAS' || cuentaForm.tipo === 'CXC') && (<>
                   <select required value={cuentaForm.alumno_student_id} onChange={e=>setCuentaForm(p=>({...p,alumno_student_id:e.target.value}))} className={inp}>
                     <option value="">— ALUMNO —</option>
@@ -967,25 +1574,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                       ))}
                     </div>
                   </div>
-                  {cuentaForm.tipo === 'HORAS_PAGADAS' && (
-                    <div className="md:col-span-3 flex items-start gap-3 bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-4">
-                      <CheckCircle2 size={14} className="text-emerald-400 shrink-0 mt-0.5"/>
-                      <p className="text-[9px] text-emerald-400/80 leading-relaxed">
-                        Las horas se acreditarán <span className="font-black text-emerald-400">de inmediato</span>. Este registro aparecerá en "Horas Acreditadas", no en "Por Cobrar". El alumno queda habilitado para volar al instante.
-                      </p>
-                    </div>
-                  )}
-                  {cuentaForm.tipo === 'CXC' && (
-                    <div className="md:col-span-3 flex items-start gap-3 bg-yellow-500/5 border border-yellow-500/20 rounded-2xl p-4">
-                      <AlertTriangle size={14} className="text-yellow-400 shrink-0 mt-0.5"/>
-                      <p className="text-[9px] text-yellow-400/80 leading-relaxed">
-                        Quedará como <span className="font-black text-yellow-400">PENDIENTE</span> hasta que el alumno pague. Las horas se acreditan solo al marcar "Cobrado". Aparecerá en "Por Cobrar".
-                      </p>
-                    </div>
-                  )}
                 </>)}
 
-                {/* CXP */}
                 {cuentaForm.tipo === 'CXP' && (<>
                   <select value={cuentaForm.moneda} onChange={e=>setCuentaForm(p=>({...p,moneda:e.target.value as any}))} className={inp}>
                     <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
@@ -1005,7 +1595,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   )}
                   <input type="number" step="0.01" min="0.01" required value={cuentaForm.monto_total}
                     onChange={e=>setCuentaForm(p=>({...p,monto_total:e.target.value}))}
-                    onBlur={e=>{const n=parseFloat(e.target.value);if(!isNaN(n))setCuentaForm(p=>({...p,monto_total:round2(n).toString()}));}}
                     placeholder="MONTO" className={inp}/>
                   <input required value={cuentaForm.concepto} onChange={e=>setCuentaForm(p=>({...p,concepto:e.target.value}))} placeholder="CONCEPTO / DESCRIPCIÓN" className={inp}/>
                   <input type="date" required value={cuentaForm.fecha_emision} onChange={e=>setCuentaForm(p=>({...p,fecha_emision:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
@@ -1028,38 +1617,37 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
           )}
 
-          {/* v12.0 — 3 CARDS */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* v13.0 — 4 CARDS: CxC, Horas, CxP proveedores, Reposiciones internas */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
 
-            {/* Card 1: Cuentas por Cobrar (deuda pendiente) */}
+            {/* Card 1: Por Cobrar */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-yellow-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
                   <ArrowUpCircle className="text-yellow-400 h-4 w-4"/> Por Cobrar
-                  <span className="ml-auto font-mono text-yellow-400">${totalCxC.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
+                  <span className="ml-auto font-mono text-yellow-400 text-[9px]">${totalCxC.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Alumnos que deben — horas aún no acreditadas</p>
+                <p className="text-[8px] text-zinc-600 font-mono mt-1">Alumnos que deben</p>
               </div>
-              <div className="overflow-y-auto max-h-[380px] p-4 space-y-2">
+              <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                 {cxcPendientes.map(c=>(
                   <div key={c.id} className="bg-white/[0.02] border border-yellow-500/10 rounded-2xl p-4 group hover:bg-white/[0.04] transition-all">
                     <div className="flex justify-between items-start mb-2">
-                      <div>
-                        <p className="text-[10px] font-black uppercase">{c.nombre_alumno}</p>
-                        <p className="text-[8px] text-zinc-600 font-mono">{c.concepto} · {fmtDate(c.fecha_emision)}</p>
-                        <p className="text-[8px] text-yellow-400/70 font-mono mt-0.5">{c.horas_prometidas}h prometidas · {c.moneda||'USD'}</p>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] font-black uppercase truncate">{c.nombre_alumno}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
+                        <p className="text-[8px] text-yellow-400/70 font-mono mt-0.5">{c.horas_prometidas}h · {c.moneda||'USD'}</p>
                       </div>
-                      <div className="text-right">
-                        <p className="font-black italic text-base text-yellow-400">${c.monto_pendiente.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
-                        <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-yellow-500/10 text-yellow-500">PENDIENTE</span>
+                      <div className="text-right ml-2">
+                        <p className="font-black italic text-sm text-yellow-400">${c.monto_pendiente.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
                       </div>
                     </div>
-                    <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
+                    <div className="flex gap-2 mt-3">
                       <button onClick={()=>handlePagarCuenta(c.id,true)} disabled={savingAction===c.id}
                         className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
                         {savingAction===c.id?<Loader2 size={11} className="animate-spin"/>:<><CheckCircle2 size={11}/> Cobrado</>}
                       </button>
-                      <button onClick={()=>handleDeleteCuenta(c.id,true)} disabled={savingAction===c.id}
+                      <button onClick={()=>deleteCuentaProtected(c.id,true)} disabled={savingAction===c.id}
                         className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
                         <Trash2 size={12}/>
                       </button>
@@ -1072,33 +1660,32 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </div>
             </div>
 
-            {/* Card 2: Horas Pagadas (cobradas — acreditadas) */}
+            {/* Card 2: Horas Pagadas */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-emerald-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
                   <Plane className="text-emerald-400 h-4 w-4"/> Horas Pagadas
-                  <span className="ml-auto font-mono text-emerald-400">{totalHorasAcred.toFixed(1)}h</span>
+                  <span className="ml-auto font-mono text-emerald-400 text-[9px]">{totalHorasAcred.toFixed(1)}h</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Pagos recibidos — horas ya acreditadas al alumno</p>
+                <p className="text-[8px] text-zinc-600 font-mono mt-1">Horas acreditadas al alumno</p>
               </div>
-              <div className="overflow-y-auto max-h-[380px] p-4 space-y-2">
+              <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                 {horasPagadas.map(c=>(
                   <div key={c.id} className="bg-white/[0.02] border border-emerald-500/10 rounded-2xl p-4 group transition-all hover:bg-white/[0.04]">
                     <div className="flex justify-between items-start">
-                      <div>
-                        <p className="text-[10px] font-black uppercase">{c.nombre_alumno}</p>
-                        <p className="text-[8px] text-zinc-600 font-mono">{c.concepto} · {fmtDate(c.fecha_emision)}</p>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] font-black uppercase truncate">{c.nombre_alumno}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
                         <p className="text-[8px] text-emerald-400 font-mono mt-0.5 flex items-center gap-1">
-                          <CheckCircle2 size={9}/> {c.horas_compradas}h acreditadas · {c.moneda||'USD'}
+                          <CheckCircle2 size={9}/> {c.horas_compradas}h · {c.moneda||'USD'}
                         </p>
                       </div>
-                      <div className="text-right">
-                        <p className="font-black italic text-base text-emerald-400">${c.monto_total.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
-                        <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-500">COBRADO</span>
+                      <div className="text-right ml-2">
+                        <p className="font-black italic text-sm text-emerald-400">${c.monto_total.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
                       </div>
                     </div>
                     <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
-                      <button onClick={()=>handleDeleteCuenta(c.id,true)} disabled={savingAction===c.id}
+                      <button onClick={()=>deleteCuentaProtected(c.id,true)} disabled={savingAction===c.id}
                         className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30 text-[8px] font-black uppercase flex items-center gap-1">
                         <Trash2 size={11}/> Eliminar
                       </button>
@@ -1106,41 +1693,41 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </div>
                 ))}
                 {horasPagadas.length===0&&(
-                  <div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin registros de horas pagadas</p></div>
+                  <div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin horas pagadas</p></div>
                 )}
               </div>
             </div>
 
-            {/* Card 3: Cuentas por Pagar (proveedores) */}
+            {/* Card 3: Por Pagar (Proveedores externos) */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
-              <div className="p-5 border-b border-white/5 bg-red-500/5">
+              <div className="p-5 border-b border-white/5 bg-orange-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
-                  <ArrowDownCircle className="text-red-400 h-4 w-4"/> Por Pagar
-                  <span className="ml-auto font-mono text-red-400">${totalCxP.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
+                  <ArrowDownCircle className="text-orange-400 h-4 w-4"/> Por Pagar
+                  <span className="ml-auto font-mono text-orange-400 text-[9px]">${totalCxP.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Proveedores y gastos pendientes</p>
+                <p className="text-[8px] text-zinc-600 font-mono mt-1">Proveedores y gastos externos</p>
               </div>
-              <div className="overflow-y-auto max-h-[380px] p-4 space-y-2">
-                {cuentas.map(c=>(
-                  <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all ${c.estatus==='PAGADO'?'border-emerald-500/10 opacity-50':'border-red-500/10 hover:bg-white/[0.04]'}`}>
+              <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
+                {cuentasProveedores.map(c=>(
+                  <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all ${c.estatus==='PAGADO'?'border-emerald-500/10 opacity-50':'border-orange-500/10 hover:bg-white/[0.04]'}`}>
                     <div className="flex justify-between items-start mb-2">
-                      <div>
-                        <p className="text-[10px] font-black uppercase">{c.entidad_nombre}</p>
-                        <p className="text-[8px] text-zinc-600 font-mono">{c.concepto} · {fmtDate(c.fecha_emision)}</p>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] font-black uppercase truncate">{c.entidad_nombre}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
                         {c.fecha_vencimiento&&<p className="text-[8px] text-orange-400/70 font-mono mt-0.5">Vence: {fmtDate(c.fecha_vencimiento)}</p>}
                       </div>
-                      <div className="text-right">
-                        <p className={`font-black italic text-base ${c.estatus==='PAGADO'?'text-emerald-400':'text-red-400'}`}>{fmtMonto(c.monto_pendiente,c.moneda)}</p>
-                        <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${c.estatus==='PAGADO'?'bg-emerald-500/10 text-emerald-500':'bg-red-500/10 text-red-500'}`}>{c.estatus}</span>
+                      <div className="text-right ml-2">
+                        <p className={`font-black italic text-sm ${c.estatus==='PAGADO'?'text-emerald-400':'text-orange-400'}`}>{fmtMonto(c.monto_pendiente,c.moneda)}</p>
+                        <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${c.estatus==='PAGADO'?'bg-emerald-500/10 text-emerald-500':'bg-orange-500/10 text-orange-500'}`}>{c.estatus}</span>
                       </div>
                     </div>
                     {c.estatus!=='PAGADO'&&(
-                      <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
+                      <div className="flex gap-2 mt-3">
                         <button onClick={()=>handlePagarCuenta(c.id,false)} disabled={savingAction===c.id}
                           className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
                           {savingAction===c.id?<Loader2 size={11} className="animate-spin"/>:<><CheckCircle2 size={11}/> Pagado</>}
                         </button>
-                        <button onClick={()=>handleDeleteCuenta(c.id,false)} disabled={savingAction===c.id}
+                        <button onClick={()=>deleteCuentaProtected(c.id,false)} disabled={savingAction===c.id}
                           className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
                           <Trash2 size={12}/>
                         </button>
@@ -1148,8 +1735,68 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     )}
                   </div>
                 ))}
-                {cuentas.length===0&&(
+                {cuentasProveedores.length===0&&(
                   <div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por pagar</p></div>
+                )}
+              </div>
+            </div>
+
+            {/* Card 4: v13.0 — Reposiciones Internas */}
+            <div className={`${glass} rounded-3xl overflow-hidden border-purple-500/10`}>
+              <div className="p-5 border-b border-white/5 bg-purple-500/5">
+                <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
+                  <ArrowLeftRight className="text-purple-400 h-4 w-4"/> Reposiciones
+                  <span className="ml-auto font-mono text-purple-400 text-[9px]">${totalReposiciones.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
+                </h3>
+                <p className="text-[8px] text-zinc-600 font-mono mt-1">Transferencias entre cajas pendientes de reponer</p>
+              </div>
+              <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
+                {cuentasReposiciones.map(c=>{
+                  const salida  = movCajas.find(m => m.transfer_id === c.transfer_id && m.transfer_role === 'SALIDA');
+                  const entrada = movCajas.find(m => m.transfer_id === c.transfer_id && m.transfer_role === 'ENTRADA');
+                  const cajaOrig = cajas.find(x => x.id === salida?.caja_id);
+                  const cajaDest = cajas.find(x => x.id === entrada?.caja_id);
+                  return (
+                    <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all ${c.estatus==='PAGADO'?'border-emerald-500/10 opacity-60':'border-purple-500/10 hover:bg-white/[0.04]'}`}>
+                      <div className="flex justify-between items-start mb-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[10px] font-black uppercase truncate">{c.entidad_nombre}</p>
+                          {cajaOrig && cajaDest && (
+                            <p className="text-[8px] text-purple-400/80 font-mono flex items-center gap-1 mt-0.5">
+                              {cajaOrig.nombre} <ArrowLeftRight size={8}/> {cajaDest.nombre}
+                            </p>
+                          )}
+                          <p className="text-[8px] text-zinc-600 font-mono truncate mt-0.5">{c.concepto}</p>
+                          <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(c.fecha_emision)}</p>
+                        </div>
+                        <div className="text-right ml-2">
+                          <p className={`font-black italic text-sm ${c.estatus==='PAGADO'?'text-emerald-400':'text-purple-400'}`}>{fmtMonto(c.monto_pendiente,c.moneda)}</p>
+                          <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${c.estatus==='PAGADO'?'bg-emerald-500/10 text-emerald-500':'bg-purple-500/10 text-purple-400'}`}>
+                            {c.estatus==='PAGADO'?'Repuesta':'Pendiente'}
+                          </span>
+                        </div>
+                      </div>
+                      {c.estatus!=='PAGADO'&&(
+                        <div className="flex gap-2 mt-3">
+                          <button onClick={()=>openPagarReposicion(c)} disabled={savingAction===c.id}
+                            className="flex-1 py-2 bg-purple-500/20 text-purple-400 rounded-xl text-[9px] font-black uppercase border border-purple-500/20 hover:bg-purple-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
+                            {savingAction===c.id?<Loader2 size={11} className="animate-spin"/>:<><Repeat size={11}/> Reponer</>}
+                          </button>
+                          <button onClick={()=>deleteCuentaProtected(c.id,false)} disabled={savingAction===c.id}
+                            className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
+                            <Trash2 size={12}/>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {cuentasReposiciones.length===0&&(
+                  <div className="text-center py-12 text-zinc-700">
+                    <ArrowLeftRight className="h-8 w-8 mx-auto mb-3 opacity-20"/>
+                    <p className="text-[9px] font-black uppercase tracking-widest">Sin transferencias entre cajas</p>
+                    <p className="text-[8px] text-zinc-800 font-mono mt-1">Usa "Transferir entre cajas" en el tab Cajas</p>
+                  </div>
                 )}
               </div>
             </div>
@@ -1244,8 +1891,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           <div className="space-y-6">
             <div className={`${glass} rounded-2xl p-5 flex items-center justify-between`}>
               <div>
-                <p className="text-[9px] font-black text-zinc-500 uppercase tracking-widest mb-1">Tasa BCV (Bs/USD) — para totales consolidados</p>
-                <p className="text-[8px] text-zinc-700">Solo afecta el display. Los montos en BD se guardan en moneda nativa.</p>
+                <p className="text-[9px] font-black text-zinc-500 uppercase tracking-widest mb-1">Tasa BCV (Bs/USD)</p>
+                <p className="text-[8px] text-zinc-700">Solo afecta display. BD guarda en moneda nativa.</p>
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[#E1AD01] font-black font-mono">Bs</span>
@@ -1283,7 +1930,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                           <span className={`absolute left-4 top-1/2 -translate-y-1/2 font-black text-lg ${MONEDA_COLOR[m]}`}>{prefix}</span>
                           <input type="number" step="0.01" value={physBalances[m]}
                             onChange={e=>setPhysBalances(p=>({...p,[m]:e.target.value}))}
-                            className={`w-full bg-black/50 border py-4 pl-10 pr-4 rounded-xl text-xl font-black italic outline-none text-center text-white transition-all ${cuadra?'border-emerald-500/50 focus:border-emerald-400':descuadra?'border-red-500/50 focus:border-red-400':'border-white/10 focus:border-[#E1AD01]'}`}
+                            className={`w-full bg-black/50 border py-4 pl-10 pr-4 rounded-xl text-xl font-black italic outline-none text-center text-white transition-all ${cuadra?'border-emerald-500/50':descuadra?'border-red-500/50':'border-white/10 focus:border-[#E1AD01]'}`}
                             placeholder="0.00"/>
                         </div>
                       </div>
@@ -1291,21 +1938,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   );
                 })}
               </div>
-              {METODOS.some(({m})=>{const f=parseFloat(physBalances[m]);return !isNaN(f)&&f!==0&&Math.abs(round2(getVaultBalance(m)-f))>0.01;})&&(
-                <div className="bg-red-500/5 border border-red-500/20 rounded-2xl p-5 space-y-2 mt-5">
-                  <p className="text-[9px] font-black text-red-400 uppercase tracking-widest mb-2">⚠ Discrepancias Detectadas</p>
-                  {METODOS.map(({m,label,prefix})=>{
-                    const t=getVaultBalance(m);const f=round2(parseFloat(physBalances[m])||0);const d=round2(t-f);
-                    if(Math.abs(d)<=0.01||physBalances[m]==='')return null;
-                    return(
-                      <div key={m} className="flex justify-between items-center text-[10px]">
-                        <span className={`font-black uppercase ${MONEDA_COLOR[m]}`}>{label}</span>
-                        <span className={`font-mono italic font-black ${d>0?'text-red-400':'text-yellow-400'}`}>{d>0?'Faltante':'Sobrante'}: {prefix} {Math.abs(d).toFixed(2)}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
               <button onClick={handleCierre} className="w-full py-5 bg-red-600 rounded-2xl font-black uppercase text-[10px] tracking-widest flex items-center justify-center gap-2 hover:bg-red-500 transition-all mt-5">
                 <Lock className="h-4 w-4"/> Certificar Cierre Multi-Moneda
               </button>
@@ -1313,6 +1945,294 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           </div>
         );
       })()}
+
+      {/* ══ MODAL v13.0: TRANSFERENCIA ENTRE CAJAS ═════════════════════════════ */}
+      {transferModalOpen && (
+        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-purple-500`}>
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
+                  <ArrowLeftRight className="text-purple-400 h-5 w-5"/>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-black uppercase tracking-widest">Transferir entre Cajas</h3>
+                  <p className="text-[8px] text-zinc-600 mt-1">Se generará una CxP de reposición automáticamente</p>
+                </div>
+              </div>
+              <button onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="text-zinc-600 hover:text-white"><X size={18}/></button>
+            </div>
+
+            <form onSubmit={handleTransferencia} className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">Caja Origen</label>
+                  <select required value={transferForm.caja_origen_id} onChange={e=>setTransferForm(p=>({...p,caja_origen_id:e.target.value}))} className={inp} disabled={savingTransfer}>
+                    <option value="">— DE —</option>
+                    {cajas.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+                  </select>
+                  {transferForm.caja_origen_id && (
+                    <p className="text-[8px] text-zinc-600 font-mono mt-1">
+                      Saldo {transferForm.moneda}: {fmtMonto(getCajaBalance(transferForm.caja_origen_id, transferForm.moneda), transferForm.moneda)}
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">Caja Destino</label>
+                  <select required value={transferForm.caja_destino_id} onChange={e=>setTransferForm(p=>({...p,caja_destino_id:e.target.value}))} className={inp} disabled={savingTransfer}>
+                    <option value="">— A —</option>
+                    {cajas.filter(c => c.id !== transferForm.caja_origen_id).map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">Moneda</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                    <button key={m} type="button" onClick={()=>setTransferForm(p=>({...p,moneda:m}))}
+                      className={`py-3 rounded-xl text-[10px] font-black uppercase border transition-all ${transferForm.moneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="relative">
+                  <span className="absolute left-5 top-1/2 -translate-y-1/2 text-purple-400 font-black text-xl">{transferForm.moneda==='BS'?'Bs':'$'}</span>
+                  <input type="number" step="0.01" min="0.01" required value={transferForm.monto}
+                    onChange={e=>setTransferForm(p=>({...p,monto:e.target.value}))}
+                    className="w-full bg-white/5 border border-white/10 py-6 pl-14 pr-6 rounded-2xl text-2xl font-black italic outline-none focus:border-purple-500 text-white"
+                    placeholder="0.00" disabled={savingTransfer}/>
+                </div>
+                <input type="date" required value={transferForm.fecha} onChange={e=>setTransferForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}} disabled={savingTransfer}/>
+              </div>
+
+              <input required value={transferForm.concepto} onChange={e=>setTransferForm(p=>({...p,concepto:e.target.value}))}
+                placeholder="CONCEPTO (ej: COMBUSTIBLE, PAGO NÓMINA URGENTE)" className={inp} disabled={savingTransfer}/>
+
+              <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4">
+                <p className="text-[9px] text-purple-400 font-black uppercase tracking-widest mb-2 flex items-center gap-2">
+                  <AlertTriangle size={12}/> Al confirmar se generarán 3 asientos vinculados:
+                </p>
+                <ol className="text-[9px] text-purple-300/70 font-mono space-y-1 pl-4">
+                  <li>1. Salida de caja origen ({cajas.find(c=>c.id===transferForm.caja_origen_id)?.nombre || '...'})</li>
+                  <li>2. Entrada a caja destino ({cajas.find(c=>c.id===transferForm.caja_destino_id)?.nombre || '...'})</li>
+                  <li>3. CxP de reposición (Águilas debe reponer a caja origen)</li>
+                </ol>
+              </div>
+
+              <ErrorBanner msg={transferError} onClose={()=>setTransferError(null)}/>
+
+              <div className="flex gap-3">
+                <button type="button" onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">
+                  Cancelar
+                </button>
+                <button type="submit" disabled={savingTransfer} className="flex-[2] py-4 bg-purple-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-purple-400 disabled:opacity-40 flex items-center justify-center gap-2">
+                  {savingTransfer?<Loader2 className="animate-spin h-4 w-4"/>:<><ArrowLeftRight size={14}/> Ejecutar Transferencia</>}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ══ MODAL v13.0: PAGAR REPOSICIÓN ═════════════════════════════════════ */}
+      {pagarReposicionModal && (
+        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-purple-500`}>
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-10 h-10 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
+                <Repeat className="text-purple-400 h-5 w-5"/>
+              </div>
+              <div>
+                <h3 className="text-[11px] font-black uppercase tracking-widest">Reponer a Caja</h3>
+                <p className="text-[8px] text-zinc-600 mt-1">Sale de Bóveda, entra a la caja original</p>
+              </div>
+            </div>
+
+            <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4 mb-4">
+              <p className="text-[9px] text-purple-400/80 font-mono">{pagarReposicionModal.entidad_nombre}</p>
+              <p className="text-2xl font-black italic text-purple-400 mt-1">{fmtMonto(pagarReposicionModal.monto_total, pagarReposicionModal.moneda)}</p>
+              <p className="text-[8px] text-zinc-600 font-mono mt-1">{pagarReposicionModal.concepto}</p>
+            </div>
+
+            <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">¿Desde qué Bóveda pagar?</label>
+            <div className="grid grid-cols-2 gap-2 mb-6">
+              {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>{
+                const saldo = getVaultBalance(m);
+                const suficiente = saldo >= pagarReposicionModal.monto_total;
+                return (
+                  <button key={m} type="button" onClick={()=>setPagarReposicionMoneda(m)}
+                    className={`p-3 rounded-xl border text-left transition-all ${pagarReposicionMoneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-500 hover:text-white'}`}>
+                    <p className="text-[9px] font-black uppercase">{m}</p>
+                    <p className={`text-[10px] font-mono italic mt-1 ${suficiente?'':'text-red-400'}`}>{fmtMonto(saldo, m)}</p>
+                    {!suficiente && <p className="text-[7px] text-red-400 font-black uppercase mt-0.5">Insuficiente</p>}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={()=>setPagarReposicionModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">
+                Cancelar
+              </button>
+              <button onClick={confirmarPagoReposicion} disabled={savingAction===pagarReposicionModal.id}
+                className="flex-[2] py-4 bg-purple-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-purple-400 disabled:opacity-40 flex items-center justify-center gap-2">
+                {savingAction===pagarReposicionModal.id?<Loader2 className="animate-spin h-4 w-4"/>:<><CheckCircle2 size={14}/> Confirmar Reposición</>}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ MODAL v13.0: ELIMINAR TRANSFERENCIA SELECTIVA ══════════════════════ */}
+      {deleteTransferModal && (
+        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-lg rounded-3xl p-7 border-t-2 border-t-red-500`}>
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-10 h-10 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-center justify-center">
+                <Trash2 className="text-red-400 h-5 w-5"/>
+              </div>
+              <div>
+                <h3 className="text-[11px] font-black uppercase tracking-widest">Eliminar Transferencia</h3>
+                <p className="text-[8px] text-zinc-600 mt-1">Selecciona qué registros vinculados eliminar</p>
+              </div>
+            </div>
+
+            <div className="space-y-2 mb-6">
+              {deleteTransferModal.salida && (
+                <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.salida?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
+                  <input type="checkbox" checked={deleteTransferSelection.salida} onChange={e=>setDeleteTransferSelection(p=>({...p,salida:e.target.checked}))} className="w-4 h-4 accent-red-500"/>
+                  <div className="flex-1">
+                    <p className="text-[10px] font-black uppercase text-red-400">Salida de {deleteTransferModal.cajaOrigenNombre}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">-{fmtMonto(deleteTransferModal.salida.monto, deleteTransferModal.salida.moneda)} · {fmtDate(deleteTransferModal.salida.fecha)}</p>
+                  </div>
+                </label>
+              )}
+              {deleteTransferModal.entrada && (
+                <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.entrada?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
+                  <input type="checkbox" checked={deleteTransferSelection.entrada} onChange={e=>setDeleteTransferSelection(p=>({...p,entrada:e.target.checked}))} className="w-4 h-4 accent-red-500"/>
+                  <div className="flex-1">
+                    <p className="text-[10px] font-black uppercase text-emerald-400">Entrada a {deleteTransferModal.cajaDestinoNombre}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">+{fmtMonto(deleteTransferModal.entrada.monto, deleteTransferModal.entrada.moneda)} · {fmtDate(deleteTransferModal.entrada.fecha)}</p>
+                  </div>
+                </label>
+              )}
+              {deleteTransferModal.reposicion && (
+                <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.reposicion?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
+                  <input type="checkbox" checked={deleteTransferSelection.reposicion} onChange={e=>setDeleteTransferSelection(p=>({...p,reposicion:e.target.checked}))} className="w-4 h-4 accent-red-500"/>
+                  <div className="flex-1">
+                    <p className="text-[10px] font-black uppercase text-purple-400">CxP Reposición ({deleteTransferModal.reposicion.estatus})</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">{fmtMonto(deleteTransferModal.reposicion.monto_total, deleteTransferModal.reposicion.moneda)} · {deleteTransferModal.reposicion.entidad_nombre}</p>
+                  </div>
+                </label>
+              )}
+            </div>
+
+            <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 mb-4">
+              <p className="text-[9px] text-yellow-400 font-mono leading-relaxed">
+                ⚠ Eliminar solo una parte de la transferencia romperá la integridad contable. Marca los 3 elementos si quieres deshacer completamente la operación.
+              </p>
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={()=>setDeleteTransferModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">
+                Cancelar
+              </button>
+              <button onClick={confirmDeleteTransferSelection}
+                disabled={!deleteTransferSelection.salida && !deleteTransferSelection.entrada && !deleteTransferSelection.reposicion}
+                className="flex-[2] py-4 bg-red-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-red-400 disabled:opacity-30 flex items-center justify-center gap-2">
+                <Trash2 size={14}/> Eliminar Seleccionados
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ MODAL: CLAVE DEL DIRECTOR (preservado) ════════════════════════════ */}
+      {directorAuthOpen && (
+        <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-sm rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
+            <div className="flex items-center gap-3 mb-5">
+              <div className="w-10 h-10 rounded-2xl bg-[#E1AD01]/10 border border-[#E1AD01]/20 flex items-center justify-center">
+                <KeyRound className="text-[#E1AD01] h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-[11px] font-black uppercase tracking-widest">Autorización del Director</h3>
+                <p className="text-[8px] text-zinc-600 mt-1">Edición y eliminación financiera requieren clave.</p>
+              </div>
+            </div>
+            <input autoFocus type="password" inputMode="numeric" maxLength={4}
+              value={directorCode}
+              onChange={e=>setDirectorCode(e.target.value.replace(/\D/g,'').slice(0,4))}
+              onKeyDown={e=>{ if(e.key==='Enter') confirmDirectorCode(); }}
+              placeholder="••••"
+              className="w-full bg-black/50 border border-white/10 p-5 rounded-2xl text-white text-2xl text-center font-black tracking-[0.6em] outline-none focus:border-[#E1AD01]"/>
+            {directorAuthError && <p className="text-[9px] text-red-400 mt-3 text-center font-mono">{directorAuthError}</p>}
+            <div className="flex gap-3 mt-5">
+              <button onClick={cancelDirectorAuth} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
+              <button onClick={confirmDirectorCode} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white">Autorizar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ MODAL: EDITAR LEDGER (preservado) ══════════════════════════════════ */}
+      {editingTx && (
+        <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3"><Pencil className="text-[#E1AD01] h-4 w-4"/><h3 className="text-[10px] font-black uppercase tracking-widest">Editar Movimiento Financiero</h3></div>
+              <button onClick={()=>setEditingTx(null)} className="text-zinc-600 hover:text-white"><X size={16}/></button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <select value={editTxForm.type} onChange={e=>setEditTxForm(p=>({...p,type:e.target.value as TransactionType}))} className={inp}>
+                <option value="INCOME">INGRESO (+)</option><option value="EXPENSE">EGRESO (-)</option><option value="INSTRUCTOR_PAY">NÓMINA</option><option value="PAYABLE">POR PAGAR</option><option value="RECEIVABLE">POR COBRAR</option>
+              </select>
+              <select value={editTxForm.currency} onChange={e=>setEditTxForm(p=>({...p,currency:normalizePaymentMethod(e.target.value)}))} className={inp}>
+                <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option><option value="CASH">CASH</option><option value="BS">BS</option>
+              </select>
+              <input type="number" min="0.01" step="0.01" value={editTxForm.amount} onChange={e=>setEditTxForm(p=>({...p,amount:e.target.value}))} className={inp} placeholder="MONTO"/>
+              <input type="date" value={editTxForm.fecha} onChange={e=>setEditTxForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
+              <textarea value={editTxForm.description} onChange={e=>setEditTxForm(p=>({...p,description:e.target.value}))} className="md:col-span-2 w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-[#E1AD01] resize-none" rows={3} placeholder="DESCRIPCIÓN"/>
+            </div>
+            <div className="flex gap-3 mt-6">
+              <button onClick={()=>setEditingTx(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
+              <button onClick={saveEditedTx} disabled={savingAction===editingTx.id} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white disabled:opacity-40 flex items-center justify-center gap-2">
+                {savingAction===editingTx.id?<Loader2 size={13} className="animate-spin"/>:<ShieldCheck size={13}/>} Guardar Cambios
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ MODAL: EDITAR CAJA (preservado) ═══════════════════════════════════ */}
+      {editingMov && (
+        <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3"><Pencil className="text-[#E1AD01] h-4 w-4"/><h3 className="text-[10px] font-black uppercase tracking-widest">Editar Movimiento de Caja</h3></div>
+              <button onClick={()=>setEditingMov(null)} className="text-zinc-600 hover:text-white"><X size={16}/></button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <select value={editMovForm.tipo} onChange={e=>setEditMovForm(p=>({...p,tipo:e.target.value as 'ENTRADA'|'SALIDA'}))} className={inp}><option value="ENTRADA">+ ENTRADA</option><option value="SALIDA">- SALIDA</option></select>
+              <select value={editMovForm.moneda} onChange={e=>setEditMovForm(p=>({...p,moneda:normalizePaymentMethod(e.target.value)}))} className={inp}><option value="USDT">USDT</option><option value="ZELLE">ZELLE</option><option value="CASH">CASH</option><option value="BS">BS</option></select>
+              <input type="number" min="0.01" step="0.01" value={editMovForm.monto} onChange={e=>setEditMovForm(p=>({...p,monto:e.target.value}))} className={inp} placeholder="MONTO"/>
+              <input type="date" value={editMovForm.fecha} onChange={e=>setEditMovForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
+              <input value={editMovForm.concepto} onChange={e=>setEditMovForm(p=>({...p,concepto:e.target.value}))} className={inp} placeholder="CONCEPTO"/>
+              <input value={editMovForm.referencia} onChange={e=>setEditMovForm(p=>({...p,referencia:e.target.value}))} className={inp} placeholder="REFERENCIA"/>
+            </div>
+            <div className="flex gap-3 mt-6">
+              <button onClick={()=>setEditingMov(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
+              <button onClick={saveEditedMov} disabled={savingAction===editingMov.id} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white disabled:opacity-40 flex items-center justify-center gap-2">
+                {savingAction===editingMov.id?<Loader2 size={13} className="animate-spin"/>:<ShieldCheck size={13}/>} Guardar Cambios
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );

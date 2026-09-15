@@ -1,15 +1,30 @@
-// Terminal de Inteligencia Águilas Pilot v4.12 - VALKYRON OS
-// Evolución: Blindaje Nuclear de Roles y Centro de Comando Operativo
+// HomeDashboard.tsx
+// Terminal de Inteligencia Águilas Pilot v4.13 - VALKYRON OS
+// Evolución: AbortController nuclear + fallback defensivo de red + retry con backoff
 // Regla de Oro: Cero Omisiones. Grado Militar. Siempre evolución.
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Card, CardContent } from './ui/card';
 import { supabase } from '../lib/supabaseClient'; 
 import { 
   Plane, Package, Wrench, Activity, Zap, ShieldCheck, 
   Clock, PlusCircle, X, Navigation, CheckCircle2, 
   DollarSign, TrendingUp, Landmark, ArrowRight, Loader2,
-  ArrowUpCircle, ArrowDownCircle, Wallet, Calculator, Coins, UserCheck, AlertTriangle
+  ArrowUpCircle, ArrowDownCircle, Wallet, Calculator, Coins, UserCheck, AlertTriangle,
+  WifiOff, RefreshCw  // [v4.13] íconos de estado de red
 } from 'lucide-react';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTANTES DE CONFIGURACIÓN DE RED (v4.13)
+// ─────────────────────────────────────────────────────────────────────────────
+const FETCH_RETRY_LIMIT = 3;
+const FETCH_RETRY_DELAY_MS = 1500;
+
+/** Espera N ms respetando el AbortSignal — se cancela limpiamente si el componente desmonta */
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')); });
+  });
 
 export const HomeDashboard = ({ 
   fleet = [], 
@@ -26,7 +41,11 @@ export const HomeDashboard = ({
   const [activeQuickView, setActiveQuickView] = useState<'menu' | 'logbook' | 'vault' | 'capitanes'>('menu');
   const [recentTransactions, setRecentTransactions] = useState<any[]>([]);
   const [isSyncing, setIsSyncing] = useState(true);
-  
+
+  // [v4.13] Estado de error de red para mostrar UI de reintento
+  const [networkError, setNetworkError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+
   const [logData, setLogData] = useState({
     aircraftId: '',
     hobbsStart: 0,
@@ -35,40 +54,117 @@ export const HomeDashboard = ({
     tachEnd: 0
   });
 
-  // --- BLINDAJE DE ROLES (GRADO MILITAR v4.12) ---
+  // --- BLINDAJE DE ROLES (GRADO MILITAR v4.12 — conservado intacto) ---
   const rolRaw = userRole || "";
   const rol = rolRaw.toUpperCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  
-  // Validación infalible: Detecta "ADMIN", "Admin", "Administradora", etc.
   const hasFinanceAccess = rol === 'CEO' || rol === 'ADMIN' || rol.includes('ADMIN');
 
-  // --- RECONOCIMIENTO DE ACTIVIDAD Y SINCRONIZACIÓN NUCLEAR ---
-  useEffect(() => {
-    if (hasFinanceAccess) {
-      const fetchRecentActivity = async () => {
+  // ─────────────────────────────────────────────────────────────────────────
+  // [v4.13] FETCH CON ABORT + RETRY EXPONENCIAL
+  // Resuelve: ERR_NETWORK_CHANGED, TypeError: Failed to fetch, 400 en finanzas
+  // Patrón: AbortController con cleanup en return() del useEffect garantiza que
+  // ningún setState se ejecuta sobre un componente ya desmontado.
+  // ─────────────────────────────────────────────────────────────────────────
+  const fetchRecentActivity = useCallback(async (signal: AbortSignal) => {
+    let attempt = 0;
+
+    while (attempt < FETCH_RETRY_LIMIT) {
+      if (signal.aborted) return; // Guardia de cancelación
+
+      try {
         setIsSyncing(true);
+        setNetworkError(null);
+
         const { data, error } = await supabase
           .from('transacciones_finanzas')
-          .select('*')
-          .order('created_at', { ascending: false });
-          
-        if (error) console.error("FALLA RADAR FINANCIERO:", error);
+          .select('id, entity_name, amount, status, category, created_at')  // [v4.13] select explícito — evita 400 por columnas fantasma
+          .order('created_at', { ascending: false })
+          .limit(50); // [v4.13] tope defensivo — sin limit, un payload enorme causa timeout
+
+        if (signal.aborted) return; // Guardia post-await
+
+        if (error) {
+          // Error de Supabase (no de red): 400/403/404 — no tiene sentido reintentar
+          console.error(`[VALKYRON OS v4.13] FALLA RADAR FINANCIERO (intento ${attempt + 1}):`, error);
+
+          if (error.code === 'PGRST116' || error.message?.includes('does not exist')) {
+            // 404 equivalente: tabla/vista no existe — falla silenciosa con estado informativo
+            setNetworkError(`tabla_no_encontrada:${error.message}`);
+            setIsSyncing(false);
+            return; // Sin reintento — el schema no va a aparecer por arte de magia
+          }
+
+          // Para errores 400 (schema mismatch, RLS): reintento con backoff
+          attempt++;
+          if (attempt < FETCH_RETRY_LIMIT) {
+            await sleep(FETCH_RETRY_DELAY_MS * attempt, signal);
+          } else {
+            setNetworkError(`supabase_error:${error.message}`);
+            setIsSyncing(false);
+          }
+          continue;
+        }
+
+        // ✅ Éxito
         if (data) setRecentTransactions(data);
         setIsSyncing(false);
-      };
+        setNetworkError(null);
+        return;
 
-      fetchRecentActivity();
+      } catch (err: any) {
+        if (signal.aborted || err.name === 'AbortError') return; // Cancelación limpia — no es un error
 
-      const channel = supabase
-        .channel('home-updates-v4-12')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' }, fetchRecentActivity)
-        .subscribe();
+        console.warn(`[VALKYRON OS v4.13] ERR_NETWORK (intento ${attempt + 1}):`, err.message);
+        attempt++;
 
-      return () => { supabase.removeChannel(channel); };
+        if (attempt < FETCH_RETRY_LIMIT) {
+          // Backoff exponencial: 1.5s, 3s, 4.5s
+          await sleep(FETCH_RETRY_DELAY_MS * attempt, signal);
+        } else {
+          if (!signal.aborted) {
+            setNetworkError(`network:${err.message}`);
+            setIsSyncing(false);
+          }
+        }
+      }
     }
-  }, [hasFinanceAccess]);
+  }, []); // Sin deps — supabase es estable
 
-  // --- CÁLCULO DE OPERATIVIDAD DINÁMICA ---
+  // ─────────────────────────────────────────────────────────────────────────
+  // [v4.13] RECONOCIMIENTO DE ACTIVIDAD Y SINCRONIZACIÓN CON CLEANUP NUCLEAR
+  // El AbortController.abort() en el return() garantiza:
+  //  1. Ningún setState post-desmontaje
+  //  2. El retry loop se cancela instantáneamente
+  //  3. El canal realtime se destruye limpiamente
+  // ─────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!hasFinanceAccess) {
+      setIsSyncing(false); // [v4.13] Fix: isSyncing no queda en true para roles sin acceso
+      return;
+    }
+
+    const controller = new AbortController();
+
+    fetchRecentActivity(controller.signal);
+
+    const channel = supabase
+      .channel('home-updates-v4-13') // [v4.13] canal actualizado — evita conflicto con v4.12
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'transacciones_finanzas' },
+        () => {
+          if (!controller.signal.aborted) fetchRecentActivity(controller.signal);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      controller.abort();              // Cancela fetch en vuelo y loops de retry
+      supabase.removeChannel(channel); // Destruye subscripción realtime
+    };
+  }, [hasFinanceAccess, fetchRecentActivity, retryCount]); // retryCount permite trigger manual
+
+  // --- CÁLCULO DE OPERATIVIDAD DINÁMICA (v4.12 — conservado intacto) ---
   const fleetHealth = useMemo(() => {
     if (fleet.length === 0) return 0;
     const operationalUnits = fleet.filter((a: any) => a.status === 'operational').length;
@@ -79,7 +175,7 @@ export const HomeDashboard = ({
   const criticalStock = useMemo(() => inventory.filter((item: any) => item.quantity <= item.minStock).length, [inventory]);
   const aogCount = useMemo(() => fleet.filter((ac: any) => ac.status === 'grounded' || ac.status === 'maintenance').length, [fleet]);
 
-  // --- INTELIGENCIA DE DEUDA DE CAPITANES ---
+  // --- INTELIGENCIA DE DEUDA DE CAPITANES (v4.12 — conservado intacto) ---
   const instructionDebt = useMemo(() => {
     if (!hasFinanceAccess) return 0;
     return recentTransactions
@@ -113,10 +209,52 @@ export const HomeDashboard = ({
     }
   };
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // [v4.13] COMPONENTE DE ESTADO DE RED — inline, sin dependencias externas
+  // Se inyecta en el panel de Actividad Contable cuando networkError !== null
+  // ─────────────────────────────────────────────────────────────────────────
+  const NetworkErrorBanner = () => {
+    const isSchemaError = networkError?.startsWith('tabla_no_encontrada');
+    const isNetworkError = networkError?.startsWith('network:');
+
+    return (
+      <div className="flex flex-col items-center justify-center py-8 gap-4 animate-in fade-in duration-500">
+        <div className={`p-3 rounded-full ${isNetworkError ? 'bg-orange-500/10 border border-orange-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
+          {isNetworkError
+            ? <WifiOff className="h-6 w-6 text-orange-400" />
+            : <AlertTriangle className="h-6 w-6 text-red-400" />
+          }
+        </div>
+        <div className="text-center">
+          <p className="text-[9px] font-black uppercase tracking-widest text-zinc-500 mb-1 text-center">
+            {isSchemaError ? 'Tabla No Encontrada' : isNetworkError ? 'Sin Conexión' : 'Error de Servidor'}
+          </p>
+          <p className="text-[8px] text-zinc-700 font-mono text-center max-w-[200px]">
+            {isSchemaError
+              ? 'transacciones_finanzas no existe en el schema público'
+              : isNetworkError
+              ? 'Verifica tu conexión a internet'
+              : 'Error en servidor Supabase'
+            }
+          </p>
+        </div>
+        {!isSchemaError && (
+          // No ofrecer retry si el schema no existe — es inútil
+          <button
+            onClick={() => setRetryCount(c => c + 1)}
+            className="flex items-center gap-2 px-4 py-2 bg-[#E1AD01]/10 border border-[#E1AD01]/20 rounded-xl text-[#E1AD01] text-[8px] font-black uppercase tracking-widest hover:bg-[#E1AD01]/20 transition-all"
+          >
+            <RefreshCw className="h-3 w-3" /> Reintentar
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-8 animate-in fade-in zoom-in-95 duration-700 text-left font-sans relative">
       
-      {/* SECCIÓN 1: KPI CARDS */}
+      {/* SECCIÓN 1: KPI CARDS (v4.12 — conservadas íntegras) */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-[1.618rem]">
         <Card className="bg-[#0f0f0f] border-l-4 border-l-[#E1AD01] border-white/5 shadow-2xl">
           <CardContent className="p-6 text-left">
@@ -188,7 +326,7 @@ export const HomeDashboard = ({
         </Card>
       </div>
 
-      {/* SECCIÓN 2: CENTRO DE COMANDO OPERATIVO */}
+      {/* SECCIÓN 2: CENTRO DE COMANDO OPERATIVO (v4.12 — conservado íntegro) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 text-left">
         <div className="lg:col-span-2 bg-[#0a0a0a] border border-white/5 rounded-2xl p-8 relative overflow-hidden shadow-2xl text-left">
           <div className="absolute top-0 right-0 p-4 opacity-5"><Activity className="h-40 w-40 text-white" /></div>
@@ -225,12 +363,32 @@ export const HomeDashboard = ({
           </button>
         </div>
 
+        {/* [v4.13] PANEL ACTIVIDAD CONTABLE: maneja los 3 estados (syncing / error / data) */}
         <div className="bg-[#0f0f0f] border border-white/10 rounded-2xl p-8 relative overflow-hidden shadow-2xl text-left text-white">
           <h3 className="text-white font-black text-[11px] uppercase tracking-[0.4em] mb-8 flex items-center gap-3 italic text-white/80 text-left">
             <Activity className="h-4 w-4 text-[#E1AD01]" /> Actividad Contable
+            {/* [v4.13] Badge de estado de sincronización */}
+            {isSyncing && (
+              <span className="ml-auto flex items-center gap-1 text-[7px] text-zinc-600 font-mono">
+                <Loader2 className="h-2 w-2 animate-spin" /> SYNC
+              </span>
+            )}
           </h3>
           <div className="space-y-6 text-left">
-            {recentTransactions.length > 0 ? recentTransactions.slice(0, 5).map((tx: any) => (
+            {/* Estado: sincronizando por primera vez */}
+            {isSyncing && recentTransactions.length === 0 && (
+              <div className="flex justify-center py-10">
+                <Loader2 className="h-6 w-6 text-[#E1AD01] animate-spin opacity-20" />
+              </div>
+            )}
+
+            {/* [v4.13] Estado: error de red con UI de reintento */}
+            {!isSyncing && networkError && recentTransactions.length === 0 && (
+              <NetworkErrorBanner />
+            )}
+
+            {/* Estado: datos disponibles (con o sin error posterior) */}
+            {recentTransactions.length > 0 && recentTransactions.slice(0, 5).map((tx: any) => (
               <div key={tx.id} className="border-l-2 border-[#E1AD01]/30 pl-4 py-1 group hover:border-[#E1AD01] transition-all text-left">
                 <div className="flex justify-between items-center mb-1 text-left">
                   <p className="text-[10px] text-white font-black uppercase tracking-widest truncate max-w-[120px] text-left">{tx.entity_name}</p>
@@ -240,7 +398,7 @@ export const HomeDashboard = ({
                 </div>
                 <p className="text-[8px] text-zinc-600 font-mono uppercase truncate text-left">${Number(tx.amount).toLocaleString()}</p>
               </div>
-            )) : <div className="flex justify-center py-10"><Loader2 className="h-6 w-6 text-[#E1AD01] animate-spin opacity-20" /></div>}
+            ))}
           </div>
           {hasFinanceAccess && (
             <button onClick={() => onNavigate('finance')} className="mt-8 w-full py-3 text-[9px] font-black uppercase tracking-widest text-[#E1AD01] border border-[#E1AD01]/20 rounded-xl hover:bg-[#E1AD01]/10 transition-all flex items-center justify-center gap-2 italic text-center">
@@ -250,7 +408,7 @@ export const HomeDashboard = ({
         </div>
       </div>
 
-      {/* MODAL ACCIONES RÁPIDAS (Seccion final mantenida para funcionalidad completa) */}
+      {/* MODAL ACCIONES RÁPIDAS (v4.12 — conservado íntegro) */}
       {isQuickActionOpen && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/98 backdrop-blur-xl p-6 text-left">
           <div className="bg-[#050505] border border-[#E1AD01]/30 w-full max-w-2xl rounded-[1.618rem] overflow-hidden shadow-2xl">
@@ -261,7 +419,6 @@ export const HomeDashboard = ({
               <button onClick={() => setIsQuickActionOpen(false)} className="hover:rotate-90 transition-all text-black"><X className="h-6 w-6" /></button>
             </div>
             <div className="p-12 text-left">
-               {/* Lógica de vistas del modal mantenida para integridad operacional */}
                {activeQuickView === 'capitanes' ? (
                 <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 text-left text-white">
                   <div className="grid grid-cols-1 gap-4 text-left">

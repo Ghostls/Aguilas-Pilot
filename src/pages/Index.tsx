@@ -1,6 +1,13 @@
 // src/pages/Index.tsx
-// VALKYRON OS v4.19 — FIX: OPERACIONES añadido al filtro de tabs (misma vista que MECANICO)
-// Regla de Oro: Cero Omisiones. Grado Militar. Siempre evolución.
+// VALKYRON OS v4.20 — FIX: syncFleet como callback en ControlHub + canal realtime con timestamp
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v4.20:
+//   [FIX] Canal realtime renombrado con timestamp → evita conflicto con sesiones previas
+//   [FIX] syncFleet pasado como onFleetChange a ControlHub → se llama después de
+//         handleConfirmAndSend y handleFinalCertification para forzar re-fetch
+//   [FIX] FleetDashboard también recibe onFleetChange para sincronizar desde ese módulo
+// v4.19 PRESERVADO: filtro de tabs por rol, OPERACIONES = MECANICO, toda la estructura intacta
+// REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -44,7 +51,7 @@ const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?
   { key: 'calendario',  label: 'Calendario',  icon: CalendarDays   },
 ];
 
-// ─── NORMALIZACIÓN DE ESTADO DE AERONAVE ─────────────────────────────────────
+// ─── NORMALIZACIÓN DE ESTADO ──────────────────────────────────────────────────
 type AircraftStatus = 'operational' | 'maintenance' | 'grounded' | 'flight';
 
 const normalizeStatus = (raw: string): AircraftStatus => {
@@ -88,6 +95,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   const [vendorsData,      setVendorsData]      = useState<Vendor[]>([]);
 
   // ── SYNC FLOTA ───────────────────────────────────────────────────────────
+  // [FIX v4.20] Expuesto como callback estable — se pasa a ControlHub y FleetDashboard
   const syncFleet = useCallback(async () => {
     const { data: aircrafts, error } = await supabase
       .from('flota_aviones')
@@ -129,12 +137,6 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             metaRol || metaRole,
             profile?.rol,
           );
-
-          console.log('[ÁGUILAS OS] Rol resuelto:', rolResuelto, {
-            prop:   userRole,
-            meta:   metaRol || metaRole,
-            perfil: profile?.rol,
-          });
 
           setUserProfile({
             rol:             rolResuelto,
@@ -190,8 +192,10 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 
     syncTerminalData();
 
+    // [FIX v4.20] Canal con nombre único por sesión → evita conflicto con canales huérfanos
+    const channelName = `index-fleet-monitor-${Date.now()}`;
     const fleetChannel = supabase
-      .channel('index-fleet-monitor')
+      .channel(channelName)
       .on('postgres_changes',
         { event: '*', schema: 'public', table: 'flota_aviones' },
         () => syncFleet(),
@@ -221,7 +225,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
     if (rol === 'ADMIN' || rol.includes('ADMIN'))
       return ['home', 'inventory', 'fuel', 'finance', 'vendors', 'flights', 'fleet', 'calendario'].includes(tab.key);
 
-    // ── FIX v4.19: OPERACIONES comparte exactamente la misma vista que MECANICO ──
+    // FIX v4.19: OPERACIONES comparte exactamente la misma vista que MECANICO
     if (rol === 'MECANICO' || rol === 'OPERACIONES')
       return ['home', 'fleet', 'inventory', 'control-hub', 'checkout', 'fuel'].includes(tab.key);
 
@@ -337,6 +341,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             <FleetDashboard
               fleetData={fleetData}
               setFleetData={setFleetData}
+              onFleetChange={syncFleet}
             />
           )}
 
@@ -359,6 +364,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
               setFleet={setFleetData}
               inventory={partsData}
               onPartsUsage={() => {}}
+              onFleetChange={syncFleet}
             />
           )}
 
@@ -414,7 +420,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           Águilas Pilot — Strategic Division 2026
         </div>
         <div className="text-[8px] text-[#E1AD01] font-black uppercase tracking-[0.3em] italic text-right">
-          Valkyron OS v4.19
+          Valkyron OS v4.20
         </div>
       </footer>
     </div>
