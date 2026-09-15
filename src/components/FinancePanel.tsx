@@ -1,16 +1,14 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v13.0 — INTERCONEXIÓN DE CAJAS
-// NUEVO v13.0:
-//   — Transferencia entre cajas: Roberto → Ederson genera 3 asientos vinculados
-//     con transfer_id común: (1) salida caja origen, (2) entrada caja destino,
-//     (3) CxP de reposición categorizada como REPOSICION_CAJA
-//   — Card "Reposiciones Internas" separado en tab CUENTAS, distinto de CxP proveedores
-//   — Al marcar reposición como PAGADA: se genera automáticamente entrada a la caja
-//     original desde Bóveda + asiento EXPENSE en Ledger (afecta bóvedas globales)
-//   — Modal de eliminación de transferencia muestra los 3 registros vinculados
-//     y permite elegir cuáles borrar (protegido por clave del Director)
-//   — Nuevo botón "⇄ Transferir entre cajas" en el toolbar de CAJAS
-// PRESERVADO v12.0: HORAS_PAGADAS vs CxC, edición protegida, Ledger, Bóvedas,
-//   Cajas, Requisiciones, Cierre Multi-Moneda, todos los fixes 1-7 previos.
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v13.1 — FIX REGISTRO DE MOVIMIENTOS
+// CHANGELOG v13.1:
+//   [FIX] fetchAll: lock colgado ya no bloquea re-fetch silent tras escritura.
+//         Si fetchLockRef.current=true en modo silent, se libera y se re-ejecuta.
+//   [FIX] handleMovCaja: fuerza fetchLockRef.current=false + fetchAll(true) tras insert
+//         — el movimiento aparece de inmediato sin esperar debounce de realtime (800ms)
+//   [FIX] handleLedger: mismo patrón — re-fetch inmediato tras sellar asiento
+//   [FIX] handleTransferencia: libera lock antes de fetchAll(true) al final del try
+// PRESERVADO v13.0: Transferencia entre cajas, Reposiciones Internas, 4 Cards CxC/CxP,
+//   edición protegida con clave Director, Libro Diario, Bóvedas, Cierre Multi-Moneda,
+//   Requisiciones, todos los fixes 1-7 previos. CERO OMISIONES. GRADO MILITAR.
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -35,7 +33,6 @@ interface MovimientoCaja {
   id: string; caja_id: string; tipo: 'ENTRADA' | 'SALIDA';
   moneda: PaymentMethod; monto: number;
   concepto: string; referencia: string; fecha: string; registrado_por: string;
-  // v13.0 — trazabilidad de transferencia
   transfer_id?: string | null;
   transfer_role?: 'SALIDA' | 'ENTRADA' | null;
   transfer_peer_id?: string | null;
@@ -46,7 +43,6 @@ interface CuentaGeneral {
   monto_total: number; monto_pendiente: number; concepto: string;
   fecha_emision: string; fecha_vencimiento?: string;
   estatus: 'PENDIENTE' | 'PAGADO' | 'PARCIAL'; notas?: string;
-  // v13.0 — vínculo con transferencia
   transfer_id?: string | null;
   categoria_interna?: 'REPOSICION_CAJA' | null;
 }
@@ -66,7 +62,6 @@ interface FinancePanelProps {
   setGlobalFinance?: React.Dispatch<React.SetStateAction<{CASH:number;ZELLE:number;USDT:number;BS:number}>>;
 }
 
-// v13.0 — Estructura para el modal de eliminación de transferencia
 interface TransferChain {
   transferId: string;
   salida: MovimientoCaja | null;
@@ -147,7 +142,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [activeTab, setActiveTab] = useState<TabType>('LEDGER');
   const [tasaBCV,   setTasaBCV]   = useState(DEFAULT_TASA_BS);
 
-  // Data
   const [transactions, setTransactions] = useState<FinanceTransaction[]>([]);
   const [requests,     setRequests]     = useState<any[]>([]);
   const [cajas,        setCajas]        = useState<CajaChica[]>([]);
@@ -157,48 +151,41 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [alumnos,      setAlumnos]      = useState<AlumnoCxC[]>([]);
   const [cuentasCxC,   setCuentasCxC]   = useState<CuentaPorCobrar[]>([]);
 
-  // UI
   const [loading,       setLoading]       = useState(true);
   const [selectedVault, setSelectedVault] = useState<PaymentMethod>('USDT');
   const [cajaActiva,    setCajaActiva]    = useState<string | null>(null);
   const fetchLockRef = useRef(false);
 
-  // Errores
-  const [ledgerError,  setLedgerError]  = useState<string | null>(null);
-  const [cajaError,    setCajaError]    = useState<string | null>(null);
-  const [cuentaError,  setCuentaError]  = useState<string | null>(null);
-  const [reqError,     setReqError]     = useState<string | null>(null);
+  const [ledgerError,   setLedgerError]   = useState<string | null>(null);
+  const [cajaError,     setCajaError]     = useState<string | null>(null);
+  const [cuentaError,   setCuentaError]   = useState<string | null>(null);
+  const [reqError,      setReqError]      = useState<string | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
 
-  // Saving locks
-  const [savingLedger,   setSavingLedger]  = useState(false);
-  const [savingCaja,     setSavingCaja]    = useState(false);
-  const [savingCuenta,   setSavingCuenta]  = useState(false);
-  const [savingReq,      setSavingReq]     = useState(false);
-  const [savingTransfer, setSavingTransfer]= useState(false);
-  const [savingAction,   setSavingAction]  = useState<string | null>(null);
+  const [savingLedger,    setSavingLedger]   = useState(false);
+  const [savingCaja,      setSavingCaja]     = useState(false);
+  const [savingCuenta,    setSavingCuenta]   = useState(false);
+  const [savingReq,       setSavingReq]      = useState(false);
+  const [savingTransfer,  setSavingTransfer] = useState(false);
+  const [savingAction,    setSavingAction]   = useState<string | null>(null);
 
-  // Seguridad
-  const [directorAuthOpen, setDirectorAuthOpen] = useState(false);
-  const [directorCode, setDirectorCode] = useState('');
-  const [directorAuthError, setDirectorAuthError] = useState<string | null>(null);
+  const [directorAuthOpen,    setDirectorAuthOpen]    = useState(false);
+  const [directorCode,        setDirectorCode]        = useState('');
+  const [directorAuthError,   setDirectorAuthError]   = useState<string | null>(null);
   const [pendingSecureAction, setPendingSecureAction] = useState<(() => Promise<void>) | null>(null);
 
-  // Edición Ledger
-  const [editingTx, setEditingTx] = useState<FinanceTransaction | null>(null);
-  const [editTxForm, setEditTxForm] = useState({
+  const [editingTx,   setEditingTx]   = useState<FinanceTransaction | null>(null);
+  const [editTxForm,  setEditTxForm]  = useState({
     amount: '', currency: 'USDT' as PaymentMethod, type: 'INCOME' as TransactionType,
     description: '', fecha: new Date().toISOString().split('T')[0],
   });
 
-  // Edición Caja
-  const [editingMov, setEditingMov] = useState<MovimientoCaja | null>(null);
+  const [editingMov,  setEditingMov]  = useState<MovimientoCaja | null>(null);
   const [editMovForm, setEditMovForm] = useState({
     tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
     monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
   });
 
-  // v13.0 — Transferencia entre cajas
   const [transferModalOpen, setTransferModalOpen] = useState(false);
   const [transferForm, setTransferForm] = useState({
     caja_origen_id:  '',
@@ -209,17 +196,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     fecha:           new Date().toISOString().split('T')[0],
   });
 
-  // v13.0 — Modal de eliminación de transferencia (selectivo)
-  const [deleteTransferModal, setDeleteTransferModal] = useState<TransferChain | null>(null);
+  const [deleteTransferModal,     setDeleteTransferModal]     = useState<TransferChain | null>(null);
   const [deleteTransferSelection, setDeleteTransferSelection] = useState<{ salida: boolean; entrada: boolean; reposicion: boolean }>({
     salida: true, entrada: true, reposicion: true,
   });
 
-  // v13.0 — Modal para elegir bóveda al pagar reposición
-  const [pagarReposicionModal, setPagarReposicionModal] = useState<CuentaGeneral | null>(null);
+  const [pagarReposicionModal,  setPagarReposicionModal]  = useState<CuentaGeneral | null>(null);
   const [pagarReposicionMoneda, setPagarReposicionMoneda] = useState<PaymentMethod>('USDT');
 
-  // Forms
   const [ledger, setLedger] = useState({
     amount: '', currency: 'USDT' as PaymentMethod, type: 'INCOME' as TransactionType,
     reference: '', capitanId: '', fecha: new Date().toISOString().split('T')[0],
@@ -241,15 +225,20 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     fecha_vencimiento: '', notas: '',
   });
   const [showCuentaForm, setShowCuentaForm] = useState(false);
-  const [reqItems,    setReqItems]    = useState('');
-  const [reqPriority, setReqPriority] = useState('MEDIA');
-  const [reqAmount,   setReqAmount]   = useState('');
+  const [reqItems,     setReqItems]     = useState('');
+  const [reqPriority,  setReqPriority]  = useState('MEDIA');
+  const [reqAmount,    setReqAmount]    = useState('');
   const [physBalances, setPhysBalances] = useState<Record<PaymentMethod, string>>({ USDT:'', ZELLE:'', CASH:'', BS:'' });
 
   // ─── FETCH ────────────────────────────────────────────────────────────────
+  // [FIX v13.1] Si el lock está activo en modo silent (llamado desde handler de escritura),
+  // lo liberamos y continuamos — evita que movimientos recién guardados queden sin mostrar.
 
   const fetchAll = useCallback(async (silent = false) => {
-    if (fetchLockRef.current) return;
+    if (fetchLockRef.current && !silent) return;
+    if (fetchLockRef.current && silent) {
+      fetchLockRef.current = false; // [FIX v13.1] liberar lock colgado en modo silent
+    }
     fetchLockRef.current = true;
     if (!silent) setLoading(true);
     try {
@@ -283,10 +272,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       })));
       if (cuentasRes.data) setCuentas(cuentasRes.data.map((c: any) => ({
         ...c,
-        monto_total:      round2(Number(c.monto_total) || 0),
-        monto_pendiente:  round2(Number(c.monto_pendiente) || 0),
-        transfer_id:      c.transfer_id       ?? null,
-        categoria_interna:c.categoria_interna ?? null,
+        monto_total:       round2(Number(c.monto_total) || 0),
+        monto_pendiente:   round2(Number(c.monto_pendiente) || 0),
+        transfer_id:       c.transfer_id        ?? null,
+        categoria_interna: c.categoria_interna  ?? null,
       })));
       if (capRes.data)     setCapitanes(capRes.data);
       if (alumnosRes.data) setAlumnos(alumnosRes.data.map((a: any) => ({
@@ -309,7 +298,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         await syncPaidAccountsToLedger(normalizedCxC);
       }
     } catch (e) {
-      console.error('[FinancePanel v13.0] fetchAll error:', e);
+      console.error('[FinancePanel v13.1] fetchAll error:', e);
     } finally {
       setLoading(false);
       fetchLockRef.current = false;
@@ -368,10 +357,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const totalCxC        = useMemo(() => cxcPendientes.reduce((a, c) => round2(a + c.monto_pendiente), 0), [cxcPendientes]);
   const totalHorasAcred = useMemo(() => horasPagadas.reduce((a, c) => a + c.horas_compradas, 0), [horasPagadas]);
 
-  // v13.0 — separación de CxP: reposiciones internas vs proveedores externos
   const cuentasProveedores  = useMemo(() => cuentas.filter(c => c.categoria_interna !== 'REPOSICION_CAJA'), [cuentas]);
   const cuentasReposiciones = useMemo(() => cuentas.filter(c => c.categoria_interna === 'REPOSICION_CAJA'), [cuentas]);
-  const totalCxP        = useMemo(() =>
+  const totalCxP = useMemo(() =>
     cuentasProveedores.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + c.monto_pendiente), 0),
   [cuentasProveedores]);
   const totalReposiciones = useMemo(() =>
@@ -450,6 +438,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }).eq('id', editingTx.id);
       if (error) throw new Error(error.message);
       setEditingTx(null);
+      fetchLockRef.current = false;
       await fetchAll(true);
     } catch (err) {
       setLedgerError(err instanceof Error ? err.message : 'No se pudo editar la transacción.');
@@ -468,6 +457,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         const cxcId = tx.invoiceNumber.replace(/^CXC-/, '').replace(/^HORA-/, '');
         await supabase.from('cuentas_por_cobrar').delete().eq('id', cxcId);
       }
+      fetchLockRef.current = false;
       await fetchAll(true);
     } catch (err) {
       setLedgerError(err instanceof Error ? err.message : 'No se pudo eliminar la transacción.');
@@ -477,7 +467,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   });
 
   const openEditMov = (mov: MovimientoCaja) => {
-    // v13.0 — no permitir editar movimientos que forman parte de una transferencia
     if (mov.transfer_id) {
       alert('Este movimiento forma parte de una transferencia entre cajas. Para modificarlo, elimine la transferencia completa y créela de nuevo.');
       return;
@@ -511,6 +500,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }).eq('id', editingMov.id);
       if (error) throw new Error(error.message);
       setEditingMov(null);
+      fetchLockRef.current = false;
       await fetchAll(true);
     } catch (err) {
       setCajaError(err instanceof Error ? err.message : 'No se pudo editar el movimiento de caja.');
@@ -519,7 +509,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
   };
 
-  // v13.0 — Al eliminar un movimiento vinculado a una transferencia, abrimos el modal selectivo
   const deleteMovProtected = (id: string) => {
     const mov = movCajas.find(m => m.id === id);
     if (mov?.transfer_id) {
@@ -531,6 +520,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       try {
         const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', id);
         if (error) throw new Error(error.message);
+        fetchLockRef.current = false;
         await fetchAll(true);
       } catch (err) {
         setCajaError(err instanceof Error ? err.message : 'No se pudo eliminar el movimiento de caja.');
@@ -541,7 +531,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   const deleteCuentaProtected = (id: string, esCxC: boolean) => {
-    // v13.0 — si es reposición vinculada a transferencia, abrir modal selectivo
     if (!esCxC) {
       const cuenta = cuentas.find(c => c.id === id);
       if (cuenta?.transfer_id) {
@@ -560,6 +549,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           const { error } = await supabase.from('cuentas_generales').delete().eq('id', id);
           if (error) throw new Error(error.message);
         }
+        fetchLockRef.current = false;
         await fetchAll(true);
       } catch (err) {
         setCuentaError(err instanceof Error ? err.message : 'No se pudo eliminar la cuenta.');
@@ -569,7 +559,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     });
   };
 
-  // Sincroniza pagos históricos COBRADOS que no tengan asiento en el Ledger
   const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[]) => {
     const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0);
     if (!paid.length) return;
@@ -591,6 +580,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   }, []);
 
   // ─── HANDLER: LEDGER ──────────────────────────────────────────────────────
+  // [FIX v13.1] Fuerza re-fetch inmediato tras sellar asiento — no depende del debounce realtime
 
   const handleLedger = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -617,6 +607,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         return;
       }
       setLedger(p => ({ ...p, amount: '', reference: '' }));
+      // [FIX v13.1] Re-fetch inmediato — no esperar debounce de realtime
+      fetchLockRef.current = false;
+      await fetchAll(true);
     } catch (err) {
       setLedgerError(err instanceof Error ? err.message : 'Error de conexión.');
     } finally {
@@ -625,6 +618,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   // ─── HANDLER: CAJA ────────────────────────────────────────────────────────
+  // [FIX v13.1] Fuerza re-fetch inmediato tras insertar movimiento de caja.
+  // Antes solo confiaba en realtime con 800ms de debounce — si el lock estaba
+  // activo, el movimiento quedaba guardado en DB pero no aparecía en la UI.
 
   const handleMovCaja = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -643,6 +639,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }]);
       if (error) { setCajaError(`Error: ${error.message}`); return; }
       setMovForm(p => ({ ...p, monto: '', concepto: '', referencia: '' }));
+      // [FIX v13.1] Re-fetch inmediato — liberar lock y forzar actualización
+      fetchLockRef.current = false;
+      await fetchAll(true);
     } catch (err) {
       setCajaError(err instanceof Error ? err.message : 'Error de conexión.');
     } finally {
@@ -650,12 +649,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
   };
 
-  // ─── HANDLER v13.0: TRANSFERENCIA ENTRE CAJAS ─────────────────────────────
-  // Genera 3 asientos vinculados por transfer_id:
-  //   1. movimientos_caja_chica: SALIDA de caja origen (transfer_role='SALIDA')
-  //   2. movimientos_caja_chica: ENTRADA a caja destino (transfer_role='ENTRADA')
-  //   3. cuentas_generales: CxP categoría REPOSICION_CAJA de Águilas → caja origen
-  // Si cualquier paso falla, se hace rollback de los anteriores para mantener integridad.
+  // ─── HANDLER v13.0+v13.1: TRANSFERENCIA ENTRE CAJAS ──────────────────────
+  // [FIX v13.1] Libera lock antes del fetchAll(true) final
 
   const handleTransferencia = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -675,7 +670,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const cajaDestino = cajas.find(c => c.id === transferForm.caja_destino_id);
     if (!cajaOrigen || !cajaDestino) { setTransferError('Caja no encontrada.'); return; }
 
-    // Verificar saldo disponible en caja origen
     const saldoOrigen = getCajaBalance(transferForm.caja_origen_id, transferForm.moneda);
     if (saldoOrigen < monto) {
       const confirmar = window.confirm(
@@ -688,10 +682,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
 
     setSavingTransfer(true);
-    const transferId = uuid4();
-    const salidaId   = uuid4();
-    const entradaId  = uuid4();
-    const fechaISO   = new Date(transferForm.fecha).toISOString();
+    const transferId    = uuid4();
+    const salidaId      = uuid4();
+    const entradaId     = uuid4();
+    const fechaISO      = new Date(transferForm.fecha).toISOString();
     const conceptoUpper = transferForm.concepto.toUpperCase().trim();
 
     try {
@@ -728,12 +722,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         transfer_peer_id: transferForm.caja_origen_id,
       }]);
       if (errEntrada) {
-        // Rollback: eliminar salida
         await supabase.from('movimientos_caja_chica').delete().eq('id', salidaId);
         throw new Error(`Entrada: ${errEntrada.message}`);
       }
 
-      // 3. CxP de reposición: Águilas debe a la caja origen
+      // 3. CxP de reposición
       const { error: errCxP } = await supabase.from('cuentas_generales').insert([{
         tipo: 'CXP',
         entidad_nombre: `REPOSICIÓN CAJA ${cajaOrigen.nombre.toUpperCase()}`,
@@ -751,17 +744,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         categoria_interna: 'REPOSICION_CAJA',
       }]);
       if (errCxP) {
-        // Rollback: eliminar ambos movimientos
         await supabase.from('movimientos_caja_chica').delete().in('id', [salidaId, entradaId]);
         throw new Error(`Reposición: ${errCxP.message}`);
       }
 
-      // Reset form + cerrar modal
       setTransferForm({
         caja_origen_id: '', caja_destino_id: '', moneda: 'USDT',
         monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0],
       });
       setTransferModalOpen(false);
+      // [FIX v13.1] Liberar lock antes del re-fetch final
+      fetchLockRef.current = false;
       await fetchAll(true);
 
     } catch (err) {
@@ -772,10 +765,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   // ─── v13.0: PAGO DE REPOSICIÓN ────────────────────────────────────────────
-  // Al marcar una reposición como PAGADA:
-  //   1. Marca la CxP como PAGADA
-  //   2. Genera ENTRADA en la caja origen (el dinero regresa a la caja)
-  //   3. Genera EXPENSE en Ledger (afecta bóveda global — sale de Bóveda principal)
 
   const openPagarReposicion = (cuenta: CuentaGeneral) => {
     setPagarReposicionMoneda(cuenta.moneda);
@@ -791,20 +780,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     }
     setSavingAction(cuenta.id);
     try {
-      // Buscar el movimiento SALIDA original para saber a qué caja debe regresar el dinero
       const salidaOriginal = movCajas.find(m => m.transfer_id === cuenta.transfer_id && m.transfer_role === 'SALIDA');
       if (!salidaOriginal) throw new Error('No se encontró el movimiento original de la transferencia.');
 
       const cajaOrigen = cajas.find(c => c.id === salidaOriginal.caja_id);
       if (!cajaOrigen) throw new Error('Caja origen no encontrada.');
 
-      // 1. Marcar CxP como pagada
       const { error: errCxP } = await supabase.from('cuentas_generales').update({
         estatus: 'PAGADO', monto_pendiente: 0,
       }).eq('id', cuenta.id);
       if (errCxP) throw new Error(errCxP.message);
 
-      // 2. Generar ENTRADA en la caja origen (reposición del dinero)
       const { error: errEntrada } = await supabase.from('movimientos_caja_chica').insert([{
         id: uuid4(),
         caja_id: cajaOrigen.id,
@@ -820,14 +806,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         transfer_peer_id: null,
       }]);
       if (errEntrada) {
-        // Rollback CxP
         await supabase.from('cuentas_generales').update({
           estatus: 'PENDIENTE', monto_pendiente: cuenta.monto_total,
         }).eq('id', cuenta.id);
         throw new Error(`Entrada a caja: ${errEntrada.message}`);
       }
 
-      // 3. EXPENSE en Ledger — la Bóveda global pierde ese monto
       const { error: errTx } = await supabase.from('transacciones_finanzas').insert([{
         id: uuid4(),
         type: 'EXPENSE',
@@ -842,12 +826,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         transfer_id: cuenta.transfer_id,
       }]);
       if (errTx) {
-        console.error('[v13.0] Fallo el asiento Ledger de reposición:', errTx.message);
-        // No hacemos rollback aquí — la CxP y la entrada ya se hicieron; solo advertimos
+        console.error('[v13.1] Fallo el asiento Ledger de reposición:', errTx.message);
         alert('⚠️ Reposición aplicada a caja, pero el asiento en Ledger falló. Verifique manualmente.');
       }
 
       setPagarReposicionModal(null);
+      fetchLockRef.current = false;
       await fetchAll(true);
 
     } catch (err) {
@@ -860,8 +844,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   // ─── v13.0: MODAL DE ELIMINACIÓN SELECTIVA DE TRANSFERENCIA ───────────────
 
   const openDeleteTransferModal = (transferId: string) => {
-    const salida = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'SALIDA') || null;
-    const entrada = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'ENTRADA') || null;
+    const salida     = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'SALIDA') || null;
+    const entrada    = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'ENTRADA') || null;
     const reposicion = cuentas.find(c => c.transfer_id === transferId && c.categoria_interna === 'REPOSICION_CAJA') || null;
 
     const cajaOrigenNombre  = cajas.find(c => c.id === salida?.caja_id)?.nombre ?? '—';
@@ -892,6 +876,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           if (error) throw new Error(`Reposición: ${error.message}`);
         }
         setDeleteTransferModal(null);
+        fetchLockRef.current = false;
         await fetchAll(true);
       } catch (err) {
         alert('Error al eliminar: ' + (err instanceof Error ? err.message : String(err)));
@@ -953,6 +938,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
         setCuentaForm(p => ({ ...p, alumno_student_id: '', horas_prometidas: '', monto_total: '', concepto: '' }));
         setShowCuentaForm(false);
+        fetchLockRef.current = false;
+        await fetchAll(true);
       } catch (err) {
         setCuentaError(err instanceof Error ? err.message : 'Error de conexión.');
       } finally {
@@ -981,6 +968,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       if (error) { setCuentaError(`Error: ${error.message}`); return; }
       setCuentaForm(p => ({ ...p, entidad_nombre: '', concepto: '', monto_total: '', notas: '', proveedor_id: '', fecha_vencimiento: '' }));
       setShowCuentaForm(false);
+      fetchLockRef.current = false;
+      await fetchAll(true);
     } catch (err) {
       setCuentaError(err instanceof Error ? err.message : 'Error de conexión.');
     } finally {
@@ -991,7 +980,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const handlePagarCuenta = async (id: string, esCxC: boolean) => {
     if (savingAction) return;
 
-    // v13.0 — si es reposición interna, usar flujo especial con modal de bóveda
     if (!esCxC) {
       const cuenta = cuentas.find(c => c.id === id);
       if (cuenta?.categoria_interna === 'REPOSICION_CAJA') {
@@ -1033,7 +1021,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       } else {
         await supabase.from('cuentas_generales').update({ estatus: 'PAGADO', monto_pendiente: 0 }).eq('id', id);
       }
-    } finally { setSavingAction(null); }
+      fetchLockRef.current = false;
+      await fetchAll(true);
+    } finally {
+      setSavingAction(null);
+    }
   };
 
   const handleCreateRequest = async (e: React.FormEvent) => {
@@ -1051,6 +1043,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }]);
       if (error) { setReqError(`Error: ${error.message}`); return; }
       setReqItems(''); setReqAmount('');
+      fetchLockRef.current = false;
+      await fetchAll(true);
     } catch (err) {
       setReqError(err instanceof Error ? err.message : 'Error de conexión.');
     } finally { setSavingReq(false); }
@@ -1068,6 +1062,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         issue_date: new Date().toISOString(),
       }]);
       await supabase.from('solicitudes_compra').update({ estatus: 'APROBADO', aprobado_por: userRole }).eq('id', reqId);
+      fetchLockRef.current = false;
+      await fetchAll(true);
     } finally { setSavingAction(null); }
   };
 
@@ -1116,7 +1112,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   if (loading) return (
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v13.0...</p>
+      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v13.1...</p>
     </div>
   );
 
@@ -1129,11 +1125,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
           <div>
-            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v13.0</p>
-            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Interconexión de Cajas · Edición/Eliminación: clave del Director</p>
+            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v13.1</p>
+            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Fix Registro Cajas · Edición/Eliminación: clave del Director</p>
           </div>
-          <button onClick={() => fetchAll(true)} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors">
-            <RefreshCw size={12} className={fetchLockRef.current ? 'animate-spin' : ''} />
+          <button onClick={() => { fetchLockRef.current = false; fetchAll(true); }} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors">
+            <RefreshCw size={12} />
           </button>
         </div>
         <div className="flex flex-wrap gap-1 p-1.5 bg-black/60 rounded-2xl border border-white/5">
@@ -1184,7 +1180,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         })}
       </div>
 
-      {/* KPI CUENTAS — v13.0: 4 métricas incluyendo Reposiciones */}
+      {/* KPI CUENTAS */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <div className={`${glass} bg-yellow-500/5 border border-yellow-500/10 rounded-2xl p-4 flex items-center justify-between`}>
           <div>
@@ -1358,11 +1354,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ TAB: CAJAS — v13.0 con Transferencia ════════════════════════════ */}
+      {/* ══ TAB: CAJAS ══════════════════════════════════════════════════════ */}
       {activeTab === 'CAJAS' && (
         <div className="space-y-6">
-
-          {/* Toolbar con botón de transferencia */}
           <div className="flex justify-between items-center flex-wrap gap-3">
             <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">
               {cajas.length} cajas operativas · Selecciona una para registrar movimientos
@@ -1472,9 +1466,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </div>
                   <div className="flex-1 overflow-y-auto max-h-[400px] p-4 space-y-2">
                     {movs.map(m=>(
-                      <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${
-                        m.transfer_id ? 'border-purple-500/20' : 'border-white/[0.05]'
-                      }`}>
+                      <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${m.transfer_id?'border-purple-500/20':'border-white/[0.05]'}`}>
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                             <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full border ${MONEDA_BG[m.moneda]} ${MONEDA_COLOR[m.moneda]}`}>{m.moneda}</span>
@@ -1512,7 +1504,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ TAB: CUENTAS v13.0 — 4 CARDS ═══════════════════════════════════ */}
+      {/* ══ TAB: CUENTAS ════════════════════════════════════════════════════ */}
       {activeTab === 'CUENTAS' && (
         <div className="space-y-6">
           <div className="flex justify-end">
@@ -1528,10 +1520,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <ReceiptText className="text-[#E1AD01] h-4 w-4"/> Registrar
               </h3>
               <form onSubmit={handleCuenta} className="grid grid-cols-1 md:grid-cols-3 gap-4">
-
                 <div className="md:col-span-3 flex bg-black/50 rounded-2xl p-1 border border-white/10 gap-1">
                   {([
-                    { key: 'HORAS_PAGADAS', label: '✓ Horas Pagadas', hint: 'Alumno pagó ahora — acredita de inmediato' },
+                    { key: 'HORAS_PAGADAS', label: '✓ Horas Pagadas',     hint: 'Alumno pagó ahora — acredita de inmediato' },
                     { key: 'CXC',           label: '⏳ Cuenta por Cobrar', hint: 'Alumno debe — queda pendiente' },
                     { key: 'CXP',           label: '↙ Cuenta por Pagar',  hint: 'Proveedor / gasto externo' },
                   ] as { key: FormTipo; label: string; hint: string }[]).map(({ key, label, hint }) => (
@@ -1594,8 +1585,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     <input required value={cuentaForm.entidad_nombre} onChange={e=>setCuentaForm(p=>({...p,entidad_nombre:e.target.value}))} placeholder="NOMBRE ENTIDAD" className={inp}/>
                   )}
                   <input type="number" step="0.01" min="0.01" required value={cuentaForm.monto_total}
-                    onChange={e=>setCuentaForm(p=>({...p,monto_total:e.target.value}))}
-                    placeholder="MONTO" className={inp}/>
+                    onChange={e=>setCuentaForm(p=>({...p,monto_total:e.target.value}))} placeholder="MONTO" className={inp}/>
                   <input required value={cuentaForm.concepto} onChange={e=>setCuentaForm(p=>({...p,concepto:e.target.value}))} placeholder="CONCEPTO / DESCRIPCIÓN" className={inp}/>
                   <input type="date" required value={cuentaForm.fecha_emision} onChange={e=>setCuentaForm(p=>({...p,fecha_emision:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
                   <input type="date" value={cuentaForm.fecha_vencimiento} onChange={e=>setCuentaForm(p=>({...p,fecha_vencimiento:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
@@ -1617,9 +1607,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
           )}
 
-          {/* v13.0 — 4 CARDS: CxC, Horas, CxP proveedores, Reposiciones internas */}
           <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
-
             {/* Card 1: Por Cobrar */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-yellow-500/5">
@@ -1654,9 +1642,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </div>
                   </div>
                 ))}
-                {cxcPendientes.length===0&&(
-                  <div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin deudas pendientes</p></div>
-                )}
+                {cxcPendientes.length===0&&(<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin deudas pendientes</p></div>)}
               </div>
             </div>
 
@@ -1692,13 +1678,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </div>
                   </div>
                 ))}
-                {horasPagadas.length===0&&(
-                  <div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin horas pagadas</p></div>
-                )}
+                {horasPagadas.length===0&&(<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin horas pagadas</p></div>)}
               </div>
             </div>
 
-            {/* Card 3: Por Pagar (Proveedores externos) */}
+            {/* Card 3: Por Pagar Proveedores */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-orange-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
@@ -1735,13 +1719,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     )}
                   </div>
                 ))}
-                {cuentasProveedores.length===0&&(
-                  <div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por pagar</p></div>
-                )}
+                {cuentasProveedores.length===0&&(<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por pagar</p></div>)}
               </div>
             </div>
 
-            {/* Card 4: v13.0 — Reposiciones Internas */}
+            {/* Card 4: Reposiciones Internas */}
             <div className={`${glass} rounded-3xl overflow-hidden border-purple-500/10`}>
               <div className="p-5 border-b border-white/5 bg-purple-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
@@ -1946,7 +1928,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         );
       })()}
 
-      {/* ══ MODAL v13.0: TRANSFERENCIA ENTRE CAJAS ═════════════════════════════ */}
+      {/* ══ MODAL: TRANSFERENCIA ENTRE CAJAS ═══════════════════════════════ */}
       {transferModalOpen && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-purple-500`}>
@@ -1962,7 +1944,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </div>
               <button onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="text-zinc-600 hover:text-white"><X size={18}/></button>
             </div>
-
             <form onSubmit={handleTransferencia} className="space-y-4">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -1985,7 +1966,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </select>
                 </div>
               </div>
-
               <div>
                 <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">Moneda</label>
                 <div className="grid grid-cols-4 gap-2">
@@ -1997,7 +1977,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   ))}
                 </div>
               </div>
-
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="relative">
                   <span className="absolute left-5 top-1/2 -translate-y-1/2 text-purple-400 font-black text-xl">{transferForm.moneda==='BS'?'Bs':'$'}</span>
@@ -2008,10 +1987,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </div>
                 <input type="date" required value={transferForm.fecha} onChange={e=>setTransferForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}} disabled={savingTransfer}/>
               </div>
-
               <input required value={transferForm.concepto} onChange={e=>setTransferForm(p=>({...p,concepto:e.target.value}))}
                 placeholder="CONCEPTO (ej: COMBUSTIBLE, PAGO NÓMINA URGENTE)" className={inp} disabled={savingTransfer}/>
-
               <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4">
                 <p className="text-[9px] text-purple-400 font-black uppercase tracking-widest mb-2 flex items-center gap-2">
                   <AlertTriangle size={12}/> Al confirmar se generarán 3 asientos vinculados:
@@ -2022,13 +1999,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   <li>3. CxP de reposición (Águilas debe reponer a caja origen)</li>
                 </ol>
               </div>
-
               <ErrorBanner msg={transferError} onClose={()=>setTransferError(null)}/>
-
               <div className="flex gap-3">
-                <button type="button" onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">
-                  Cancelar
-                </button>
+                <button type="button" onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
                 <button type="submit" disabled={savingTransfer} className="flex-[2] py-4 bg-purple-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-purple-400 disabled:opacity-40 flex items-center justify-center gap-2">
                   {savingTransfer?<Loader2 className="animate-spin h-4 w-4"/>:<><ArrowLeftRight size={14}/> Ejecutar Transferencia</>}
                 </button>
@@ -2038,7 +2011,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL v13.0: PAGAR REPOSICIÓN ═════════════════════════════════════ */}
+      {/* ══ MODAL: PAGAR REPOSICIÓN ════════════════════════════════════════ */}
       {pagarReposicionModal && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-purple-500`}>
@@ -2051,13 +2024,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <p className="text-[8px] text-zinc-600 mt-1">Sale de Bóveda, entra a la caja original</p>
               </div>
             </div>
-
             <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4 mb-4">
               <p className="text-[9px] text-purple-400/80 font-mono">{pagarReposicionModal.entidad_nombre}</p>
               <p className="text-2xl font-black italic text-purple-400 mt-1">{fmtMonto(pagarReposicionModal.monto_total, pagarReposicionModal.moneda)}</p>
               <p className="text-[8px] text-zinc-600 font-mono mt-1">{pagarReposicionModal.concepto}</p>
             </div>
-
             <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">¿Desde qué Bóveda pagar?</label>
             <div className="grid grid-cols-2 gap-2 mb-6">
               {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>{
@@ -2073,11 +2044,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 );
               })}
             </div>
-
             <div className="flex gap-3">
-              <button onClick={()=>setPagarReposicionModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">
-                Cancelar
-              </button>
+              <button onClick={()=>setPagarReposicionModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={confirmarPagoReposicion} disabled={savingAction===pagarReposicionModal.id}
                 className="flex-[2] py-4 bg-purple-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-purple-400 disabled:opacity-40 flex items-center justify-center gap-2">
                 {savingAction===pagarReposicionModal.id?<Loader2 className="animate-spin h-4 w-4"/>:<><CheckCircle2 size={14}/> Confirmar Reposición</>}
@@ -2087,7 +2055,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL v13.0: ELIMINAR TRANSFERENCIA SELECTIVA ══════════════════════ */}
+      {/* ══ MODAL: ELIMINAR TRANSFERENCIA SELECTIVA ════════════════════════ */}
       {deleteTransferModal && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-lg rounded-3xl p-7 border-t-2 border-t-red-500`}>
@@ -2100,7 +2068,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <p className="text-[8px] text-zinc-600 mt-1">Selecciona qué registros vinculados eliminar</p>
               </div>
             </div>
-
             <div className="space-y-2 mb-6">
               {deleteTransferModal.salida && (
                 <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.salida?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
@@ -2130,17 +2097,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </label>
               )}
             </div>
-
             <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 mb-4">
               <p className="text-[9px] text-yellow-400 font-mono leading-relaxed">
-                ⚠ Eliminar solo una parte de la transferencia romperá la integridad contable. Marca los 3 elementos si quieres deshacer completamente la operación.
+                ⚠ Eliminar solo una parte romperá la integridad contable. Marca los 3 elementos para deshacer completamente la operación.
               </p>
             </div>
-
             <div className="flex gap-3">
-              <button onClick={()=>setDeleteTransferModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">
-                Cancelar
-              </button>
+              <button onClick={()=>setDeleteTransferModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={confirmDeleteTransferSelection}
                 disabled={!deleteTransferSelection.salida && !deleteTransferSelection.entrada && !deleteTransferSelection.reposicion}
                 className="flex-[2] py-4 bg-red-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-red-400 disabled:opacity-30 flex items-center justify-center gap-2">
@@ -2151,7 +2114,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL: CLAVE DEL DIRECTOR (preservado) ════════════════════════════ */}
+      {/* ══ MODAL: CLAVE DEL DIRECTOR ══════════════════════════════════════ */}
       {directorAuthOpen && (
         <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-sm rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
@@ -2179,7 +2142,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL: EDITAR LEDGER (preservado) ══════════════════════════════════ */}
+      {/* ══ MODAL: EDITAR LEDGER ═══════════════════════════════════════════ */}
       {editingTx && (
         <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
@@ -2189,10 +2152,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <select value={editTxForm.type} onChange={e=>setEditTxForm(p=>({...p,type:e.target.value as TransactionType}))} className={inp}>
-                <option value="INCOME">INGRESO (+)</option><option value="EXPENSE">EGRESO (-)</option><option value="INSTRUCTOR_PAY">NÓMINA</option><option value="PAYABLE">POR PAGAR</option><option value="RECEIVABLE">POR COBRAR</option>
+                <option value="INCOME">INGRESO (+)</option><option value="EXPENSE">EGRESO (-)</option>
+                <option value="INSTRUCTOR_PAY">NÓMINA</option><option value="PAYABLE">POR PAGAR</option>
+                <option value="RECEIVABLE">POR COBRAR</option>
               </select>
               <select value={editTxForm.currency} onChange={e=>setEditTxForm(p=>({...p,currency:normalizePaymentMethod(e.target.value)}))} className={inp}>
-                <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option><option value="CASH">CASH</option><option value="BS">BS</option>
+                <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
+                <option value="CASH">CASH</option><option value="BS">BS</option>
               </select>
               <input type="number" min="0.01" step="0.01" value={editTxForm.amount} onChange={e=>setEditTxForm(p=>({...p,amount:e.target.value}))} className={inp} placeholder="MONTO"/>
               <input type="date" value={editTxForm.fecha} onChange={e=>setEditTxForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
@@ -2208,7 +2174,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL: EDITAR CAJA (preservado) ═══════════════════════════════════ */}
+      {/* ══ MODAL: EDITAR CAJA ════════════════════════════════════════════ */}
       {editingMov && (
         <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
