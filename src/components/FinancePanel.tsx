@@ -1,31 +1,35 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v13.1 — FIX REGISTRO DE MOVIMIENTOS
-// CHANGELOG v13.1:
-//   [FIX] fetchAll: lock colgado ya no bloquea re-fetch silent tras escritura.
-//         Si fetchLockRef.current=true en modo silent, se libera y se re-ejecuta.
-//   [FIX] handleMovCaja: fuerza fetchLockRef.current=false + fetchAll(true) tras insert
-//         — el movimiento aparece de inmediato sin esperar debounce de realtime (800ms)
-//   [FIX] handleLedger: mismo patrón — re-fetch inmediato tras sellar asiento
-//   [FIX] handleTransferencia: libera lock antes de fetchAll(true) al final del try
-// PRESERVADO v13.0: Transferencia entre cajas, Reposiciones Internas, 4 Cards CxC/CxP,
-//   edición protegida con clave Director, Libro Diario, Bóvedas, Cierre Multi-Moneda,
-//   Requisiciones, todos los fixes 1-7 previos. CERO OMISIONES. GRADO MILITAR.
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v14.0
+// CHANGELOG v14.0 vs v13.1:
+//   [NEW] Caja Efectivo dual: subcajas ADM (stand-by) / CEO (custodia física)
+//         → handleEntregaCEO: modal firma con concepto para mover efectivo ADM→CEO
+//   [NEW] FX Desk: cambio de moneda trazable (USDT/ZELLE/CASH → BS y viceversa)
+//         → tabla fx_registros + asiento doble en movimientos_caja_chica
+//   [NEW] Préstamos externos: Becquer/Roberto pueden prestar a Águilas
+//         → tipo 'PRESTAMO_EXTERNO' con campo prestamista trazable
+//   [CHG] Bancamiga reemplaza a Ederson — solo acepta BS
+//   [CHG] Caja Efectivo solo acepta CASH; mapa estático de restricciones por caja
+//   [CLN] Eliminadas: uuid4() inline duplicado, genHash repetida, dead-code physBalances reset
+//   PRESERVADO: fetchLockRef, fetchAll(silent), realtime debounce, transferencia entre cajas,
+//   reposiciones, CxC/CxP, Libro Diario, Bóvedas, Cierre, Requisiciones, clave Director.
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
 import { supabase } from '../lib/supabaseClient';
 import {
   ArrowUpCircle, ArrowDownCircle, PlusCircle, X, Loader2,
-  Wallet, UserCheck, ShieldCheck, Calculator, Landmark, CheckCircle2,
+  Wallet, ShieldCheck, Calculator, Landmark, CheckCircle2,
   FileSignature, Lock, Activity, Trash2, Download, Coins, Banknote,
   AlertTriangle, RefreshCw, ReceiptText, Plane, Pencil, KeyRound,
-  ArrowLeftRight, Repeat,
+  ArrowLeftRight, Repeat, TrendingUp, UserCheck, HandCoins,
 } from 'lucide-react';
 
 // ─── TIPOS ────────────────────────────────────────────────────────────────────
 
 export type PaymentMethod   = 'USDT' | 'ZELLE' | 'CASH' | 'BS';
-export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE' | 'RECEIVABLE';
+export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE' | 'RECEIVABLE' | 'FX_EXCHANGE';
 export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING';
+export type SubcajaEfectivo = 'ADM' | 'CEO';    // solo aplica a caja efectivo
+export type Prestamista     = 'BECQUER' | 'ROBERTO';
 type FormTipo               = 'CXC' | 'HORAS_PAGADAS' | 'CXP';
 
 interface CajaChica      { id: string; nombre: string; }
@@ -36,7 +40,26 @@ interface MovimientoCaja {
   transfer_id?: string | null;
   transfer_role?: 'SALIDA' | 'ENTRADA' | null;
   transfer_peer_id?: string | null;
+  subcaja?: SubcajaEfectivo | null;          // [NEW] solo caja efectivo
+  prestamista?: Prestamista | null;          // [NEW] préstamos externos
+  es_prestamo?: boolean;
+  fx_id?: string | null;                     // [NEW] vínculo FX
 }
+
+/** [NEW] Registro de operación FX */
+interface FXRecord {
+  id: string;
+  fecha: string;
+  moneda_origen: PaymentMethod;
+  moneda_destino: PaymentMethod;
+  monto_origen: number;
+  monto_destino: number;
+  tasa: number;
+  concepto: string;
+  registrado_por: string;
+  caja_id?: string | null;
+}
+
 interface CuentaGeneral {
   id: string; tipo: 'CXC' | 'CXP'; entidad_nombre: string; entidad_tipo: string;
   proveedor_id?: string; moneda: PaymentMethod;
@@ -61,7 +84,6 @@ interface FinancePanelProps {
   vendors: Vendor[]; inventory: any[]; userRole?: string;
   setGlobalFinance?: React.Dispatch<React.SetStateAction<{CASH:number;ZELLE:number;USDT:number;BS:number}>>;
 }
-
 interface TransferChain {
   transferId: string;
   salida: MovimientoCaja | null;
@@ -71,12 +93,35 @@ interface TransferChain {
   cajaDestinoNombre: string;
 }
 
+// ─── CONFIG ESTÁTICA DE CAJAS ─────────────────────────────────────────────────
+// Restricciones de moneda por caja — aplicadas en UI y validación.
+// "Bancamiga" solo opera en BS; "Efectivo" solo opera en CASH.
+
+const CAJA_CONFIG: Record<string, {
+  monedasPermitidas: PaymentMethod[];
+  esCajaEfectivo: boolean;
+  owner?: string;
+  color: string;
+}> = {
+  'bancamiga': { monedasPermitidas: ['BS'],   esCajaEfectivo: false, owner: 'Bancamiga', color: 'orange' },
+  'efectivo':  { monedasPermitidas: ['CASH'], esCajaEfectivo: true,  owner: 'CEO Office', color: 'yellow' },
+};
+
+/** Devuelve config por nombre de caja (lowercase match) */
+const getCajaConfig = (nombre: string) => {
+  const key = nombre.toLowerCase();
+  for (const k of Object.keys(CAJA_CONFIG)) {
+    if (key.includes(k)) return CAJA_CONFIG[k];
+  }
+  return { monedasPermitidas: ['USDT','ZELLE','CASH','BS'] as PaymentMethod[], esCajaEfectivo: false, color: 'zinc' };
+};
+
 // ─── ESTILOS ──────────────────────────────────────────────────────────────────
 
 const glass = "bg-white/[0.02] backdrop-blur-[40px] border border-white/[0.07] shadow-[0_20px_50px_rgba(0,0,0,0.5)]";
 const inp   = "bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-[#E1AD01]/60 focus:ring-1 focus:ring-[#E1AD01]/20 transition-all w-full uppercase placeholder:text-white/20";
 
-const DEFAULT_TASA_BS = 36.50;
+const DEFAULT_TASA_BS       = 36.50;
 const DIRECTOR_FINANCE_CODE = '4827';
 
 const normalizePaymentMethod = (value: unknown): PaymentMethod => {
@@ -97,25 +142,24 @@ const MONEDA_BG: Record<PaymentMethod, string> = {
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-const round2   = (n: number) => Math.round(n * 100) / 100;
-const uuid4    = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+const round2  = (n: number) => Math.round(n * 100) / 100;
+const uuid4   = () => crypto.randomUUID?.() ?? 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
   const r = (Math.random() * 16) | 0;
   return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
 });
-const genHash  = (s: string) => {
+const genHash = (s: string) => {
   let h = 0;
   for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h = h & h; }
   return Math.abs(h).toString(16).padStart(8, '0').toUpperCase();
 };
-const fmtDate  = (d: string | Date | null | undefined) => {
+const fmtDate = (d: string | Date | null | undefined) => {
   if (!d) return '—';
   const dt = new Date(d instanceof Date ? d.toISOString() : d);
   return new Date(dt.getTime() + dt.getTimezoneOffset() * 60000)
     .toLocaleDateString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric' });
 };
 const fmtMonto = (amount: number, moneda: PaymentMethod) => {
-  const n = round2(amount);
-  const s = n.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const s = round2(amount).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return moneda === 'BS' ? `Bs ${s}` : `$${s}`;
 };
 
@@ -127,9 +171,7 @@ const ErrorBanner: React.FC<{ msg: string | null; onClose: () => void }> = ({ ms
     <div className="flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/30 animate-in slide-in-from-top-2 duration-300">
       <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
       <p className="text-[10px] text-red-400 flex-1 font-mono">{msg}</p>
-      <button onClick={onClose} className="text-red-700 hover:text-red-400 transition-colors">
-        <X size={12} />
-      </button>
+      <button onClick={onClose} className="text-red-700 hover:text-red-400 transition-colors"><X size={12} /></button>
     </div>
   );
 };
@@ -150,68 +192,108 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [capitanes,    setCapitanes]    = useState<any[]>([]);
   const [alumnos,      setAlumnos]      = useState<AlumnoCxC[]>([]);
   const [cuentasCxC,   setCuentasCxC]   = useState<CuentaPorCobrar[]>([]);
+  const [fxRegistros,  setFxRegistros]  = useState<FXRecord[]>([]);   // [NEW]
 
   const [loading,       setLoading]       = useState(true);
   const [selectedVault, setSelectedVault] = useState<PaymentMethod>('USDT');
   const [cajaActiva,    setCajaActiva]    = useState<string | null>(null);
   const fetchLockRef = useRef(false);
 
+  // errores por módulo
   const [ledgerError,   setLedgerError]   = useState<string | null>(null);
   const [cajaError,     setCajaError]     = useState<string | null>(null);
   const [cuentaError,   setCuentaError]   = useState<string | null>(null);
   const [reqError,      setReqError]      = useState<string | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
+  const [fxError,       setFxError]       = useState<string | null>(null);    // [NEW]
 
-  const [savingLedger,    setSavingLedger]   = useState(false);
-  const [savingCaja,      setSavingCaja]     = useState(false);
-  const [savingCuenta,    setSavingCuenta]   = useState(false);
-  const [savingReq,       setSavingReq]      = useState(false);
-  const [savingTransfer,  setSavingTransfer] = useState(false);
-  const [savingAction,    setSavingAction]   = useState<string | null>(null);
+  // estados de carga
+  const [savingLedger,   setSavingLedger]   = useState(false);
+  const [savingCaja,     setSavingCaja]     = useState(false);
+  const [savingCuenta,   setSavingCuenta]   = useState(false);
+  const [savingReq,      setSavingReq]      = useState(false);
+  const [savingTransfer, setSavingTransfer] = useState(false);
+  const [savingFX,       setSavingFX]       = useState(false);              // [NEW]
+  const [savingAction,   setSavingAction]   = useState<string | null>(null);
 
+  // seguridad director
   const [directorAuthOpen,    setDirectorAuthOpen]    = useState(false);
   const [directorCode,        setDirectorCode]        = useState('');
   const [directorAuthError,   setDirectorAuthError]   = useState<string | null>(null);
   const [pendingSecureAction, setPendingSecureAction] = useState<(() => Promise<void>) | null>(null);
 
-  const [editingTx,   setEditingTx]   = useState<FinanceTransaction | null>(null);
-  const [editTxForm,  setEditTxForm]  = useState({
+  // edición ledger
+  const [editingTx,  setEditingTx]  = useState<FinanceTransaction | null>(null);
+  const [editTxForm, setEditTxForm] = useState({
     amount: '', currency: 'USDT' as PaymentMethod, type: 'INCOME' as TransactionType,
     description: '', fecha: new Date().toISOString().split('T')[0],
   });
 
+  // edición caja
   const [editingMov,  setEditingMov]  = useState<MovimientoCaja | null>(null);
   const [editMovForm, setEditMovForm] = useState({
     tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
     monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
   });
 
+  // transferencia entre cajas
   const [transferModalOpen, setTransferModalOpen] = useState(false);
   const [transferForm, setTransferForm] = useState({
-    caja_origen_id:  '',
-    caja_destino_id: '',
-    moneda:          'USDT' as PaymentMethod,
-    monto:           '',
-    concepto:        '',
-    fecha:           new Date().toISOString().split('T')[0],
+    caja_origen_id: '', caja_destino_id: '',
+    moneda: 'USDT' as PaymentMethod,
+    monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0],
   });
-
   const [deleteTransferModal,     setDeleteTransferModal]     = useState<TransferChain | null>(null);
-  const [deleteTransferSelection, setDeleteTransferSelection] = useState<{ salida: boolean; entrada: boolean; reposicion: boolean }>({
-    salida: true, entrada: true, reposicion: true,
-  });
+  const [deleteTransferSelection, setDeleteTransferSelection] = useState<{salida:boolean;entrada:boolean;reposicion:boolean}>({salida:true,entrada:true,reposicion:true});
 
+  // reposición
   const [pagarReposicionModal,  setPagarReposicionModal]  = useState<CuentaGeneral | null>(null);
   const [pagarReposicionMoneda, setPagarReposicionMoneda] = useState<PaymentMethod>('USDT');
 
+  // [NEW] entrega efectivo ADM → CEO
+  const [entregaCEOModal,  setEntregaCEOModal]  = useState(false);
+  const [entregaCEOForm, setEntregaCEOForm] = useState({
+    monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0],
+  });
+
+  // [NEW] FX Desk modal
+  const [fxModalOpen, setFxModalOpen] = useState(false);
+  const [fxForm, setFxForm] = useState({
+    caja_id:        '',
+    moneda_origen:  'USDT' as PaymentMethod,
+    moneda_destino: 'BS'   as PaymentMethod,
+    monto_origen:   '',
+    tasa:           String(DEFAULT_TASA_BS),
+    concepto:       '',
+    fecha:          new Date().toISOString().split('T')[0],
+  });
+
+  // [NEW] préstamo externo modal
+  const [prestamoModal, setPrestamoModal] = useState(false);
+  const [prestamoForm, setPrestamoForm] = useState({
+    prestamista:  'BECQUER' as Prestamista,
+    caja_id:      '',
+    moneda:       'USDT' as PaymentMethod,
+    monto:        '',
+    concepto:     '',
+    fecha:        new Date().toISOString().split('T')[0],
+    es_devolucion: false,
+  });
+
+  // ledger form
   const [ledger, setLedger] = useState({
     amount: '', currency: 'USDT' as PaymentMethod, type: 'INCOME' as TransactionType,
     reference: '', capitanId: '', fecha: new Date().toISOString().split('T')[0],
   });
+
+  // caja form
   const [movForm, setMovForm] = useState({
     tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
     monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
+    subcaja: 'ADM' as SubcajaEfectivo,  // [NEW]
   });
+
+  // cuentas form
   const [cuentaForm, setCuentaForm] = useState({
     tipo:              'HORAS_PAGADAS' as FormTipo,
     alumno_student_id: '',
@@ -225,24 +307,24 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     fecha_vencimiento: '', notas: '',
   });
   const [showCuentaForm, setShowCuentaForm] = useState(false);
-  const [reqItems,     setReqItems]     = useState('');
-  const [reqPriority,  setReqPriority]  = useState('MEDIA');
-  const [reqAmount,    setReqAmount]    = useState('');
+
+  // requisiciones form
+  const [reqItems,    setReqItems]    = useState('');
+  const [reqPriority, setReqPriority] = useState('MEDIA');
+  const [reqAmount,   setReqAmount]   = useState('');
+
+  // cierre físico
   const [physBalances, setPhysBalances] = useState<Record<PaymentMethod, string>>({ USDT:'', ZELLE:'', CASH:'', BS:'' });
 
   // ─── FETCH ────────────────────────────────────────────────────────────────
-  // [FIX v13.1] Si el lock está activo en modo silent (llamado desde handler de escritura),
-  // lo liberamos y continuamos — evita que movimientos recién guardados queden sin mostrar.
 
   const fetchAll = useCallback(async (silent = false) => {
     if (fetchLockRef.current && !silent) return;
-    if (fetchLockRef.current && silent) {
-      fetchLockRef.current = false; // [FIX v13.1] liberar lock colgado en modo silent
-    }
+    if (fetchLockRef.current && silent) fetchLockRef.current = false;
     fetchLockRef.current = true;
     if (!silent) setLoading(true);
     try {
-      const [txRes, reqRes, cajasRes, movRes, cuentasRes, capRes, alumnosRes, cxcRes] = await Promise.all([
+      const [txRes, reqRes, cajasRes, movRes, cuentasRes, capRes, alumnosRes, cxcRes, fxRes] = await Promise.all([
         supabase.from('transacciones_finanzas').select('*').order('issue_date', { ascending: false }),
         supabase.from('solicitudes_compra').select('*').order('created_at', { ascending: false }),
         supabase.from('cajas_chicas').select('*').order('nombre'),
@@ -251,7 +333,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         supabase.from('capitanes').select('*').order('nombre'),
         supabase.from('perfiles_estudiantes').select('id, nombre_completo, student_serial, sede').eq('role', 'student').order('nombre_completo'),
         supabase.from('cuentas_por_cobrar').select('*').order('fecha_emision', { ascending: false }),
+        supabase.from('fx_registros').select('*').order('fecha', { ascending: false }).limit(100),
       ]);
+
       if (txRes.data) setTransactions(txRes.data.map((t: any) => ({
         id: t.id, type: t.type, entityId: t.entity_id,
         entityName: t.entity_name || 'MOVIMIENTO',
@@ -261,44 +345,62 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         issueDate: t.issue_date, category: t.category || 'General',
         payment_method: normalizePaymentMethod(t.payment_method),
       })));
-      if (reqRes.data)     setRequests(reqRes.data);
-      if (cajasRes.data)   setCajas(cajasRes.data);
-      if (movRes.data)     setMovCajas(movRes.data.map((m: any) => ({
+
+      if (reqRes.data)   setRequests(reqRes.data);
+      if (cajasRes.data) setCajas(cajasRes.data);
+
+      if (movRes.data) setMovCajas(movRes.data.map((m: any) => ({
         ...m,
-        monto: round2(Number(m.monto) || 0),
-        transfer_id:      m.transfer_id       ?? null,
-        transfer_role:    m.transfer_role     ?? null,
-        transfer_peer_id: m.transfer_peer_id  ?? null,
+        monto:            round2(Number(m.monto) || 0),
+        transfer_id:      m.transfer_id      ?? null,
+        transfer_role:    m.transfer_role    ?? null,
+        transfer_peer_id: m.transfer_peer_id ?? null,
+        subcaja:          m.subcaja          ?? null,
+        prestamista:      m.prestamista      ?? null,
+        es_prestamo:      m.es_prestamo      ?? false,
+        fx_id:            m.fx_id            ?? null,
       })));
+
       if (cuentasRes.data) setCuentas(cuentasRes.data.map((c: any) => ({
         ...c,
         monto_total:       round2(Number(c.monto_total) || 0),
         monto_pendiente:   round2(Number(c.monto_pendiente) || 0),
-        transfer_id:       c.transfer_id        ?? null,
-        categoria_interna: c.categoria_interna  ?? null,
+        transfer_id:       c.transfer_id       ?? null,
+        categoria_interna: c.categoria_interna ?? null,
       })));
+
       if (capRes.data)     setCapitanes(capRes.data);
       if (alumnosRes.data) setAlumnos(alumnosRes.data.map((a: any) => ({
         student_id: a.id,
-        nombre: a.nombre_completo || 'SIN NOMBRE',
-        serial: a.student_serial || '—',
-        sede: a.sede || '—',
+        nombre:     a.nombre_completo || 'SIN NOMBRE',
+        serial:     a.student_serial  || '—',
+        sede:       a.sede            || '—',
       })));
+
       if (cxcRes.data) {
-        const normalizedCxC = cxcRes.data.map((c: any) => ({
+        const norm = cxcRes.data.map((c: any) => ({
           ...c,
           monto_total:      round2(Number(c.monto_total) || 0),
           monto_pagado:     round2(Number(c.monto_pagado) || 0),
           monto_pendiente:  round2(Number(c.monto_pendiente) || 0),
           horas_prometidas: Number(c.horas_prometidas) || 0,
-          horas_compradas:  Number(c.horas_compradas) || 0,
+          horas_compradas:  Number(c.horas_compradas)  || 0,
           moneda: normalizePaymentMethod(c.moneda),
         }));
-        setCuentasCxC(normalizedCxC);
-        await syncPaidAccountsToLedger(normalizedCxC);
+        setCuentasCxC(norm);
+        await syncPaidAccountsToLedger(norm);
       }
+
+      // [NEW] fx_registros puede no existir aún — ignorar error gracefully
+      if (fxRes.data) setFxRegistros(fxRes.data.map((f: any) => ({
+        ...f,
+        monto_origen:  round2(Number(f.monto_origen) || 0),
+        monto_destino: round2(Number(f.monto_destino) || 0),
+        tasa:          round2(Number(f.tasa) || 0),
+      })));
+
     } catch (e) {
-      console.error('[FinancePanel v13.1] fetchAll error:', e);
+      console.error('[FinancePanel v14.0] fetchAll error:', e);
     } finally {
       setLoading(false);
       fetchLockRef.current = false;
@@ -313,13 +415,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchAll();
-    const ch = supabase.channel('finance-v13-interconnect')
+    const ch = supabase.channel('finance-v14')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' },  handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' },       handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cajas_chicas' },             handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'movimientos_caja_chica' },   handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_generales' },        handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cuentas_por_cobrar' },       handleRealtimeChange)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'fx_registros' },             handleRealtimeChange)
       .subscribe();
     return () => {
       if (realtimeDebounce.current) clearTimeout(realtimeDebounce.current);
@@ -333,27 +436,34 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     transactions
       .filter(t => t.payment_method === method && t.status === 'PAID')
       .reduce((acc, t) => {
-        const plus = t.type === 'INCOME' || t.type === 'RECEIVABLE';
-        return round2(plus ? acc + t.amount : acc - t.amount);
+        const isIn = t.type === 'INCOME' || t.type === 'RECEIVABLE';
+        return round2(isIn ? acc + t.amount : acc - t.amount);
       }, 0),
   [transactions]);
 
   useEffect(() => {
-    const totals = (['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).reduce((acc, method) => {
-      acc[method] = getVaultBalance(method);
-      return acc;
-    }, { USDT: 0, ZELLE: 0, CASH: 0, BS: 0 } as {USDT:number;ZELLE:number;CASH:number;BS:number});
+    const totals = (['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).reduce((acc, m) => {
+      acc[m] = getVaultBalance(m); return acc;
+    }, { USDT: 0, ZELLE: 0, CASH: 0, BS: 0 } as Record<PaymentMethod, number>);
     setGlobalFinance(totals);
   }, [transactions, getVaultBalance, setGlobalFinance]);
 
+  /** Saldo total de una caja en una moneda */
   const getCajaBalance = useCallback((cajaId: string, moneda: PaymentMethod) =>
     movCajas
       .filter(m => m.caja_id === cajaId && m.moneda === moneda)
       .reduce((acc, m) => round2(m.tipo === 'ENTRADA' ? acc + m.monto : acc - m.monto), 0),
   [movCajas]);
 
-  const cxcPendientes   = useMemo(() => cuentasCxC.filter(c => c.estatus === 'PENDIENTE'),  [cuentasCxC]);
-  const horasPagadas    = useMemo(() => cuentasCxC.filter(c => c.estatus === 'COBRADO'),    [cuentasCxC]);
+  /** [NEW] Saldo de una subcaja de efectivo específica (ADM o CEO) */
+  const getSubcajaBalance = useCallback((cajaId: string, subcaja: SubcajaEfectivo) =>
+    movCajas
+      .filter(m => m.caja_id === cajaId && m.moneda === 'CASH' && m.subcaja === subcaja)
+      .reduce((acc, m) => round2(m.tipo === 'ENTRADA' ? acc + m.monto : acc - m.monto), 0),
+  [movCajas]);
+
+  const cxcPendientes   = useMemo(() => cuentasCxC.filter(c => c.estatus === 'PENDIENTE'), [cuentasCxC]);
+  const horasPagadas    = useMemo(() => cuentasCxC.filter(c => c.estatus === 'COBRADO'),   [cuentasCxC]);
   const totalCxC        = useMemo(() => cxcPendientes.reduce((a, c) => round2(a + c.monto_pendiente), 0), [cxcPendientes]);
   const totalHorasAcred = useMemo(() => horasPagadas.reduce((a, c) => a + c.horas_compradas, 0), [horasPagadas]);
 
@@ -366,15 +476,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + c.monto_pendiente), 0),
   [cuentasReposiciones]);
 
-  // ─── SEGURIDAD ─────────────────────────────────────────────────────────────
+  // ─── SEGURIDAD ────────────────────────────────────────────────────────────
 
   const canManageFinance = ['CEO', 'ADMIN', 'DIRECTOR'].includes(String(userRole).toUpperCase());
 
   const requireDirectorCode = useCallback((action: () => Promise<void>) => {
-    if (!canManageFinance) {
-      alert('Acceso denegado. Solo personal autorizado puede modificar este módulo.');
-      return;
-    }
+    if (!canManageFinance) { alert('Acceso denegado.'); return; }
     setDirectorCode('');
     setDirectorAuthError(null);
     setPendingSecureAction(() => action);
@@ -382,44 +489,48 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   }, [canManageFinance]);
 
   const confirmDirectorCode = async () => {
-    if (!/^\d{4}$/.test(directorCode)) {
-      setDirectorAuthError('La clave debe contener exactamente 4 dígitos.');
-      return;
-    }
-    if (directorCode !== DIRECTOR_FINANCE_CODE) {
-      setDirectorAuthError('Clave del Director incorrecta.');
-      setDirectorCode('');
-      return;
-    }
+    if (!/^\d{4}$/.test(directorCode)) { setDirectorAuthError('La clave debe tener 4 dígitos.'); return; }
+    if (directorCode !== DIRECTOR_FINANCE_CODE) { setDirectorAuthError('Clave incorrecta.'); setDirectorCode(''); return; }
     const action = pendingSecureAction;
-    setDirectorAuthOpen(false);
-    setDirectorCode('');
-    setDirectorAuthError(null);
-    setPendingSecureAction(null);
-    if (action) {
-      try { await action(); }
-      catch (err) { console.error('[FinancePanel] acción protegida:', err); }
-    }
+    setDirectorAuthOpen(false); setDirectorCode(''); setDirectorAuthError(null); setPendingSecureAction(null);
+    if (action) { try { await action(); } catch (err) { console.error('[FinancePanel] acción protegida:', err); } }
   };
 
   const cancelDirectorAuth = () => {
-    setDirectorAuthOpen(false);
-    setDirectorCode('');
-    setDirectorAuthError(null);
-    setPendingSecureAction(null);
+    setDirectorAuthOpen(false); setDirectorCode(''); setDirectorAuthError(null); setPendingSecureAction(null);
   };
 
-  // ─── EDICIÓN LEDGER / CAJA ────────────────────────────────────────────────
+  // ─── SYNC HISTÓRICO ───────────────────────────────────────────────────────
+
+  const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[]) => {
+    const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0);
+    for (const c of paid) {
+      const inv = `${c.horas_compradas > 0 ? 'HORA' : 'CXC'}-${c.id}`;
+      const { data: exists } = await supabase.from('transacciones_finanzas').select('id').eq('invoice_number', inv).limit(1);
+      if (exists?.length) continue;
+      await supabase.from('transacciones_finanzas').insert([{
+        id: uuid4(), type: 'INCOME', entity_id: c.student_id,
+        entity_name: c.nombre_alumno || 'ALUMNO',
+        amount: round2(Number(c.monto_total) || 0), invoice_number: inv,
+        description: `${c.concepto || 'COBRO'} · SINCRONIZACIÓN HISTÓRICA`,
+        status: 'PAID', category: 'Academia',
+        payment_method: normalizePaymentMethod(c.moneda),
+        issue_date: c.fecha_emision ? new Date(c.fecha_emision).toISOString() : new Date().toISOString(),
+      }]);
+    }
+  }, []);
+
+  // ─── EDICIÓN ──────────────────────────────────────────────────────────────
 
   const openEditTx = (tx: FinanceTransaction) => {
     const d = tx.issueDate ? new Date(tx.issueDate) : new Date();
     setEditingTx(tx);
     setEditTxForm({
-      amount: String(round2(Number(tx.amount) || 0)),
-      currency: normalizePaymentMethod(tx.payment_method),
-      type: tx.type as TransactionType,
+      amount:      String(round2(Number(tx.amount) || 0)),
+      currency:    normalizePaymentMethod(tx.payment_method),
+      type:        tx.type as TransactionType,
       description: tx.description || '',
-      fecha: Number.isNaN(d.getTime()) ? new Date().toISOString().split('T')[0] : d.toISOString().split('T')[0],
+      fecha:       Number.isNaN(d.getTime()) ? new Date().toISOString().split('T')[0] : d.toISOString().split('T')[0],
     });
   };
 
@@ -430,56 +541,29 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     setSavingAction(editingTx.id);
     try {
       const { error } = await supabase.from('transacciones_finanzas').update({
-        amount,
-        payment_method: editTxForm.currency,
-        type: editTxForm.type,
+        amount, payment_method: editTxForm.currency, type: editTxForm.type,
         description: editTxForm.description.trim() || 'MOVIMIENTO EDITADO',
         issue_date: new Date(editTxForm.fecha).toISOString(),
       }).eq('id', editingTx.id);
       if (error) throw new Error(error.message);
       setEditingTx(null);
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
-      setLedgerError(err instanceof Error ? err.message : 'No se pudo editar la transacción.');
-    } finally {
-      setSavingAction(null);
-    }
+      setLedgerError(err instanceof Error ? err.message : 'Error al editar.');
+    } finally { setSavingAction(null); }
   };
 
-  const deleteTxProtected = (id: string) => requireDirectorCode(async () => {
-    setSavingAction(id);
-    try {
-      const tx = transactions.find(t => t.id === id);
-      const { error } = await supabase.from('transacciones_finanzas').delete().eq('id', id);
-      if (error) throw new Error(error.message);
-      if (tx?.invoiceNumber?.startsWith('CXC-') || tx?.invoiceNumber?.startsWith('HORA-')) {
-        const cxcId = tx.invoiceNumber.replace(/^CXC-/, '').replace(/^HORA-/, '');
-        await supabase.from('cuentas_por_cobrar').delete().eq('id', cxcId);
-      }
-      fetchLockRef.current = false;
-      await fetchAll(true);
-    } catch (err) {
-      setLedgerError(err instanceof Error ? err.message : 'No se pudo eliminar la transacción.');
-    } finally {
-      setSavingAction(null);
-    }
-  });
-
   const openEditMov = (mov: MovimientoCaja) => {
-    if (mov.transfer_id) {
-      alert('Este movimiento forma parte de una transferencia entre cajas. Para modificarlo, elimine la transferencia completa y créela de nuevo.');
-      return;
-    }
+    if (mov.transfer_id) { alert('Forma parte de una transferencia. Elimínela completa y créela de nuevo.'); return; }
     setEditingMov(mov);
     const d = new Date(mov.fecha);
     setEditMovForm({
-      tipo: mov.tipo,
-      moneda: normalizePaymentMethod(mov.moneda),
-      monto: String(round2(Number(mov.monto) || 0)),
-      concepto: mov.concepto || '',
+      tipo:       mov.tipo,
+      moneda:     normalizePaymentMethod(mov.moneda),
+      monto:      String(round2(Number(mov.monto) || 0)),
+      concepto:   mov.concepto   || '',
       referencia: mov.referencia || '',
-      fecha: Number.isNaN(d.getTime()) ? new Date().toISOString().split('T')[0] : d.toISOString().split('T')[0],
+      fecha:      Number.isNaN(d.getTime()) ? new Date().toISOString().split('T')[0] : d.toISOString().split('T')[0],
     });
   };
 
@@ -491,52 +575,56 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     setSavingAction(editingMov.id);
     try {
       const { error } = await supabase.from('movimientos_caja_chica').update({
-        tipo: editMovForm.tipo,
-        moneda: editMovForm.moneda,
-        monto,
-        concepto: editMovForm.concepto.toUpperCase().trim(),
+        tipo: editMovForm.tipo, moneda: editMovForm.moneda, monto,
+        concepto:   editMovForm.concepto.toUpperCase().trim(),
         referencia: editMovForm.referencia.toUpperCase().trim() || null,
-        fecha: new Date(editMovForm.fecha).toISOString(),
+        fecha:      new Date(editMovForm.fecha).toISOString(),
       }).eq('id', editingMov.id);
       if (error) throw new Error(error.message);
       setEditingMov(null);
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
-      setCajaError(err instanceof Error ? err.message : 'No se pudo editar el movimiento de caja.');
-    } finally {
-      setSavingAction(null);
-    }
+      setCajaError(err instanceof Error ? err.message : 'Error al editar movimiento.');
+    } finally { setSavingAction(null); }
   };
+
+  // ─── ELIMINACIÓN ──────────────────────────────────────────────────────────
+
+  const deleteTxProtected = (id: string) => requireDirectorCode(async () => {
+    setSavingAction(id);
+    try {
+      const tx = transactions.find(t => t.id === id);
+      const { error } = await supabase.from('transacciones_finanzas').delete().eq('id', id);
+      if (error) throw new Error(error.message);
+      if (tx?.invoiceNumber?.startsWith('CXC-') || tx?.invoiceNumber?.startsWith('HORA-')) {
+        const cxcId = tx.invoiceNumber.replace(/^CXC-/, '').replace(/^HORA-/, '');
+        await supabase.from('cuentas_por_cobrar').delete().eq('id', cxcId);
+      }
+      fetchLockRef.current = false; await fetchAll(true);
+    } catch (err) {
+      setLedgerError(err instanceof Error ? err.message : 'Error al eliminar.');
+    } finally { setSavingAction(null); }
+  });
 
   const deleteMovProtected = (id: string) => {
     const mov = movCajas.find(m => m.id === id);
-    if (mov?.transfer_id) {
-      openDeleteTransferModal(mov.transfer_id);
-      return;
-    }
+    if (mov?.transfer_id) { openDeleteTransferModal(mov.transfer_id); return; }
     requireDirectorCode(async () => {
       setSavingAction(id);
       try {
         const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', id);
         if (error) throw new Error(error.message);
-        fetchLockRef.current = false;
-        await fetchAll(true);
+        fetchLockRef.current = false; await fetchAll(true);
       } catch (err) {
-        setCajaError(err instanceof Error ? err.message : 'No se pudo eliminar el movimiento de caja.');
-      } finally {
-        setSavingAction(null);
-      }
+        setCajaError(err instanceof Error ? err.message : 'Error al eliminar movimiento.');
+      } finally { setSavingAction(null); }
     });
   };
 
   const deleteCuentaProtected = (id: string, esCxC: boolean) => {
     if (!esCxC) {
       const cuenta = cuentas.find(c => c.id === id);
-      if (cuenta?.transfer_id) {
-        openDeleteTransferModal(cuenta.transfer_id);
-        return;
-      }
+      if (cuenta?.transfer_id) { openDeleteTransferModal(cuenta.transfer_id); return; }
     }
     requireDirectorCode(async () => {
       setSavingAction(id);
@@ -549,42 +637,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           const { error } = await supabase.from('cuentas_generales').delete().eq('id', id);
           if (error) throw new Error(error.message);
         }
-        fetchLockRef.current = false;
-        await fetchAll(true);
+        fetchLockRef.current = false; await fetchAll(true);
       } catch (err) {
-        setCuentaError(err instanceof Error ? err.message : 'No se pudo eliminar la cuenta.');
-      } finally {
-        setSavingAction(null);
-      }
+        setCuentaError(err instanceof Error ? err.message : 'Error al eliminar cuenta.');
+      } finally { setSavingAction(null); }
     });
   };
 
-  const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[]) => {
-    const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0);
-    if (!paid.length) return;
-    for (const c of paid) {
-      const invoiceNumber = `${c.horas_compradas > 0 ? 'HORA' : 'CXC'}-${c.id}`;
-      const { data: exists, error: checkError } = await supabase
-        .from('transacciones_finanzas').select('id').eq('invoice_number', invoiceNumber).limit(1);
-      if (checkError || (exists && exists.length)) continue;
-      await supabase.from('transacciones_finanzas').insert([{
-        id: uuid4(), type: 'INCOME', entity_id: c.student_id,
-        entity_name: c.nombre_alumno || 'ALUMNO',
-        amount: round2(Number(c.monto_total) || 0), invoice_number: invoiceNumber,
-        description: `${c.concepto || 'COBRO'} · SINCRONIZACIÓN HISTÓRICA`,
-        status: 'PAID', category: 'Academia',
-        payment_method: normalizePaymentMethod(c.moneda),
-        issue_date: c.fecha_emision ? new Date(c.fecha_emision).toISOString() : new Date().toISOString(),
-      }]);
-    }
-  }, []);
-
   // ─── HANDLER: LEDGER ──────────────────────────────────────────────────────
-  // [FIX v13.1] Fuerza re-fetch inmediato tras sellar asiento — no depende del debounce realtime
 
   const handleLedger = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLedgerError(null);
+    e.preventDefault(); setLedgerError(null);
     const num = round2(parseFloat(ledger.amount));
     if (isNaN(num) || num <= 0) { setLedgerError('Monto inválido.'); return; }
     if (ledger.type === 'INSTRUCTOR_PAY' && !ledger.capitanId) { setLedgerError('Selecciona un capitán.'); return; }
@@ -597,71 +660,286 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         entity_name: ledger.type === 'INSTRUCTOR_PAY' ? `NÓMINA: ${cap?.nombre ?? 'CAPITÁN'}` : `${ledger.type} ${ledger.currency}`,
         amount: num, invoice_number: `TX-${genHash(txId)}`,
         description: ledger.reference.trim() || 'REGISTRO MANUAL',
-        status: 'PAID',
-        category: ledger.type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
+        status: 'PAID', category: ledger.type === 'INSTRUCTOR_PAY' ? 'Nomina' : 'General',
         payment_method: ledger.currency,
         issue_date: new Date(ledger.fecha).toISOString(),
       }]);
-      if (error) {
-        setLedgerError(error.code === '23505' ? 'Duplicado detectado.' : `Error: ${error.message}`);
-        return;
-      }
+      if (error) { setLedgerError(error.code === '23505' ? 'Duplicado detectado.' : `Error: ${error.message}`); return; }
       setLedger(p => ({ ...p, amount: '', reference: '' }));
-      // [FIX v13.1] Re-fetch inmediato — no esperar debounce de realtime
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
       setLedgerError(err instanceof Error ? err.message : 'Error de conexión.');
-    } finally {
-      setSavingLedger(false);
-    }
+    } finally { setSavingLedger(false); }
   };
 
   // ─── HANDLER: CAJA ────────────────────────────────────────────────────────
-  // [FIX v13.1] Fuerza re-fetch inmediato tras insertar movimiento de caja.
-  // Antes solo confiaba en realtime con 800ms de debounce — si el lock estaba
-  // activo, el movimiento quedaba guardado en DB pero no aparecía en la UI.
 
   const handleMovCaja = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCajaError(null);
+    e.preventDefault(); setCajaError(null);
     if (!cajaActiva) { setCajaError('Selecciona una caja.'); return; }
     const num = round2(parseFloat(movForm.monto));
     if (isNaN(num) || num <= 0) { setCajaError('Monto inválido.'); return; }
     if (!movForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
+
+    // validación de moneda según restricciones de la caja
+    const cajaObj   = cajas.find(c => c.id === cajaActiva);
+    const cajaConf  = getCajaConfig(cajaObj?.nombre ?? '');
+    if (!cajaConf.monedasPermitidas.includes(movForm.moneda)) {
+      setCajaError(`Esta caja solo acepta: ${cajaConf.monedasPermitidas.join(', ')}`);
+      return;
+    }
+
     setSavingCaja(true);
     try {
+      const esCajaEfectivo = cajaConf.esCajaEfectivo;
       const { error } = await supabase.from('movimientos_caja_chica').insert([{
         id: uuid4(), caja_id: cajaActiva, tipo: movForm.tipo, moneda: movForm.moneda,
-        monto: num, concepto: movForm.concepto.toUpperCase().trim(),
+        monto: num,
+        concepto:   movForm.concepto.toUpperCase().trim(),
         referencia: movForm.referencia.toUpperCase().trim() || null,
-        fecha: new Date(movForm.fecha).toISOString(), registrado_por: userRole,
+        fecha:      new Date(movForm.fecha).toISOString(),
+        registrado_por: userRole,
+        subcaja: esCajaEfectivo ? movForm.subcaja : null,   // [NEW]
       }]);
       if (error) { setCajaError(`Error: ${error.message}`); return; }
       setMovForm(p => ({ ...p, monto: '', concepto: '', referencia: '' }));
-      // [FIX v13.1] Re-fetch inmediato — liberar lock y forzar actualización
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
       setCajaError(err instanceof Error ? err.message : 'Error de conexión.');
-    } finally {
-      setSavingCaja(false);
-    }
+    } finally { setSavingCaja(false); }
   };
 
-  // ─── HANDLER v13.0+v13.1: TRANSFERENCIA ENTRE CAJAS ──────────────────────
-  // [FIX v13.1] Libera lock antes del fetchAll(true) final
+  // ─── HANDLER: ENTREGA ADM → CEO ──────────────────────────────────────────
+  // [NEW] Caja Efectivo: mueve fondos de subcaja ADM a subcaja CEO.
+  // Genera SALIDA en ADM + ENTRADA en CEO dentro de la misma caja_id.
+
+  const handleEntregaCEO = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cajaEfectivo = cajas.find(c => getCajaConfig(c.nombre).esCajaEfectivo);
+    if (!cajaEfectivo) { alert('No se encontró la caja de efectivo.'); return; }
+
+    const monto = round2(parseFloat(entregaCEOForm.monto));
+    if (isNaN(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
+    if (!entregaCEOForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
+
+    const saldoADM = getSubcajaBalance(cajaEfectivo.id, 'ADM');
+    if (monto > saldoADM) {
+      const ok = window.confirm(`⚠️ ADM solo tiene ${fmtMonto(saldoADM, 'CASH')} disponible.\n¿Registrar de todas formas?`);
+      if (!ok) return;
+    }
+
+    setSavingCaja(true);
+    const refEntrega = `ENTREGA-${genHash(entregaCEOForm.concepto + Date.now())}`;
+    const fechaISO   = new Date(entregaCEOForm.fecha).toISOString();
+
+    try {
+      // SALIDA de ADM
+      const { error: e1 } = await supabase.from('movimientos_caja_chica').insert([{
+        id: uuid4(), caja_id: cajaEfectivo.id,
+        tipo: 'SALIDA', moneda: 'CASH', monto,
+        concepto:   `ENTREGA A CEO ← ${entregaCEOForm.concepto.toUpperCase().trim()}`,
+        referencia: refEntrega, fecha: fechaISO,
+        registrado_por: userRole, subcaja: 'ADM',
+      }]);
+      if (e1) throw new Error(`ADM Salida: ${e1.message}`);
+
+      // ENTRADA a CEO
+      const { error: e2 } = await supabase.from('movimientos_caja_chica').insert([{
+        id: uuid4(), caja_id: cajaEfectivo.id,
+        tipo: 'ENTRADA', moneda: 'CASH', monto,
+        concepto:   `RECIBIDO DE ADM → ${entregaCEOForm.concepto.toUpperCase().trim()}`,
+        referencia: refEntrega, fecha: fechaISO,
+        registrado_por: userRole, subcaja: 'CEO',
+      }]);
+      if (e2) {
+        await supabase.from('movimientos_caja_chica').delete().eq('referencia', refEntrega);
+        throw new Error(`CEO Entrada: ${e2.message}`);
+      }
+
+      setEntregaCEOForm({ monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0] });
+      setEntregaCEOModal(false);
+      fetchLockRef.current = false; await fetchAll(true);
+    } catch (err) {
+      setCajaError(err instanceof Error ? err.message : 'Error en entrega CEO.');
+    } finally { setSavingCaja(false); }
+  };
+
+  // ─── HANDLER: FX DESK ────────────────────────────────────────────────────
+  // [NEW] Registra cambio de moneda con trazabilidad completa:
+  // (1) fx_registros — audit trail del tipo de cambio y montos
+  // (2) SALIDA en moneda_origen de la caja + ENTRADA en moneda_destino
+  //
+  // Caso de uso principal: vender USDT/ZELLE/CASH y recibir BS para pagar nómina.
+
+  const handleFX = async (e: React.FormEvent) => {
+    e.preventDefault(); setFxError(null);
+
+    if (fxForm.moneda_origen === fxForm.moneda_destino) { setFxError('Las monedas deben ser distintas.'); return; }
+    if (!fxForm.caja_id) { setFxError('Selecciona la caja de operación.'); return; }
+
+    const montoOrigen = round2(parseFloat(fxForm.monto_origen));
+    const tasa        = round2(parseFloat(fxForm.tasa));
+    if (isNaN(montoOrigen) || montoOrigen <= 0) { setFxError('Monto inválido.'); return; }
+    if (isNaN(tasa) || tasa <= 0)               { setFxError('Tasa inválida.'); return; }
+    if (!fxForm.concepto.trim())                { setFxError('Concepto obligatorio.'); return; }
+
+    // Cálculo del monto destino según dirección del cambio
+    let montoDestino: number;
+    if (fxForm.moneda_destino === 'BS') {
+      montoDestino = round2(montoOrigen * tasa);      // USD → BS: multiplicar
+    } else if (fxForm.moneda_origen === 'BS') {
+      montoDestino = round2(montoOrigen / tasa);      // BS → USD: dividir
+    } else {
+      montoDestino = montoOrigen;                     // USD↔USD: 1:1 (ej. USDT↔ZELLE)
+    }
+
+    setSavingFX(true);
+    const fxId     = uuid4();
+    const fechaISO = new Date(fxForm.fecha).toISOString();
+    const refFX    = `FX-${genHash(fxId)}`;
+    const concepto = fxForm.concepto.toUpperCase().trim();
+
+    try {
+      // (1) Registro FX — tabla de auditoría de cambios
+      const { error: fxErr } = await supabase.from('fx_registros').insert([{
+        id: fxId, fecha: fechaISO,
+        moneda_origen:  fxForm.moneda_origen,
+        moneda_destino: fxForm.moneda_destino,
+        monto_origen:   montoOrigen,
+        monto_destino:  montoDestino,
+        tasa,
+        concepto,
+        registrado_por: userRole,
+        caja_id: fxForm.caja_id,
+      }]);
+      if (fxErr) throw new Error(`FX registro: ${fxErr.message}`);
+
+      // (2) SALIDA en moneda origen — dinero que sale de la bóveda/caja
+      const { error: eS } = await supabase.from('movimientos_caja_chica').insert([{
+        id: uuid4(), caja_id: fxForm.caja_id,
+        tipo: 'SALIDA', moneda: fxForm.moneda_origen, monto: montoOrigen,
+        concepto:   `FX VENTA ${fxForm.moneda_origen}→${fxForm.moneda_destino} · ${concepto}`,
+        referencia: refFX, fecha: fechaISO,
+        registrado_por: userRole, fx_id: fxId,
+      }]);
+      if (eS) { await supabase.from('fx_registros').delete().eq('id', fxId); throw new Error(`FX salida: ${eS.message}`); }
+
+      // (3) ENTRADA en moneda destino — dinero que entra a la bóveda/caja
+      const { error: eE } = await supabase.from('movimientos_caja_chica').insert([{
+        id: uuid4(), caja_id: fxForm.caja_id,
+        tipo: 'ENTRADA', moneda: fxForm.moneda_destino, monto: montoDestino,
+        concepto:   `FX COMPRA ${fxForm.moneda_destino}←${fxForm.moneda_origen} · ${concepto}`,
+        referencia: refFX, fecha: fechaISO,
+        registrado_por: userRole, fx_id: fxId,
+      }]);
+      if (eE) {
+        await supabase.from('movimientos_caja_chica').delete().eq('fx_id', fxId);
+        await supabase.from('fx_registros').delete().eq('id', fxId);
+        throw new Error(`FX entrada: ${eE.message}`);
+      }
+
+      // (4) Asiento en Ledger como EXPENSE (para nómina) o INCOME según dirección
+      const isNomina = concepto.includes('NÓMIN') || concepto.includes('NOMINA');
+      await supabase.from('transacciones_finanzas').insert([{
+        id: uuid4(), type: isNomina ? 'EXPENSE' : 'INCOME',
+        entity_name: `FX ${fxForm.moneda_origen}→${fxForm.moneda_destino}`,
+        amount: montoOrigen, invoice_number: refFX,
+        description: `Cambio ${fxForm.moneda_origen} → ${fxForm.moneda_destino} @ ${tasa} · ${concepto}`,
+        status: 'PAID', category: isNomina ? 'Nomina' : 'FX',
+        payment_method: fxForm.moneda_origen,
+        issue_date: fechaISO,
+      }]);
+
+      setFxForm(p => ({ ...p, monto_origen: '', concepto: '' }));
+      setFxModalOpen(false);
+      fetchLockRef.current = false; await fetchAll(true);
+    } catch (err) {
+      setFxError(err instanceof Error ? err.message : 'Error en operación FX.');
+    } finally { setSavingFX(false); }
+  };
+
+  // monto destino calculado en tiempo real para preview
+  const fxMontoDestino = useMemo(() => {
+    const mo = parseFloat(fxForm.monto_origen);
+    const t  = parseFloat(fxForm.tasa);
+    if (isNaN(mo) || isNaN(t) || mo <= 0 || t <= 0) return null;
+    if (fxForm.moneda_destino === 'BS') return round2(mo * t);
+    if (fxForm.moneda_origen  === 'BS') return round2(mo / t);
+    return round2(mo);
+  }, [fxForm.monto_origen, fxForm.tasa, fxForm.moneda_origen, fxForm.moneda_destino]);
+
+  // ─── HANDLER: PRÉSTAMO EXTERNO ────────────────────────────────────────────
+  // [NEW] Becquer o Roberto prestan dinero a Águilas (o Águilas devuelve).
+  // Registra en movimientos_caja_chica con flags es_prestamo=true, prestamista.
+  // También crea CxP en cuentas_generales para trackear la deuda.
+
+  const handlePrestamo = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!prestamoForm.caja_id)  { setCajaError('Selecciona la caja receptora.'); return; }
+    const monto = round2(parseFloat(prestamoForm.monto));
+    if (isNaN(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
+    if (!prestamoForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
+
+    setSavingCaja(true);
+    const refPrestamo = `PREST-${genHash(prestamoForm.prestamista + Date.now())}`;
+    const fechaISO    = new Date(prestamoForm.fecha).toISOString();
+    const concepto    = prestamoForm.concepto.toUpperCase().trim();
+
+    try {
+      if (!prestamoForm.es_devolucion) {
+        // ── PRÉSTAMO: entra dinero a la caja ──────────────────────────────
+        const { error: eM } = await supabase.from('movimientos_caja_chica').insert([{
+          id: uuid4(), caja_id: prestamoForm.caja_id,
+          tipo: 'ENTRADA', moneda: prestamoForm.moneda, monto,
+          concepto:   `PRÉSTAMO DE ${prestamoForm.prestamista} · ${concepto}`,
+          referencia: refPrestamo, fecha: fechaISO,
+          registrado_por: userRole,
+          es_prestamo: true, prestamista: prestamoForm.prestamista,
+        }]);
+        if (eM) throw new Error(eM.message);
+
+        // CxP generada automáticamente — Águilas debe devolver este dinero
+        const { error: eCxP } = await supabase.from('cuentas_generales').insert([{
+          tipo: 'CXP',
+          entidad_nombre: `DEVOLUCIÓN A ${prestamoForm.prestamista}`,
+          entidad_tipo: 'PRESTAMISTA',
+          moneda: prestamoForm.moneda,
+          monto_total: monto, monto_pendiente: monto,
+          concepto:   `Préstamo recibido de ${prestamoForm.prestamista} · ${concepto}`,
+          fecha_emision: fechaISO, estatus: 'PENDIENTE',
+          notas: `Ref: ${refPrestamo}`,
+        }]);
+        if (eCxP) console.warn('[v14] CxP de préstamo falló (no bloquea):', eCxP.message);
+
+      } else {
+        // ── DEVOLUCIÓN: sale dinero de la caja ────────────────────────────
+        const { error: eM } = await supabase.from('movimientos_caja_chica').insert([{
+          id: uuid4(), caja_id: prestamoForm.caja_id,
+          tipo: 'SALIDA', moneda: prestamoForm.moneda, monto,
+          concepto:   `DEVOLUCIÓN A ${prestamoForm.prestamista} · ${concepto}`,
+          referencia: refPrestamo, fecha: fechaISO,
+          registrado_por: userRole,
+          es_prestamo: true, prestamista: prestamoForm.prestamista,
+        }]);
+        if (eM) throw new Error(eM.message);
+      }
+
+      setPrestamoForm(p => ({ ...p, monto: '', concepto: '' }));
+      setPrestamoModal(false);
+      fetchLockRef.current = false; await fetchAll(true);
+    } catch (err) {
+      setCajaError(err instanceof Error ? err.message : 'Error en préstamo externo.');
+    } finally { setSavingCaja(false); }
+  };
+
+  // ─── TRANSFERENCIA ENTRE CAJAS ────────────────────────────────────────────
 
   const handleTransferencia = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setTransferError(null);
-
+    e.preventDefault(); setTransferError(null);
     if (!transferForm.caja_origen_id)  { setTransferError('Selecciona la caja de origen.'); return; }
     if (!transferForm.caja_destino_id) { setTransferError('Selecciona la caja de destino.'); return; }
-    if (transferForm.caja_origen_id === transferForm.caja_destino_id) {
-      setTransferError('La caja origen y destino no pueden ser la misma.');
-      return;
-    }
+    if (transferForm.caja_origen_id === transferForm.caja_destino_id) { setTransferError('Origen y destino iguales.'); return; }
+
     const monto = round2(parseFloat(transferForm.monto));
     if (isNaN(monto) || monto <= 0) { setTransferError('Monto inválido.'); return; }
     if (!transferForm.concepto.trim()) { setTransferError('Concepto obligatorio.'); return; }
@@ -672,13 +950,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
     const saldoOrigen = getCajaBalance(transferForm.caja_origen_id, transferForm.moneda);
     if (saldoOrigen < monto) {
-      const confirmar = window.confirm(
-        `⚠️ Saldo insuficiente en caja ${cajaOrigen.nombre}\n\n` +
-        `Saldo disponible: ${fmtMonto(saldoOrigen, transferForm.moneda)}\n` +
-        `Monto a transferir: ${fmtMonto(monto, transferForm.moneda)}\n\n` +
-        `La caja quedará en negativo. ¿Continuar?`
+      const ok = window.confirm(
+        `⚠️ Saldo insuficiente en ${cajaOrigen.nombre}\n\n` +
+        `Disponible: ${fmtMonto(saldoOrigen, transferForm.moneda)}\n` +
+        `Transferir: ${fmtMonto(monto, transferForm.moneda)}\n\n¿Continuar?`
       );
-      if (!confirmar) return;
+      if (!ok) return;
     }
 
     setSavingTransfer(true);
@@ -689,82 +966,53 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const conceptoUpper = transferForm.concepto.toUpperCase().trim();
 
     try {
-      // 1. SALIDA de caja origen
-      const { error: errSalida } = await supabase.from('movimientos_caja_chica').insert([{
-        id: salidaId,
-        caja_id: transferForm.caja_origen_id,
-        tipo: 'SALIDA',
-        moneda: transferForm.moneda,
-        monto,
-        concepto: `TRANSFERENCIA → ${cajaDestino.nombre.toUpperCase()} · ${conceptoUpper}`,
-        referencia: `TRF-${genHash(transferId)}`,
-        fecha: fechaISO,
+      const { error: e1 } = await supabase.from('movimientos_caja_chica').insert([{
+        id: salidaId, caja_id: transferForm.caja_origen_id,
+        tipo: 'SALIDA', moneda: transferForm.moneda, monto,
+        concepto:   `TRANSFERENCIA → ${cajaDestino.nombre.toUpperCase()} · ${conceptoUpper}`,
+        referencia: `TRF-${genHash(transferId)}`, fecha: fechaISO,
         registrado_por: userRole,
-        transfer_id: transferId,
-        transfer_role: 'SALIDA',
-        transfer_peer_id: transferForm.caja_destino_id,
+        transfer_id: transferId, transfer_role: 'SALIDA', transfer_peer_id: transferForm.caja_destino_id,
       }]);
-      if (errSalida) throw new Error(`Salida: ${errSalida.message}`);
+      if (e1) throw new Error(`Salida: ${e1.message}`);
 
-      // 2. ENTRADA a caja destino
-      const { error: errEntrada } = await supabase.from('movimientos_caja_chica').insert([{
-        id: entradaId,
-        caja_id: transferForm.caja_destino_id,
-        tipo: 'ENTRADA',
-        moneda: transferForm.moneda,
-        monto,
-        concepto: `TRANSFERENCIA ← ${cajaOrigen.nombre.toUpperCase()} · ${conceptoUpper}`,
-        referencia: `TRF-${genHash(transferId)}`,
-        fecha: fechaISO,
+      const { error: e2 } = await supabase.from('movimientos_caja_chica').insert([{
+        id: entradaId, caja_id: transferForm.caja_destino_id,
+        tipo: 'ENTRADA', moneda: transferForm.moneda, monto,
+        concepto:   `TRANSFERENCIA ← ${cajaOrigen.nombre.toUpperCase()} · ${conceptoUpper}`,
+        referencia: `TRF-${genHash(transferId)}`, fecha: fechaISO,
         registrado_por: userRole,
-        transfer_id: transferId,
-        transfer_role: 'ENTRADA',
-        transfer_peer_id: transferForm.caja_origen_id,
+        transfer_id: transferId, transfer_role: 'ENTRADA', transfer_peer_id: transferForm.caja_origen_id,
       }]);
-      if (errEntrada) {
+      if (e2) {
         await supabase.from('movimientos_caja_chica').delete().eq('id', salidaId);
-        throw new Error(`Entrada: ${errEntrada.message}`);
+        throw new Error(`Entrada: ${e2.message}`);
       }
 
-      // 3. CxP de reposición
-      const { error: errCxP } = await supabase.from('cuentas_generales').insert([{
+      const { error: e3 } = await supabase.from('cuentas_generales').insert([{
         tipo: 'CXP',
         entidad_nombre: `REPOSICIÓN CAJA ${cajaOrigen.nombre.toUpperCase()}`,
-        entidad_tipo: 'INTERNO',
-        proveedor_id: null,
-        moneda: transferForm.moneda,
-        monto_total: monto,
-        monto_pendiente: monto,
-        concepto: `Reposición por transferencia a ${cajaDestino.nombre.toUpperCase()} · ${conceptoUpper}`,
-        fecha_emision: fechaISO,
-        fecha_vencimiento: null,
-        estatus: 'PENDIENTE',
-        notas: `Transferencia interna entre cajas · Ref: TRF-${genHash(transferId)}`,
-        transfer_id: transferId,
-        categoria_interna: 'REPOSICION_CAJA',
+        entidad_tipo: 'INTERNO', moneda: transferForm.moneda,
+        monto_total: monto, monto_pendiente: monto,
+        concepto:   `Reposición por transferencia a ${cajaDestino.nombre.toUpperCase()} · ${conceptoUpper}`,
+        fecha_emision: fechaISO, estatus: 'PENDIENTE',
+        notas: `Ref: TRF-${genHash(transferId)}`,
+        transfer_id: transferId, categoria_interna: 'REPOSICION_CAJA',
       }]);
-      if (errCxP) {
+      if (e3) {
         await supabase.from('movimientos_caja_chica').delete().in('id', [salidaId, entradaId]);
-        throw new Error(`Reposición: ${errCxP.message}`);
+        throw new Error(`Reposición: ${e3.message}`);
       }
 
-      setTransferForm({
-        caja_origen_id: '', caja_destino_id: '', moneda: 'USDT',
-        monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0],
-      });
+      setTransferForm({ caja_origen_id:'', caja_destino_id:'', moneda:'USDT', monto:'', concepto:'', fecha: new Date().toISOString().split('T')[0] });
       setTransferModalOpen(false);
-      // [FIX v13.1] Liberar lock antes del re-fetch final
-      fetchLockRef.current = false;
-      await fetchAll(true);
-
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
-      setTransferError(err instanceof Error ? err.message : 'Error al procesar transferencia.');
-    } finally {
-      setSavingTransfer(false);
-    }
+      setTransferError(err instanceof Error ? err.message : 'Error en transferencia.');
+    } finally { setSavingTransfer(false); }
   };
 
-  // ─── v13.0: PAGO DE REPOSICIÓN ────────────────────────────────────────────
+  // ─── PAGO REPOSICIÓN ──────────────────────────────────────────────────────
 
   const openPagarReposicion = (cuenta: CuentaGeneral) => {
     setPagarReposicionMoneda(cuenta.moneda);
@@ -774,84 +1022,56 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const confirmarPagoReposicion = async () => {
     if (!pagarReposicionModal) return;
     const cuenta = pagarReposicionModal;
-    if (!cuenta.transfer_id) {
-      alert('Esta reposición no tiene transferencia asociada. Use el flujo normal de CxP.');
-      return;
-    }
+    if (!cuenta.transfer_id) { alert('Sin transferencia asociada. Use flujo normal de CxP.'); return; }
     setSavingAction(cuenta.id);
     try {
-      const salidaOriginal = movCajas.find(m => m.transfer_id === cuenta.transfer_id && m.transfer_role === 'SALIDA');
-      if (!salidaOriginal) throw new Error('No se encontró el movimiento original de la transferencia.');
+      const salida    = movCajas.find(m => m.transfer_id === cuenta.transfer_id && m.transfer_role === 'SALIDA');
+      if (!salida)    throw new Error('Movimiento original no encontrado.');
+      const cajaOrig  = cajas.find(c => c.id === salida.caja_id);
+      if (!cajaOrig)  throw new Error('Caja origen no encontrada.');
 
-      const cajaOrigen = cajas.find(c => c.id === salidaOriginal.caja_id);
-      if (!cajaOrigen) throw new Error('Caja origen no encontrada.');
-
-      const { error: errCxP } = await supabase.from('cuentas_generales').update({
-        estatus: 'PAGADO', monto_pendiente: 0,
-      }).eq('id', cuenta.id);
-      if (errCxP) throw new Error(errCxP.message);
-
-      const { error: errEntrada } = await supabase.from('movimientos_caja_chica').insert([{
-        id: uuid4(),
-        caja_id: cajaOrigen.id,
-        tipo: 'ENTRADA',
-        moneda: pagarReposicionMoneda,
-        monto: cuenta.monto_total,
-        concepto: `REPOSICIÓN DESDE BÓVEDA · ${cuenta.concepto}`,
+      await supabase.from('cuentas_generales').update({ estatus: 'PAGADO', monto_pendiente: 0 }).eq('id', cuenta.id);
+      const { error: eE } = await supabase.from('movimientos_caja_chica').insert([{
+        id: uuid4(), caja_id: cajaOrig.id,
+        tipo: 'ENTRADA', moneda: pagarReposicionMoneda, monto: cuenta.monto_total,
+        concepto:   `REPOSICIÓN DESDE BÓVEDA · ${cuenta.concepto}`,
         referencia: `REP-${genHash(cuenta.id)}`,
         fecha: new Date().toISOString(),
         registrado_por: userRole,
         transfer_id: cuenta.transfer_id,
-        transfer_role: null,
-        transfer_peer_id: null,
       }]);
-      if (errEntrada) {
-        await supabase.from('cuentas_generales').update({
-          estatus: 'PENDIENTE', monto_pendiente: cuenta.monto_total,
-        }).eq('id', cuenta.id);
-        throw new Error(`Entrada a caja: ${errEntrada.message}`);
+      if (eE) {
+        await supabase.from('cuentas_generales').update({ estatus: 'PENDIENTE', monto_pendiente: cuenta.monto_total }).eq('id', cuenta.id);
+        throw new Error(`Entrada a caja: ${eE.message}`);
       }
-
-      const { error: errTx } = await supabase.from('transacciones_finanzas').insert([{
-        id: uuid4(),
-        type: 'EXPENSE',
-        entity_name: `REPOSICIÓN CAJA ${cajaOrigen.nombre.toUpperCase()}`,
-        amount: cuenta.monto_total,
-        invoice_number: `REP-${genHash(cuenta.id)}`,
+      await supabase.from('transacciones_finanzas').insert([{
+        id: uuid4(), type: 'EXPENSE',
+        entity_name: `REPOSICIÓN CAJA ${cajaOrig.nombre.toUpperCase()}`,
+        amount: cuenta.monto_total, invoice_number: `REP-${genHash(cuenta.id)}`,
         description: `Reposición interna · ${cuenta.concepto}`,
-        status: 'PAID',
-        category: 'Reposición Interna',
+        status: 'PAID', category: 'Reposición Interna',
         payment_method: pagarReposicionMoneda,
         issue_date: new Date().toISOString(),
-        transfer_id: cuenta.transfer_id,
       }]);
-      if (errTx) {
-        console.error('[v13.1] Fallo el asiento Ledger de reposición:', errTx.message);
-        alert('⚠️ Reposición aplicada a caja, pero el asiento en Ledger falló. Verifique manualmente.');
-      }
 
       setPagarReposicionModal(null);
-      fetchLockRef.current = false;
-      await fetchAll(true);
-
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
-      alert('Error al procesar pago de reposición: ' + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setSavingAction(null);
-    }
+      alert('Error: ' + (err instanceof Error ? err.message : String(err)));
+    } finally { setSavingAction(null); }
   };
 
-  // ─── v13.0: MODAL DE ELIMINACIÓN SELECTIVA DE TRANSFERENCIA ───────────────
+  // ─── ELIMINAR TRANSFERENCIA ───────────────────────────────────────────────
 
   const openDeleteTransferModal = (transferId: string) => {
     const salida     = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'SALIDA') || null;
     const entrada    = movCajas.find(m => m.transfer_id === transferId && m.transfer_role === 'ENTRADA') || null;
     const reposicion = cuentas.find(c => c.transfer_id === transferId && c.categoria_interna === 'REPOSICION_CAJA') || null;
-
-    const cajaOrigenNombre  = cajas.find(c => c.id === salida?.caja_id)?.nombre ?? '—';
-    const cajaDestinoNombre = cajas.find(c => c.id === entrada?.caja_id)?.nombre ?? '—';
-
-    setDeleteTransferModal({ transferId, salida, entrada, reposicion, cajaOrigenNombre, cajaDestinoNombre });
+    setDeleteTransferModal({
+      transferId, salida, entrada, reposicion,
+      cajaOrigenNombre:  cajas.find(c => c.id === salida?.caja_id)?.nombre  ?? '—',
+      cajaDestinoNombre: cajas.find(c => c.id === entrada?.caja_id)?.nombre ?? '—',
+    });
     setDeleteTransferSelection({ salida: !!salida, entrada: !!entrada, reposicion: !!reposicion });
   };
 
@@ -859,38 +1079,24 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     if (!deleteTransferModal) return;
     const { salida, entrada, reposicion } = deleteTransferModal;
     const sel = deleteTransferSelection;
-
     requireDirectorCode(async () => {
       setSavingAction('transfer-delete');
       try {
-        if (sel.salida && salida) {
-          const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', salida.id);
-          if (error) throw new Error(`Salida: ${error.message}`);
-        }
-        if (sel.entrada && entrada) {
-          const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', entrada.id);
-          if (error) throw new Error(`Entrada: ${error.message}`);
-        }
-        if (sel.reposicion && reposicion) {
-          const { error } = await supabase.from('cuentas_generales').delete().eq('id', reposicion.id);
-          if (error) throw new Error(`Reposición: ${error.message}`);
-        }
+        if (sel.salida    && salida)     { const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', salida.id);     if (error) throw new Error(error.message); }
+        if (sel.entrada   && entrada)    { const { error } = await supabase.from('movimientos_caja_chica').delete().eq('id', entrada.id);    if (error) throw new Error(error.message); }
+        if (sel.reposicion && reposicion){ const { error } = await supabase.from('cuentas_generales').delete().eq('id', reposicion.id);     if (error) throw new Error(error.message); }
         setDeleteTransferModal(null);
-        fetchLockRef.current = false;
-        await fetchAll(true);
+        fetchLockRef.current = false; await fetchAll(true);
       } catch (err) {
         alert('Error al eliminar: ' + (err instanceof Error ? err.message : String(err)));
-      } finally {
-        setSavingAction(null);
-      }
+      } finally { setSavingAction(null); }
     });
   };
 
-  // ─── HANDLER: CUENTA (3 tipos) ────────────────────────────────────────────
+  // ─── HANDLER: CUENTAS ─────────────────────────────────────────────────────
 
   const handleCuenta = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCuentaError(null);
+    e.preventDefault(); setCuentaError(null);
 
     if (cuentaForm.tipo === 'HORAS_PAGADAS' || cuentaForm.tipo === 'CXC') {
       const horas = parseFloat(cuentaForm.horas_prometidas);
@@ -900,10 +1106,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       if (isNaN(monto) || monto <= 0)    { setCuentaError('Monto inválido.'); return; }
       if (!cuentaForm.concepto.trim())   { setCuentaError('Concepto requerido.'); return; }
 
-      const alumno = alumnos.find(a => a.student_id === cuentaForm.alumno_student_id);
-      if (!alumno) { setCuentaError('Alumno no encontrado.'); return; }
-
-      const esPagado = cuentaForm.tipo === 'HORAS_PAGADAS';
+      const alumno    = alumnos.find(a => a.student_id === cuentaForm.alumno_student_id);
+      if (!alumno)    { setCuentaError('Alumno no encontrado.'); return; }
+      const esPagado  = cuentaForm.tipo === 'HORAS_PAGADAS';
 
       setSavingCuenta(true);
       try {
@@ -913,42 +1118,39 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           monto_total: monto, monto_pagado: esPagado ? monto : 0,
           monto_pendiente: esPagado ? 0 : monto,
           horas_prometidas: horas, horas_compradas: esPagado ? horas : 0,
-          concepto: cuentaForm.concepto.toUpperCase().trim(),
-          fecha_emision: cuentaForm.fecha_emision, moneda: cuentaForm.moneda_pago,
+          concepto:      cuentaForm.concepto.toUpperCase().trim(),
+          fecha_emision: cuentaForm.fecha_emision,
+          moneda: cuentaForm.moneda_pago,
           estatus: esPagado ? 'COBRADO' : 'PENDIENTE',
         }]).select('id').single();
         if (error) { setCuentaError(`Error: ${error.message}`); return; }
 
         if (esPagado) {
-          if (!data?.id) throw new Error('No se pudo obtener el ID de la cuenta creada.');
-          const invoiceNumber = `HORA-${String(data.id)}`;
+          if (!data?.id) throw new Error('No se obtuvo ID de la cuenta creada.');
           const { error: txError } = await supabase.from('transacciones_finanzas').insert([{
             id: uuid4(), type: 'INCOME', entity_id: alumno.student_id, entity_name: alumno.nombre,
-            amount: monto, invoice_number: invoiceNumber,
+            amount: monto, invoice_number: `HORA-${String(data.id)}`,
             description: `HORAS PAGADAS · ${cuentaForm.concepto.toUpperCase().trim()}`,
             status: 'PAID', category: 'Academia',
             payment_method: normalizePaymentMethod(cuentaForm.moneda_pago),
             issue_date: new Date(cuentaForm.fecha_emision).toISOString(),
           }]);
           if (txError) {
-            await supabase.from('cuentas_por_cobrar').delete().eq('id', data?.id || '');
-            throw new Error(`No se pudo registrar el ingreso: ${txError.message}`);
+            await supabase.from('cuentas_por_cobrar').delete().eq('id', data.id);
+            throw new Error(`Ingreso Ledger: ${txError.message}`);
           }
         }
 
-        setCuentaForm(p => ({ ...p, alumno_student_id: '', horas_prometidas: '', monto_total: '', concepto: '' }));
+        setCuentaForm(p => ({ ...p, alumno_student_id:'', horas_prometidas:'', monto_total:'', concepto:'' }));
         setShowCuentaForm(false);
-        fetchLockRef.current = false;
-        await fetchAll(true);
+        fetchLockRef.current = false; await fetchAll(true);
       } catch (err) {
         setCuentaError(err instanceof Error ? err.message : 'Error de conexión.');
-      } finally {
-        setSavingCuenta(false);
-      }
+      } finally { setSavingCuenta(false); }
       return;
     }
 
-    // CXP
+    // ── CXP ───────────────────────────────────────────────────────────────
     const num = round2(parseFloat(cuentaForm.monto_total));
     if (isNaN(num) || num <= 0)            { setCuentaError('Monto inválido.'); return; }
     if (!cuentaForm.entidad_nombre.trim()) { setCuentaError('Nombre de entidad requerido.'); return; }
@@ -966,71 +1168,58 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         estatus: 'PENDIENTE', notas: cuentaForm.notas || null,
       }]);
       if (error) { setCuentaError(`Error: ${error.message}`); return; }
-      setCuentaForm(p => ({ ...p, entidad_nombre: '', concepto: '', monto_total: '', notas: '', proveedor_id: '', fecha_vencimiento: '' }));
+      setCuentaForm(p => ({ ...p, entidad_nombre:'', concepto:'', monto_total:'', notas:'', proveedor_id:'', fecha_vencimiento:'' }));
       setShowCuentaForm(false);
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
       setCuentaError(err instanceof Error ? err.message : 'Error de conexión.');
-    } finally {
-      setSavingCuenta(false);
-    }
+    } finally { setSavingCuenta(false); }
   };
 
   const handlePagarCuenta = async (id: string, esCxC: boolean) => {
     if (savingAction) return;
-
     if (!esCxC) {
       const cuenta = cuentas.find(c => c.id === id);
-      if (cuenta?.categoria_interna === 'REPOSICION_CAJA') {
-        openPagarReposicion(cuenta);
-        return;
-      }
+      if (cuenta?.categoria_interna === 'REPOSICION_CAJA') { openPagarReposicion(cuenta); return; }
     }
-
     setSavingAction(id);
     try {
       if (esCxC) {
         const reg = cuentasCxC.find(c => c.id === id);
         if (!reg) return;
-        const previous = { ...reg };
+        const prev = { ...reg };
         const { error } = await supabase.from('cuentas_por_cobrar').update({
           estatus: 'COBRADO', monto_pagado: reg.monto_total, monto_pendiente: 0,
           horas_compradas: reg.horas_prometidas,
         }).eq('id', id);
         if (error) throw new Error(error.message);
-        const invoiceNumber = `CXC-${id}`;
-        const { data: existingTx } = await supabase.from('transacciones_finanzas').select('id').eq('invoice_number', invoiceNumber).limit(1);
-        if (!existingTx?.length) {
-          const { error: txError } = await supabase.from('transacciones_finanzas').insert([{
+        const inv = `CXC-${id}`;
+        const { data: exists } = await supabase.from('transacciones_finanzas').select('id').eq('invoice_number', inv).limit(1);
+        if (!exists?.length) {
+          const { error: txErr } = await supabase.from('transacciones_finanzas').insert([{
             id: uuid4(), type: 'INCOME', entity_id: reg.student_id, entity_name: reg.nombre_alumno,
-            amount: round2(Number(reg.monto_total) || 0), invoice_number: invoiceNumber,
+            amount: round2(Number(reg.monto_total) || 0), invoice_number: inv,
             description: `COBRO CXC · ${reg.concepto || 'CUENTA POR COBRAR'}`,
             status: 'PAID', category: 'Academia',
             payment_method: normalizePaymentMethod(reg.moneda),
             issue_date: new Date().toISOString(),
           }]);
-          if (txError) {
-            await supabase.from('cuentas_por_cobrar').update({
-              estatus: previous.estatus, monto_pagado: previous.monto_pagado,
-              monto_pendiente: previous.monto_pendiente, horas_compradas: previous.horas_compradas,
-            }).eq('id', id);
-            throw new Error(`No se pudo registrar el ingreso: ${txError.message}`);
+          if (txErr) {
+            await supabase.from('cuentas_por_cobrar').update({ estatus: prev.estatus, monto_pagado: prev.monto_pagado, monto_pendiente: prev.monto_pendiente, horas_compradas: prev.horas_compradas }).eq('id', id);
+            throw new Error(`Ingreso Ledger: ${txErr.message}`);
           }
         }
       } else {
         await supabase.from('cuentas_generales').update({ estatus: 'PAGADO', monto_pendiente: 0 }).eq('id', id);
       }
-      fetchLockRef.current = false;
-      await fetchAll(true);
-    } finally {
-      setSavingAction(null);
-    }
+      fetchLockRef.current = false; await fetchAll(true);
+    } finally { setSavingAction(null); }
   };
 
+  // ─── REQUISICIONES ────────────────────────────────────────────────────────
+
   const handleCreateRequest = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setReqError(null);
+    e.preventDefault(); setReqError(null);
     const num = round2(parseFloat(reqAmount));
     if (!reqItems.trim() || isNaN(num) || num <= 0) { setReqError('Completa el detalle y el costo.'); return; }
     setSavingReq(true);
@@ -1043,8 +1232,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }]);
       if (error) { setReqError(`Error: ${error.message}`); return; }
       setReqItems(''); setReqAmount('');
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } catch (err) {
       setReqError(err instanceof Error ? err.message : 'Error de conexión.');
     } finally { setSavingReq(false); }
@@ -1062,57 +1250,60 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         issue_date: new Date().toISOString(),
       }]);
       await supabase.from('solicitudes_compra').update({ estatus: 'APROBADO', aprobado_por: userRole }).eq('id', reqId);
-      fetchLockRef.current = false;
-      await fetchAll(true);
+      fetchLockRef.current = false; await fetchAll(true);
     } finally { setSavingAction(null); }
   };
 
   // ─── EXPORTS ──────────────────────────────────────────────────────────────
 
-  const handleExportCSV = () => {
-    const rows = transactions.map(t => [fmtDate(t.issueDate), t.invoiceNumber, `"${t.entityName}"`, t.payment_method || 'N/A', t.amount, t.type, t.status]);
-    const csv  = [['Fecha','Ref','Entidad','Metodo','Monto','Tipo','Estatus'].join(','), ...rows.map(r => r.join(','))].join('\n');
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' }));
-    a.download = `FinanzasAguilas_${new Date().toISOString().split('T')[0]}.csv`;
-    a.click();
+  const downloadCSV = (rows: string[][], filename: string) => {
+    const csv = rows.map(r => r.join(',')).join('\n');
+    const a   = document.createElement('a');
+    a.href    = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' }));
+    a.download = filename; a.click();
   };
 
+  const handleExportCSV = () => downloadCSV([
+    ['Fecha','Ref','Entidad','Metodo','Monto','Tipo','Estatus'],
+    ...transactions.map(t => [fmtDate(t.issueDate), t.invoiceNumber, `"${t.entityName}"`, t.payment_method||'N/A', String(t.amount), t.type, t.status]),
+  ], `FinanzasAguilas_${new Date().toISOString().split('T')[0]}.csv`);
+
   const handleExportCajaIndividual = (cajaId: string) => {
-    const caja = cajas.find(c => c.id === cajaId);
-    if (!caja) return;
+    const caja = cajas.find(c => c.id === cajaId); if (!caja) return;
     const movs = movCajas.filter(m => m.caja_id === cajaId);
-    const rows = [`CAJA: ${caja.nombre.toUpperCase()}`, `Exportado: ${new Date().toLocaleDateString('es-VE')}`, '',
-      'Fecha,Tipo,Moneda,Monto,Concepto,Referencia,Por',
+    downloadCSV([
+      [`CAJA: ${caja.nombre.toUpperCase()}`], [`Exportado: ${new Date().toLocaleDateString('es-VE')}`], [],
+      ['Fecha','Tipo','Moneda','Monto','Concepto','Referencia','Por','Subcaja','Préstamo','Prestamista'],
       ...movs.map(m => [fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2),
-        `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.registrado_por||'Sistema'].join(','))];
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8;' }));
-    a.download = `Caja_${caja.nombre.replace(/\s+/g,'_')}_${new Date().toISOString().split('T')[0]}.csv`;
-    a.click();
+        `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.registrado_por||'Sistema',
+        m.subcaja||'—', m.es_prestamo?'SÍ':'NO', m.prestamista||'—']),
+    ], `Caja_${caja.nombre.replace(/\s+/g,'_')}_${new Date().toISOString().split('T')[0]}.csv`);
   };
 
   const handleExportCajasExcel = () => {
-    const all: string[] = [`CAJAS CHICAS · ${new Date().toLocaleDateString('es-VE')}`, ''];
+    const all: string[][] = [[`CAJAS CHICAS · ${new Date().toLocaleDateString('es-VE')}`], []];
     cajas.forEach(caja => {
       const movs = movCajas.filter(m => m.caja_id === caja.id);
-      all.push(`CAJA: ${caja.nombre.toUpperCase()}`, 'Fecha,Tipo,Moneda,Monto,Concepto,Referencia');
+      all.push([`CAJA: ${caja.nombre.toUpperCase()}`], ['Fecha','Tipo','Moneda','Monto','Concepto','Referencia','Subcaja','Prestamista']);
       movs.forEach(m => all.push([fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2),
-        `"${m.concepto||''}"`, `"${m.referencia||''}"`].join(',')));
-      all.push('');
+        `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.subcaja||'—', m.prestamista||'—']));
+      all.push([]);
     });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob(['\ufeff' + all.join('\n')], { type: 'text/csv;charset=utf-8;' }));
-    a.download = `Cajas_${new Date().toISOString().split('T')[0]}.csv`;
-    a.click();
+    downloadCSV(all, `Cajas_${new Date().toISOString().split('T')[0]}.csv`);
   };
+
+  // ─── CAJA EFECTIVO — datos para UI ────────────────────────────────────────
+
+  const cajaEfectivo     = useMemo(() => cajas.find(c => getCajaConfig(c.nombre).esCajaEfectivo), [cajas]);
+  const saldoEfectivoADM = useMemo(() => cajaEfectivo ? getSubcajaBalance(cajaEfectivo.id, 'ADM') : 0, [cajaEfectivo, getSubcajaBalance]);
+  const saldoEfectivoCEO = useMemo(() => cajaEfectivo ? getSubcajaBalance(cajaEfectivo.id, 'CEO') : 0, [cajaEfectivo, getSubcajaBalance]);
 
   // ─── LOADING ──────────────────────────────────────────────────────────────
 
   if (loading) return (
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v13.1...</p>
+      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v14.0...</p>
     </div>
   );
 
@@ -1125,8 +1316,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
           <div>
-            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v13.1</p>
-            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Fix Registro Cajas · Edición/Eliminación: clave del Director</p>
+            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v14.0</p>
+            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">
+              Caja Efectivo ADM/CEO · FX Desk · Préstamos Externos
+            </p>
           </div>
           <button onClick={() => { fetchLockRef.current = false; fetchAll(true); }} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors">
             <RefreshCw size={12} />
@@ -1153,11 +1346,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       </div>
 
-      {/* KPI STRIP BÓVEDAS */}
+      {/* KPI BÓVEDAS */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m => {
-          const ing   = transactions.filter(t=>t.payment_method===m&&t.status==='PAID'&&(t.type==='INCOME'||t.type==='RECEIVABLE')).reduce((a,t)=>round2(a+t.amount),0);
-          const egr   = transactions.filter(t=>t.payment_method===m&&t.status==='PAID'&&(t.type==='EXPENSE'||t.type==='PAYABLE'||t.type==='INSTRUCTOR_PAY')).reduce((a,t)=>round2(a+t.amount),0);
+          const ing   = transactions.filter(t => t.payment_method===m && t.status==='PAID' && (t.type==='INCOME'||t.type==='RECEIVABLE')).reduce((a,t) => round2(a+t.amount), 0);
+          const egr   = transactions.filter(t => t.payment_method===m && t.status==='PAID' && (t.type==='EXPENSE'||t.type==='PAYABLE'||t.type==='INSTRUCTOR_PAY')).reduce((a,t) => round2(a+t.amount), 0);
           const saldo = round2(ing - egr);
           const prefix = m === 'BS' ? 'Bs' : '$';
           const fmt = (n: number) => `${prefix} ${round2(n).toLocaleString('es-VE',{minimumFractionDigits:2})}`;
@@ -1179,6 +1372,49 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           );
         })}
       </div>
+
+      {/* [NEW] CAJA EFECTIVO — PANEL ADM/CEO (visible siempre) */}
+      {cajaEfectivo && (
+        <div className={`${glass} bg-yellow-500/5 border border-yellow-500/20 rounded-2xl p-5`}>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-xl bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
+                <Banknote className="text-yellow-400 h-4 w-4"/>
+              </div>
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-yellow-400">Caja Efectivo — Trazabilidad</p>
+                <p className="text-[8px] text-zinc-600 font-mono">Administración → Custodia CEO</p>
+              </div>
+            </div>
+            <button onClick={() => setEntregaCEOModal(true)}
+              className="bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-yellow-500/20 transition-all flex items-center gap-2">
+              <ArrowLeftRight size={12}/> Entregar a CEO
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="bg-black/30 rounded-xl p-4 border border-yellow-500/10">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-2 h-2 rounded-full bg-blue-400"></div>
+                <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">Stand-By · Administración</p>
+              </div>
+              <p className={`text-xl font-black italic ${saldoEfectivoADM >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                {fmtMonto(saldoEfectivoADM, 'CASH')}
+              </p>
+              <p className="text-[8px] text-zinc-600 font-mono mt-1">Pendiente de entrega a CEO</p>
+            </div>
+            <div className="bg-black/30 rounded-xl p-4 border border-yellow-500/20">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="w-2 h-2 rounded-full bg-yellow-400"></div>
+                <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">Custodia · CEO</p>
+              </div>
+              <p className={`text-xl font-black italic ${saldoEfectivoCEO >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                {fmtMonto(saldoEfectivoCEO, 'CASH')}
+              </p>
+              <p className="text-[8px] text-zinc-600 font-mono mt-1">En caja de los directores</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* KPI CUENTAS */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -1231,6 +1467,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   <option value="INCOME">INGRESO (+)</option>
                   <option value="EXPENSE">EGRESO (-)</option>
                   <option value="INSTRUCTOR_PAY">NÓMINA</option>
+                  <option value="FX_EXCHANGE">FX CAMBIO</option>
                 </select>
                 <select value={ledger.currency} onChange={e=>setLedger(p=>({...p,currency:e.target.value as any}))} className={inp}>
                   <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
@@ -1262,11 +1499,41 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
             <div className="p-6 border-b border-white/5 flex justify-between items-center">
               <h3 className="text-[10px] font-black uppercase tracking-widest italic">Libro Mayor</h3>
-              <button onClick={handleExportCSV} className="bg-[#E1AD01]/10 text-[#E1AD01] px-4 py-2 rounded-xl border border-[#E1AD01]/20 text-[9px] font-black uppercase hover:bg-[#E1AD01] hover:text-black flex items-center gap-2 transition-all">
-                <Download size={11}/> CSV
-              </button>
+              <div className="flex gap-2">
+                <button onClick={() => setFxModalOpen(true)}
+                  className="bg-teal-500/10 text-teal-400 px-4 py-2 rounded-xl border border-teal-500/20 text-[9px] font-black uppercase hover:bg-teal-500/20 flex items-center gap-2 transition-all">
+                  <TrendingUp size={11}/> FX Desk
+                </button>
+                <button onClick={handleExportCSV} className="bg-[#E1AD01]/10 text-[#E1AD01] px-4 py-2 rounded-xl border border-[#E1AD01]/20 text-[9px] font-black uppercase hover:bg-[#E1AD01] hover:text-black flex items-center gap-2 transition-all">
+                  <Download size={11}/> CSV
+                </button>
+              </div>
             </div>
-            <div className="flex-1 overflow-y-auto max-h-[520px] p-4 space-y-2">
+
+            {/* [NEW] FX Registros recientes */}
+            {fxRegistros.length > 0 && (
+              <div className="px-4 pt-4">
+                <p className="text-[8px] text-teal-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1">
+                  <TrendingUp size={10}/> Operaciones FX Recientes
+                </p>
+                <div className="space-y-1 max-h-[120px] overflow-y-auto">
+                  {fxRegistros.slice(0,5).map(fx => (
+                    <div key={fx.id} className="bg-teal-500/5 border border-teal-500/10 p-3 rounded-xl flex justify-between items-center">
+                      <div>
+                        <p className="text-[9px] font-black uppercase text-teal-400">{fx.moneda_origen} → {fx.moneda_destino}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(fx.fecha)} · {fx.concepto}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-[10px] font-black italic text-white">{fmtMonto(fx.monto_origen, fx.moneda_origen)} → {fmtMonto(fx.monto_destino, fx.moneda_destino)}</p>
+                        <p className="text-[8px] text-zinc-600 font-mono">@ {fx.tasa}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto max-h-[400px] p-4 space-y-2 mt-2">
               {transactions.map(t => (
                 <div key={t.id} className="bg-white/[0.02] border border-white/[0.05] p-4 rounded-2xl flex justify-between items-center group hover:bg-white/[0.04] transition-all">
                   <div className="flex-1 min-w-0">
@@ -1279,7 +1546,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     <span className={`font-black text-lg italic ${(t.type==='INCOME'||t.type==='RECEIVABLE')?'text-emerald-400':'text-red-400'}`}>
                       {(t.type==='INCOME'||t.type==='RECEIVABLE')?'+':'-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
                     </span>
-                    {t.status==='PAID'?<CheckCircle2 className="h-4 w-4 text-emerald-500/40 shrink-0"/>:<Loader2 className="h-4 w-4 text-[#E1AD01] animate-spin shrink-0"/>}
+                    <CheckCircle2 className={`h-4 w-4 shrink-0 ${t.status==='PAID'?'text-emerald-500/40':'text-zinc-700'}`}/>
                     <button onClick={()=>openEditTx(t)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
                       <Pencil size={13}/>
                     </button>
@@ -1346,9 +1613,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </div>
                 </div>
               ))}
-              {transactions.filter(t=>t.payment_method===selectedVault).length===0&&(
-                <div className="text-center py-16 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin movimientos en {selectedVault}</p></div>
-              )}
             </div>
           </div>
         </div>
@@ -1359,12 +1623,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         <div className="space-y-6">
           <div className="flex justify-between items-center flex-wrap gap-3">
             <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">
-              {cajas.length} cajas operativas · Selecciona una para registrar movimientos
+              {cajas.length} cajas operativas
             </p>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
+              {/* [NEW] FX Desk */}
+              <button onClick={()=>setFxModalOpen(true)}
+                className="bg-teal-500/10 text-teal-400 border border-teal-500/20 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-teal-500/20 transition-all flex items-center gap-2">
+                <TrendingUp size={13}/> FX Desk
+              </button>
+              {/* [NEW] Préstamo externo */}
+              <button onClick={()=>setPrestamoModal(true)}
+                className="bg-violet-500/10 text-violet-400 border border-violet-500/20 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-violet-500/20 transition-all flex items-center gap-2">
+                <HandCoins size={13}/> Préstamo Externo
+              </button>
               <button onClick={()=>setTransferModalOpen(true)}
                 className="bg-purple-500/10 text-purple-400 border border-purple-500/20 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-purple-500/20 transition-all flex items-center gap-2">
-                <ArrowLeftRight size={13}/> Transferir entre cajas
+                <ArrowLeftRight size={13}/> Transferir
               </button>
               <button onClick={handleExportCajasExcel} className="bg-emerald-500/10 text-emerald-400 px-5 py-3 rounded-xl border border-emerald-500/20 text-[10px] font-black uppercase tracking-widest hover:bg-emerald-500/20 transition-all flex items-center gap-2">
                 <Download size={12}/> Exportar
@@ -1372,53 +1646,104 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
           </div>
 
+          {/* Grid de cajas */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {cajas.map(caja => {
-              const active  = cajaActiva===caja.id;
-              const monedas = (['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>({m,s:getCajaBalance(caja.id,m)})).filter(x=>x.s!==0);
+              const active     = cajaActiva === caja.id;
+              const cajaConf   = getCajaConfig(caja.nombre);
+              const monedas    = cajaConf.monedasPermitidas
+                .map(m => ({ m, s: getCajaBalance(caja.id, m) }))
+                .filter(x => x.s !== 0);
+              const esCajaEfe  = cajaConf.esCajaEfectivo;
+
               return (
                 <button key={caja.id} onClick={()=>setCajaActiva(active?null:caja.id)}
                   className={`${glass} rounded-2xl p-5 text-left border transition-all ${active?'border-[#E1AD01]/50 bg-[#E1AD01]/5':'border-white/[0.07] hover:border-white/20'}`}>
                   <div className="flex justify-between items-center mb-4">
-                    <div className={`w-8 h-8 rounded-xl flex items-center justify-center ${active?'bg-[#E1AD01] text-black':'bg-white/5 text-zinc-600'}`}><Banknote size={15}/></div>
-                    {active&&<span className="text-[7px] text-[#E1AD01] font-black uppercase tracking-widest">Activa</span>}
+                    <div className={`w-8 h-8 rounded-xl flex items-center justify-center ${active?'bg-[#E1AD01] text-black':'bg-white/5 text-zinc-600'}`}>
+                      {esCajaEfe ? <Banknote size={15}/> : <Coins size={15}/>}
+                    </div>
+                    <div className="flex gap-1 flex-wrap justify-end">
+                      {cajaConf.monedasPermitidas.length === 1 && (
+                        <span className={`text-[7px] font-black px-2 py-0.5 rounded-full border ${MONEDA_BG[cajaConf.monedasPermitidas[0]]} ${MONEDA_COLOR[cajaConf.monedasPermitidas[0]]}`}>
+                          {cajaConf.monedasPermitidas[0]} ONLY
+                        </span>
+                      )}
+                      {active && <span className="text-[7px] text-[#E1AD01] font-black uppercase tracking-widest">Activa</span>}
+                    </div>
                   </div>
                   <p className="text-[10px] text-zinc-400 font-black uppercase tracking-widest mb-3">{caja.nombre}</p>
-                  {monedas.length>0?(
+
+                  {/* [NEW] Subcajas para caja efectivo */}
+                  {esCajaEfe ? (
                     <div className="space-y-1.5">
-                      {monedas.map(({m,s})=>(
+                      <div className="flex justify-between items-center">
+                        <span className="text-[8px] text-blue-400 font-black uppercase flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-blue-400"/> ADM</span>
+                        <span className={`text-[9px] font-black italic ${saldoEfectivoADM>=0?'text-yellow-400':'text-red-400'}`}>{fmtMonto(saldoEfectivoADM,'CASH')}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[8px] text-yellow-400 font-black uppercase flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-yellow-400"/> CEO</span>
+                        <span className={`text-[9px] font-black italic ${saldoEfectivoCEO>=0?'text-yellow-400':'text-red-400'}`}>{fmtMonto(saldoEfectivoCEO,'CASH')}</span>
+                      </div>
+                    </div>
+                  ) : monedas.length > 0 ? (
+                    <div className="space-y-1.5">
+                      {monedas.map(({m,s}) => (
                         <div key={m} className="flex justify-between items-center">
                           <span className={`text-[8px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
                           <span className={`text-[10px] font-black italic ${s>=0?MONEDA_COLOR[m]:'text-red-400'}`}>{fmtMonto(s,m)}</span>
                         </div>
                       ))}
                     </div>
-                  ):<p className="text-[9px] text-zinc-700 font-mono italic">Sin movimientos</p>}
+                  ) : (
+                    <p className="text-[9px] text-zinc-700 font-mono italic">Sin movimientos</p>
+                  )}
                 </button>
               );
             })}
           </div>
 
-          {cajaActiva&&(()=>{
-            const caja = cajas.find(c=>c.id===cajaActiva)!;
-            const movs = movCajas.filter(m=>m.caja_id===cajaActiva);
+          {/* Panel de movimientos de caja activa */}
+          {cajaActiva && (() => {
+            const caja      = cajas.find(c => c.id === cajaActiva)!;
+            const cajaConf  = getCajaConfig(caja.nombre);
+            const movs      = movCajas.filter(m => m.caja_id === cajaActiva);
+            const esCajaEfe = cajaConf.esCajaEfectivo;
             return (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 <div className={`lg:col-span-4 ${glass} rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
-                  <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic">Caja: <span className="text-[#E1AD01]">{caja.nombre}</span></h3>
+                  <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic">
+                    Caja: <span className="text-[#E1AD01]">{caja.nombre}</span>
+                  </h3>
                   <form onSubmit={handleMovCaja} className="space-y-4">
                     <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10">
-                      {(['ENTRADA','SALIDA'] as const).map(tipo=>(
+                      {(['ENTRADA','SALIDA'] as const).map(tipo => (
                         <button key={tipo} type="button" onClick={()=>setMovForm(p=>({...p,tipo}))}
                           className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${movForm.tipo===tipo?(tipo==='ENTRADA'?'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30':'bg-red-500/20 text-red-400 border border-red-500/30'):'text-zinc-600 hover:text-zinc-400'}`}>
                           {tipo==='ENTRADA'?'+ Entrada':'- Salida'}
                         </button>
                       ))}
                     </div>
+
+                    {/* [NEW] Selector de subcaja para caja efectivo */}
+                    {esCajaEfe && (
+                      <div>
+                        <label className="text-[8px] text-zinc-600 font-black uppercase tracking-widest block mb-2">Registrar en</label>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {(['ADM','CEO'] as SubcajaEfectivo[]).map(sc => (
+                            <button key={sc} type="button" onClick={()=>setMovForm(p=>({...p,subcaja:sc}))}
+                              className={`py-3 rounded-xl text-[10px] font-black uppercase border transition-all ${movForm.subcaja===sc?'bg-yellow-500/20 text-yellow-400 border-yellow-500/30':'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                              {sc==='ADM'?'📋 Administración':'🔐 CEO'}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     <div>
                       <label className="text-[8px] text-zinc-600 font-black uppercase tracking-widest block mb-2">Moneda</label>
                       <div className="grid grid-cols-4 gap-1.5">
-                        {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                        {cajaConf.monedasPermitidas.map(m => (
                           <button key={m} type="button" onClick={()=>setMovForm(p=>({...p,moneda:m}))}
                             className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${movForm.moneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
                             {m}
@@ -1426,6 +1751,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         ))}
                       </div>
                     </div>
+
                     <input type="date" required value={movForm.fecha} onChange={e=>setMovForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}} disabled={savingCaja}/>
                     <div className="relative">
                       <span className="absolute left-5 top-1/2 -translate-y-1/2 font-black text-xl" style={{color:'#E1AD01'}}>{movForm.moneda==='BS'?'Bs':'$'}</span>
@@ -1444,6 +1770,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </button>
                   </form>
                 </div>
+
                 <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
                   <div className="p-6 border-b border-white/5">
                     <div className="flex justify-between items-center mb-3">
@@ -1452,36 +1779,56 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <Download size={10}/> Exportar
                       </button>
                     </div>
-                    <div className="flex gap-3 flex-wrap">
-                      {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>{
-                        const s=getCajaBalance(cajaActiva!,m); const hasMov=movs.some(mv=>mv.moneda===m); if(!hasMov)return null;
-                        return(
-                          <div key={m} className={`px-3 py-1.5 rounded-xl border ${MONEDA_BG[m]} flex items-center gap-2`}>
-                            <span className={`text-[8px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
-                            <span className={`text-[10px] font-black italic ${s>=0?MONEDA_COLOR[m]:'text-red-400'}`}>{fmtMonto(s,m)}</span>
+                    <div className="flex gap-2 flex-wrap">
+                      {esCajaEfe ? (
+                        <>
+                          <div className={`px-3 py-1.5 rounded-xl border bg-blue-500/10 border-blue-500/20 flex items-center gap-2`}>
+                            <div className="w-1.5 h-1.5 rounded-full bg-blue-400"/>
+                            <span className="text-[8px] font-black uppercase text-blue-400">ADM</span>
+                            <span className={`text-[10px] font-black italic ${saldoEfectivoADM>=0?'text-yellow-400':'text-red-400'}`}>{fmtMonto(saldoEfectivoADM,'CASH')}</span>
                           </div>
-                        );
-                      })}
+                          <div className={`px-3 py-1.5 rounded-xl border bg-yellow-500/10 border-yellow-500/20 flex items-center gap-2`}>
+                            <div className="w-1.5 h-1.5 rounded-full bg-yellow-400"/>
+                            <span className="text-[8px] font-black uppercase text-yellow-400">CEO</span>
+                            <span className={`text-[10px] font-black italic ${saldoEfectivoCEO>=0?'text-yellow-400':'text-red-400'}`}>{fmtMonto(saldoEfectivoCEO,'CASH')}</span>
+                          </div>
+                        </>
+                      ) : (
+                        cajaConf.monedasPermitidas.map(m => {
+                          const s = getCajaBalance(cajaActiva!, m);
+                          const hasMov = movs.some(mv => mv.moneda === m);
+                          if (!hasMov) return null;
+                          return (
+                            <div key={m} className={`px-3 py-1.5 rounded-xl border ${MONEDA_BG[m]} flex items-center gap-2`}>
+                              <span className={`text-[8px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
+                              <span className={`text-[10px] font-black italic ${s>=0?MONEDA_COLOR[m]:'text-red-400'}`}>{fmtMonto(s,m)}</span>
+                            </div>
+                          );
+                        })
+                      )}
                     </div>
                   </div>
                   <div className="flex-1 overflow-y-auto max-h-[400px] p-4 space-y-2">
-                    {movs.map(m=>(
-                      <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${m.transfer_id?'border-purple-500/20':'border-white/[0.05]'}`}>
+                    {movs.map(m => (
+                      <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${m.transfer_id?'border-purple-500/20':m.es_prestamo?'border-violet-500/20':m.fx_id?'border-teal-500/20':'border-white/[0.05]'}`}>
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                             <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full border ${MONEDA_BG[m.moneda]} ${MONEDA_COLOR[m.moneda]}`}>{m.moneda}</span>
-                            {m.transfer_id && (
-                              <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center gap-1">
-                                <ArrowLeftRight size={8}/> Transferencia
+                            {m.subcaja && (
+                              <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full border ${m.subcaja==='CEO'?'bg-yellow-500/10 text-yellow-400 border-yellow-500/20':'bg-blue-500/10 text-blue-400 border-blue-500/20'}`}>
+                                {m.subcaja}
                               </span>
                             )}
+                            {m.transfer_id && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center gap-1"><ArrowLeftRight size={8}/> Transferencia</span>}
+                            {m.es_prestamo && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-violet-500/10 text-violet-400 border border-violet-500/20 flex items-center gap-1"><HandCoins size={8}/> {m.prestamista}</span>}
+                            {m.fx_id && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/20 flex items-center gap-1"><TrendingUp size={8}/> FX</span>}
                             <p className="text-[10px] font-black uppercase truncate">{m.concepto||'—'}</p>
                           </div>
                           <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(m.fecha)}{m.referencia?` · ${m.referencia}`:''}</p>
                         </div>
                         <div className="flex items-center gap-3 ml-3">
                           <span className={`font-black text-base italic ${m.tipo==='ENTRADA'?'text-emerald-400':'text-red-400'}`}>{m.tipo==='ENTRADA'?'+':'-'}{fmtMonto(m.monto,m.moneda)}</span>
-                          {!m.transfer_id && (
+                          {!m.transfer_id && !m.fx_id && (
                             <button onClick={()=>openEditMov(m)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
                               <Pencil size={13}/>
                             </button>
@@ -1493,8 +1840,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         </div>
                       </div>
                     ))}
-                    {movs.length===0&&(
-                      <div className="text-center py-16 text-zinc-700"><Banknote className="h-8 w-8 mx-auto mb-3 opacity-20"/><p className="text-[9px] font-black uppercase tracking-widest">Sin movimientos en esta caja</p></div>
+                    {movs.length===0 && (
+                      <div className="text-center py-16 text-zinc-700">
+                        <Banknote className="h-8 w-8 mx-auto mb-3 opacity-20"/>
+                        <p className="text-[9px] font-black uppercase tracking-widest">Sin movimientos en esta caja</p>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -1608,14 +1958,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
-            {/* Card 1: Por Cobrar */}
+            {/* CxC Pendientes */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-yellow-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
                   <ArrowUpCircle className="text-yellow-400 h-4 w-4"/> Por Cobrar
                   <span className="ml-auto font-mono text-yellow-400 text-[9px]">${totalCxC.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Alumnos que deben</p>
               </div>
               <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                 {cxcPendientes.map(c=>(
@@ -1626,9 +1975,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
                         <p className="text-[8px] text-yellow-400/70 font-mono mt-0.5">{c.horas_prometidas}h · {c.moneda||'USD'}</p>
                       </div>
-                      <div className="text-right ml-2">
-                        <p className="font-black italic text-sm text-yellow-400">${c.monto_pendiente.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
-                      </div>
+                      <p className="font-black italic text-sm text-yellow-400 ml-2">${c.monto_pendiente.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
                     </div>
                     <div className="flex gap-2 mt-3">
                       <button onClick={()=>handlePagarCuenta(c.id,true)} disabled={savingAction===c.id}
@@ -1642,18 +1989,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </div>
                   </div>
                 ))}
-                {cxcPendientes.length===0&&(<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin deudas pendientes</p></div>)}
+                {cxcPendientes.length===0&&<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin deudas pendientes</p></div>}
               </div>
             </div>
 
-            {/* Card 2: Horas Pagadas */}
+            {/* Horas Pagadas */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-emerald-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
                   <Plane className="text-emerald-400 h-4 w-4"/> Horas Pagadas
                   <span className="ml-auto font-mono text-emerald-400 text-[9px]">{totalHorasAcred.toFixed(1)}h</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Horas acreditadas al alumno</p>
               </div>
               <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                 {horasPagadas.map(c=>(
@@ -1663,12 +2009,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         <p className="text-[10px] font-black uppercase truncate">{c.nombre_alumno}</p>
                         <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
                         <p className="text-[8px] text-emerald-400 font-mono mt-0.5 flex items-center gap-1">
-                          <CheckCircle2 size={9}/> {c.horas_compradas}h · {c.moneda||'USD'}
+                          <CheckCircle2 size={9}/> {c.horas_compradas}h
                         </p>
                       </div>
-                      <div className="text-right ml-2">
-                        <p className="font-black italic text-sm text-emerald-400">${c.monto_total.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
-                      </div>
+                      <p className="font-black italic text-sm text-emerald-400 ml-2">${c.monto_total.toLocaleString('es-VE',{minimumFractionDigits:2})}</p>
                     </div>
                     <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
                       <button onClick={()=>deleteCuentaProtected(c.id,true)} disabled={savingAction===c.id}
@@ -1678,18 +2022,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </div>
                   </div>
                 ))}
-                {horasPagadas.length===0&&(<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin horas pagadas</p></div>)}
+                {horasPagadas.length===0&&<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin horas pagadas</p></div>}
               </div>
             </div>
 
-            {/* Card 3: Por Pagar Proveedores */}
+            {/* CxP Proveedores */}
             <div className={`${glass} rounded-3xl overflow-hidden`}>
               <div className="p-5 border-b border-white/5 bg-orange-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
                   <ArrowDownCircle className="text-orange-400 h-4 w-4"/> Por Pagar
                   <span className="ml-auto font-mono text-orange-400 text-[9px]">${totalCxP.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Proveedores y gastos externos</p>
               </div>
               <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                 {cuentasProveedores.map(c=>(
@@ -1719,37 +2062,33 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     )}
                   </div>
                 ))}
-                {cuentasProveedores.length===0&&(<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por pagar</p></div>)}
+                {cuentasProveedores.length===0&&<div className="text-center py-12 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin cuentas por pagar</p></div>}
               </div>
             </div>
 
-            {/* Card 4: Reposiciones Internas */}
+            {/* Reposiciones Internas */}
             <div className={`${glass} rounded-3xl overflow-hidden border-purple-500/10`}>
               <div className="p-5 border-b border-white/5 bg-purple-500/5">
                 <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
                   <ArrowLeftRight className="text-purple-400 h-4 w-4"/> Reposiciones
                   <span className="ml-auto font-mono text-purple-400 text-[9px]">${totalReposiciones.toLocaleString('es-VE',{minimumFractionDigits:2})}</span>
                 </h3>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">Transferencias entre cajas pendientes de reponer</p>
               </div>
               <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                 {cuentasReposiciones.map(c=>{
                   const salida  = movCajas.find(m => m.transfer_id === c.transfer_id && m.transfer_role === 'SALIDA');
                   const entrada = movCajas.find(m => m.transfer_id === c.transfer_id && m.transfer_role === 'ENTRADA');
-                  const cajaOrig = cajas.find(x => x.id === salida?.caja_id);
-                  const cajaDest = cajas.find(x => x.id === entrada?.caja_id);
                   return (
                     <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all ${c.estatus==='PAGADO'?'border-emerald-500/10 opacity-60':'border-purple-500/10 hover:bg-white/[0.04]'}`}>
                       <div className="flex justify-between items-start mb-2">
                         <div className="flex-1 min-w-0">
                           <p className="text-[10px] font-black uppercase truncate">{c.entidad_nombre}</p>
-                          {cajaOrig && cajaDest && (
+                          {salida && entrada && (
                             <p className="text-[8px] text-purple-400/80 font-mono flex items-center gap-1 mt-0.5">
-                              {cajaOrig.nombre} <ArrowLeftRight size={8}/> {cajaDest.nombre}
+                              {cajas.find(x=>x.id===salida.caja_id)?.nombre} <ArrowLeftRight size={8}/> {cajas.find(x=>x.id===entrada.caja_id)?.nombre}
                             </p>
                           )}
                           <p className="text-[8px] text-zinc-600 font-mono truncate mt-0.5">{c.concepto}</p>
-                          <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(c.fecha_emision)}</p>
                         </div>
                         <div className="text-right ml-2">
                           <p className={`font-black italic text-sm ${c.estatus==='PAGADO'?'text-emerald-400':'text-purple-400'}`}>{fmtMonto(c.monto_pendiente,c.moneda)}</p>
@@ -1776,8 +2115,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 {cuentasReposiciones.length===0&&(
                   <div className="text-center py-12 text-zinc-700">
                     <ArrowLeftRight className="h-8 w-8 mx-auto mb-3 opacity-20"/>
-                    <p className="text-[9px] font-black uppercase tracking-widest">Sin transferencias entre cajas</p>
-                    <p className="text-[8px] text-zinc-800 font-mono mt-1">Usa "Transferir entre cajas" en el tab Cajas</p>
+                    <p className="text-[9px] font-black uppercase tracking-widest">Sin reposiciones</p>
                   </div>
                 )}
               </div>
@@ -1796,7 +2134,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <form onSubmit={handleCreateRequest} className="space-y-4">
               <textarea required value={reqItems} onChange={e=>setReqItems(e.target.value)} rows={3}
                 className="w-full bg-black/50 border border-white/10 p-5 rounded-2xl text-xs font-mono outline-none focus:border-[#E1AD01] text-white uppercase placeholder:text-white/20 resize-none"
-                placeholder="DETALLE OPERATIVO DE LA REQUISICIÓN..." disabled={savingReq}/>
+                placeholder="DETALLE OPERATIVO..." disabled={savingReq}/>
               <div className="grid grid-cols-2 gap-3">
                 <input type="number" step="0.01" min="0.01" required value={reqAmount} onChange={e=>setReqAmount(e.target.value)} placeholder="COSTO ESTIMADO ($)" className={inp} disabled={savingReq}/>
                 <select value={reqPriority} onChange={e=>setReqPriority(e.target.value)} className={inp} disabled={savingReq}>
@@ -1844,14 +2182,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </div>
                 );
               })}
-              {requests.length===0&&(<div className="text-center py-16 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin requisiciones</p></div>)}
+              {requests.length===0&&<div className="text-center py-16 text-zinc-700"><p className="text-[9px] font-black uppercase tracking-widest">Sin requisiciones</p></div>}
             </div>
           </div>
         </div>
       )}
 
       {/* ══ TAB: CIERRE ═════════════════════════════════════════════════════ */}
-      {activeTab === 'CLOSING' && (()=>{
+      {activeTab === 'CLOSING' && (() => {
         const METODOS: { m: PaymentMethod; label: string; prefix: string }[] = [
           { m:'USDT',  label:'USDT (Crypto)',  prefix:'$'  },
           { m:'ZELLE', label:'Zelle (USD)',     prefix:'$'  },
@@ -1859,17 +2197,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           { m:'BS',    label:'Bolívares',       prefix:'Bs' },
         ];
         const handleCierre = () => {
-          const disc: string[]=[];
-          METODOS.forEach(({m,label,prefix})=>{
-            const teorico=getVaultBalance(m);
-            const fisico=round2(parseFloat(physBalances[m])||0);
-            const diff=round2(Math.abs(teorico-fisico));
-            if(diff>0.01) disc.push(`${label}: ${prefix} ${diff.toFixed(2)} de diferencia`);
+          const disc: string[] = [];
+          METODOS.forEach(({m,label,prefix}) => {
+            const teorico = getVaultBalance(m);
+            const fisico  = round2(parseFloat(physBalances[m])||0);
+            const diff    = round2(Math.abs(teorico - fisico));
+            if (diff > 0.01) disc.push(`${label}: ${prefix} ${diff.toFixed(2)} de diferencia`);
           });
-          if(disc.length>0) alert('⚠️ DISCREPANCIAS DETECTADAS:\n\n'+disc.join('\n'));
-          else{alert('✓ CIERRE CERTIFICADO\nTodos los métodos cuadran.');setPhysBalances({USDT:'',ZELLE:'',CASH:'',BS:''});}
+          if (disc.length > 0) alert('⚠️ DISCREPANCIAS:\n\n' + disc.join('\n'));
+          else { alert('✓ CIERRE CERTIFICADO — Todos los métodos cuadran.'); setPhysBalances({USDT:'',ZELLE:'',CASH:'',BS:''}); }
         };
-        return(
+        return (
           <div className="space-y-6">
             <div className={`${glass} rounded-2xl p-5 flex items-center justify-between`}>
               <div>
@@ -1888,18 +2226,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <Lock className="text-[#E1AD01] h-5 w-5"/> Cierre Multi-Moneda
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                {METODOS.map(({m,label,prefix})=>{
-                  const teorico=getVaultBalance(m);
-                  const fisico=round2(parseFloat(physBalances[m])||0);
-                  const diff=physBalances[m]!==''?round2(teorico-fisico):null;
-                  const cuadra=diff!==null&&Math.abs(diff)<=0.01;
-                  const descuadra=diff!==null&&Math.abs(diff)>0.01;
-                  return(
+                {METODOS.map(({m,label,prefix}) => {
+                  const teorico  = getVaultBalance(m);
+                  const fisico   = round2(parseFloat(physBalances[m])||0);
+                  const diff     = physBalances[m] !== '' ? round2(teorico - fisico) : null;
+                  const cuadra   = diff !== null && Math.abs(diff) <= 0.01;
+                  const descuadra= diff !== null && Math.abs(diff) > 0.01;
+                  return (
                     <div key={m} className={`rounded-2xl border p-5 space-y-4 transition-all ${cuadra?'bg-emerald-500/5 border-emerald-500/20':descuadra?'bg-red-500/5 border-red-500/20':MONEDA_BG[m]}`}>
                       <div className="flex items-center justify-between">
                         <span className={`text-[10px] font-black uppercase tracking-widest ${MONEDA_COLOR[m]}`}>{label}</span>
-                        {cuadra&&<span className="text-[8px] font-black text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded-full uppercase tracking-widest flex items-center gap-1"><CheckCircle2 size={10}/> Cuadrado</span>}
-                        {descuadra&&<span className="text-[8px] font-black text-red-400 bg-red-500/10 px-2 py-1 rounded-full uppercase tracking-widest flex items-center gap-1">⚠ Dif. {prefix} {Math.abs(diff!).toFixed(2)}</span>}
+                        {cuadra    && <span className="text-[8px] font-black text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded-full uppercase flex items-center gap-1"><CheckCircle2 size={10}/> Cuadrado</span>}
+                        {descuadra && <span className="text-[8px] font-black text-red-400 bg-red-500/10 px-2 py-1 rounded-full uppercase">⚠ Dif. {prefix} {Math.abs(diff!).toFixed(2)}</span>}
                       </div>
                       <div className="bg-black/30 rounded-xl p-4 text-center">
                         <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Saldo Teórico</p>
@@ -1928,7 +2266,251 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         );
       })()}
 
-      {/* ══ MODAL: TRANSFERENCIA ENTRE CAJAS ═══════════════════════════════ */}
+      {/* ══ MODALES ══════════════════════════════════════════════════════════ */}
+
+      {/* ── [NEW] MODAL: ENTREGA ADM → CEO ───────────────────────────────── */}
+      {entregaCEOModal && (
+        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-yellow-500`}>
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
+                  <ArrowLeftRight className="text-yellow-400 h-5 w-5"/>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-black uppercase tracking-widest">Entrega Efectivo a CEO</h3>
+                  <p className="text-[8px] text-zinc-600 mt-1">Sale de ADM → Entra a CEO</p>
+                </div>
+              </div>
+              <button onClick={()=>setEntregaCEOModal(false)} className="text-zinc-600 hover:text-white"><X size={18}/></button>
+            </div>
+            <div className="grid grid-cols-2 gap-4 bg-black/30 rounded-xl p-4 mb-4">
+              <div className="text-center">
+                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Stand-By ADM</p>
+                <p className={`font-black italic ${saldoEfectivoADM>=0?'text-yellow-400':'text-red-400'}`}>{fmtMonto(saldoEfectivoADM,'CASH')}</p>
+              </div>
+              <div className="text-center">
+                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Custodia CEO</p>
+                <p className="text-yellow-400 font-black italic">{fmtMonto(saldoEfectivoCEO,'CASH')}</p>
+              </div>
+            </div>
+            <form onSubmit={handleEntregaCEO} className="space-y-4">
+              <input type="date" required value={entregaCEOForm.fecha} onChange={e=>setEntregaCEOForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
+              <div className="relative">
+                <span className="absolute left-5 top-1/2 -translate-y-1/2 text-yellow-400 font-black text-xl">$</span>
+                <input type="number" step="0.01" min="0.01" required value={entregaCEOForm.monto}
+                  onChange={e=>setEntregaCEOForm(p=>({...p,monto:e.target.value}))}
+                  className="w-full bg-white/5 border border-white/10 py-6 pl-14 pr-6 rounded-2xl text-2xl font-black italic outline-none focus:border-yellow-500 text-white"
+                  placeholder="0.00" disabled={savingCaja}/>
+              </div>
+              <input required value={entregaCEOForm.concepto} onChange={e=>setEntregaCEOForm(p=>({...p,concepto:e.target.value}))}
+                placeholder="CONCEPTO (ej: COBRO PAQUETE 10H - CARLOS PÉREZ)" className={inp} disabled={savingCaja}/>
+              <div className="flex gap-3">
+                <button type="button" onClick={()=>setEntregaCEOModal(false)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
+                <button type="submit" disabled={savingCaja} className="flex-[2] py-4 bg-yellow-500 text-black rounded-2xl text-[10px] font-black uppercase hover:bg-yellow-400 disabled:opacity-40 flex items-center justify-center gap-2">
+                  {savingCaja?<Loader2 className="animate-spin h-4 w-4"/>:<><ArrowLeftRight size={14}/> Confirmar Entrega</>}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── [NEW] MODAL: FX DESK ─────────────────────────────────────────── */}
+      {fxModalOpen && (
+        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-lg rounded-3xl p-7 border-t-2 border-t-teal-500`}>
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
+                  <TrendingUp className="text-teal-400 h-5 w-5"/>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-black uppercase tracking-widest">FX Desk — Cambio de Moneda</h3>
+                  <p className="text-[8px] text-zinc-600 mt-1">Trazabilidad de conversión USDT/ZELLE/CASH → BS</p>
+                </div>
+              </div>
+              <button onClick={()=>{setFxModalOpen(false);setFxError(null);}} className="text-zinc-600 hover:text-white"><X size={18}/></button>
+            </div>
+            <form onSubmit={handleFX} className="space-y-4">
+              {/* Selector de monedas */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Moneda Origen (vendo)</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                      <button key={m} type="button" onClick={()=>setFxForm(p=>({...p,moneda_origen:m}))}
+                        className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${fxForm.moneda_origen===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Moneda Destino (recibo)</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                      <button key={m} type="button" onClick={()=>setFxForm(p=>({...p,moneda_destino:m}))}
+                        className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${fxForm.moneda_destino===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Caja de operación */}
+              <div>
+                <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Caja donde se registra la operación</label>
+                <select required value={fxForm.caja_id} onChange={e=>setFxForm(p=>({...p,caja_id:e.target.value}))} className={inp}>
+                  <option value="">— CAJA —</option>
+                  {cajas.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+                </select>
+              </div>
+
+              {/* Montos y tasa */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">
+                    Monto {fxForm.moneda_origen}
+                  </label>
+                  <div className="relative">
+                    <span className={`absolute left-4 top-1/2 -translate-y-1/2 font-black ${MONEDA_COLOR[fxForm.moneda_origen]}`}>{fxForm.moneda_origen==='BS'?'Bs':'$'}</span>
+                    <input type="number" step="0.01" min="0.01" required value={fxForm.monto_origen}
+                      onChange={e=>setFxForm(p=>({...p,monto_origen:e.target.value}))}
+                      className="w-full bg-black/50 border border-white/10 py-4 pl-10 pr-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white"
+                      placeholder="0.00"/>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Tasa de Cambio</label>
+                  <input type="number" step="0.01" min="0.01" required value={fxForm.tasa}
+                    onChange={e=>setFxForm(p=>({...p,tasa:e.target.value}))}
+                    className="w-full bg-black/50 border border-white/10 py-4 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white"
+                    placeholder={String(DEFAULT_TASA_BS)}/>
+                </div>
+              </div>
+
+              {/* Preview del monto destino */}
+              {fxMontoDestino !== null && (
+                <div className="bg-teal-500/5 border border-teal-500/20 rounded-2xl p-4 flex items-center justify-between">
+                  <p className="text-[9px] text-teal-400 font-black uppercase tracking-widest">Recibirás</p>
+                  <p className={`text-xl font-black italic ${MONEDA_COLOR[fxForm.moneda_destino]}`}>
+                    {fmtMonto(fxMontoDestino, fxForm.moneda_destino)}
+                  </p>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-4">
+                <input required value={fxForm.concepto} onChange={e=>setFxForm(p=>({...p,concepto:e.target.value}))}
+                  placeholder="CONCEPTO (ej: NÓMINA INSTRUCTORES)" className={inp}/>
+                <input type="date" required value={fxForm.fecha} onChange={e=>setFxForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
+              </div>
+
+              <ErrorBanner msg={fxError} onClose={()=>setFxError(null)}/>
+              <div className="flex gap-3">
+                <button type="button" onClick={()=>{setFxModalOpen(false);setFxError(null);}} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
+                <button type="submit" disabled={savingFX} className="flex-[2] py-4 bg-teal-500 text-black rounded-2xl text-[10px] font-black uppercase hover:bg-teal-400 disabled:opacity-40 flex items-center justify-center gap-2">
+                  {savingFX?<Loader2 className="animate-spin h-4 w-4"/>:<><TrendingUp size={14}/> Ejecutar Cambio</>}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── [NEW] MODAL: PRÉSTAMO EXTERNO ────────────────────────────────── */}
+      {prestamoModal && (
+        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-violet-500`}>
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-violet-500/10 border border-violet-500/20 flex items-center justify-center">
+                  <HandCoins className="text-violet-400 h-5 w-5"/>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-black uppercase tracking-widest">Préstamo Externo</h3>
+                  <p className="text-[8px] text-zinc-600 mt-1">Becquer / Roberto ↔ Águilas</p>
+                </div>
+              </div>
+              <button onClick={()=>setPrestamoModal(false)} className="text-zinc-600 hover:text-white"><X size={18}/></button>
+            </div>
+            <form onSubmit={handlePrestamo} className="space-y-4">
+              {/* Dirección: préstamo o devolución */}
+              <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10">
+                <button type="button" onClick={()=>setPrestamoForm(p=>({...p,es_devolucion:false}))}
+                  className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${!prestamoForm.es_devolucion?'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30':'text-zinc-600 hover:text-zinc-400'}`}>
+                  + Préstamo a Águilas
+                </button>
+                <button type="button" onClick={()=>setPrestamoForm(p=>({...p,es_devolucion:true}))}
+                  className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${prestamoForm.es_devolucion?'bg-red-500/20 text-red-400 border border-red-500/30':'text-zinc-600 hover:text-zinc-400'}`}>
+                  - Devolución
+                </button>
+              </div>
+
+              {/* Prestamista */}
+              <div>
+                <label className="text-[9px] text-violet-400 font-black uppercase tracking-widest block mb-2">Prestamista</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {(['BECQUER','ROBERTO'] as Prestamista[]).map(p=>(
+                    <button key={p} type="button" onClick={()=>setPrestamoForm(prev=>({...prev,prestamista:p}))}
+                      className={`py-3 rounded-xl text-[10px] font-black uppercase border transition-all ${prestamoForm.prestamista===p?'bg-violet-500/20 text-violet-400 border-violet-500/30':'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                      {p}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Caja receptora */}
+              <select required value={prestamoForm.caja_id} onChange={e=>setPrestamoForm(p=>({...p,caja_id:e.target.value}))} className={inp}>
+                <option value="">— CAJA RECEPTORA —</option>
+                {cajas.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+              </select>
+
+              {/* Moneda */}
+              <div className="grid grid-cols-4 gap-2">
+                {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                  <button key={m} type="button" onClick={()=>setPrestamoForm(p=>({...p,moneda:m}))}
+                    className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${prestamoForm.moneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                    {m}
+                  </button>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-violet-400 font-black text-xl">{prestamoForm.moneda==='BS'?'Bs':'$'}</span>
+                  <input type="number" step="0.01" min="0.01" required value={prestamoForm.monto}
+                    onChange={e=>setPrestamoForm(p=>({...p,monto:e.target.value}))}
+                    className="w-full bg-white/5 border border-white/10 py-5 pl-12 pr-4 rounded-2xl text-xl font-black italic outline-none focus:border-violet-500 text-white"
+                    placeholder="0.00"/>
+                </div>
+                <input type="date" required value={prestamoForm.fecha} onChange={e=>setPrestamoForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
+              </div>
+
+              <input required value={prestamoForm.concepto} onChange={e=>setPrestamoForm(p=>({...p,concepto:e.target.value}))}
+                placeholder="CONCEPTO DEL PRÉSTAMO" className={inp}/>
+
+              {!prestamoForm.es_devolucion && (
+                <div className="bg-violet-500/5 border border-violet-500/20 rounded-xl p-3">
+                  <p className="text-[9px] text-violet-400 font-mono">
+                    ℹ Se generará automáticamente una CxP de devolución para {prestamoForm.prestamista}.
+                  </p>
+                </div>
+              )}
+
+              <div className="flex gap-3">
+                <button type="button" onClick={()=>setPrestamoModal(false)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
+                <button type="submit" disabled={savingCaja} className="flex-[2] py-4 bg-violet-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-violet-400 disabled:opacity-40 flex items-center justify-center gap-2">
+                  {savingCaja?<Loader2 className="animate-spin h-4 w-4"/>:<><HandCoins size={14}/> {prestamoForm.es_devolucion?'Registrar Devolución':'Registrar Préstamo'}</>}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL: TRANSFERENCIA ENTRE CAJAS ─────────────────────────────── */}
       {transferModalOpen && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-purple-500`}>
@@ -1939,7 +2521,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </div>
                 <div>
                   <h3 className="text-[11px] font-black uppercase tracking-widest">Transferir entre Cajas</h3>
-                  <p className="text-[8px] text-zinc-600 mt-1">Se generará una CxP de reposición automáticamente</p>
+                  <p className="text-[8px] text-zinc-600 mt-1">Genera CxP de reposición automáticamente</p>
                 </div>
               </div>
               <button onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="text-zinc-600 hover:text-white"><X size={18}/></button>
@@ -1962,7 +2544,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">Caja Destino</label>
                   <select required value={transferForm.caja_destino_id} onChange={e=>setTransferForm(p=>({...p,caja_destino_id:e.target.value}))} className={inp} disabled={savingTransfer}>
                     <option value="">— A —</option>
-                    {cajas.filter(c => c.id !== transferForm.caja_origen_id).map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+                    {cajas.filter(c=>c.id!==transferForm.caja_origen_id).map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
                   </select>
                 </div>
               </div>
@@ -1988,22 +2570,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <input type="date" required value={transferForm.fecha} onChange={e=>setTransferForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}} disabled={savingTransfer}/>
               </div>
               <input required value={transferForm.concepto} onChange={e=>setTransferForm(p=>({...p,concepto:e.target.value}))}
-                placeholder="CONCEPTO (ej: COMBUSTIBLE, PAGO NÓMINA URGENTE)" className={inp} disabled={savingTransfer}/>
-              <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4">
-                <p className="text-[9px] text-purple-400 font-black uppercase tracking-widest mb-2 flex items-center gap-2">
-                  <AlertTriangle size={12}/> Al confirmar se generarán 3 asientos vinculados:
-                </p>
-                <ol className="text-[9px] text-purple-300/70 font-mono space-y-1 pl-4">
-                  <li>1. Salida de caja origen ({cajas.find(c=>c.id===transferForm.caja_origen_id)?.nombre || '...'})</li>
-                  <li>2. Entrada a caja destino ({cajas.find(c=>c.id===transferForm.caja_destino_id)?.nombre || '...'})</li>
-                  <li>3. CxP de reposición (Águilas debe reponer a caja origen)</li>
-                </ol>
-              </div>
+                placeholder="CONCEPTO" className={inp} disabled={savingTransfer}/>
               <ErrorBanner msg={transferError} onClose={()=>setTransferError(null)}/>
               <div className="flex gap-3">
                 <button type="button" onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
                 <button type="submit" disabled={savingTransfer} className="flex-[2] py-4 bg-purple-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-purple-400 disabled:opacity-40 flex items-center justify-center gap-2">
-                  {savingTransfer?<Loader2 className="animate-spin h-4 w-4"/>:<><ArrowLeftRight size={14}/> Ejecutar Transferencia</>}
+                  {savingTransfer?<Loader2 className="animate-spin h-4 w-4"/>:<><ArrowLeftRight size={14}/> Ejecutar</>}
                 </button>
               </div>
             </form>
@@ -2011,7 +2583,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL: PAGAR REPOSICIÓN ════════════════════════════════════════ */}
+      {/* ── MODAL: PAGAR REPOSICIÓN ───────────────────────────────────────── */}
       {pagarReposicionModal && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-purple-500`}>
@@ -2021,7 +2593,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </div>
               <div>
                 <h3 className="text-[11px] font-black uppercase tracking-widest">Reponer a Caja</h3>
-                <p className="text-[8px] text-zinc-600 mt-1">Sale de Bóveda, entra a la caja original</p>
+                <p className="text-[8px] text-zinc-600 mt-1">Sale de Bóveda, entra a caja original</p>
               </div>
             </div>
             <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4 mb-4">
@@ -2029,17 +2601,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <p className="text-2xl font-black italic text-purple-400 mt-1">{fmtMonto(pagarReposicionModal.monto_total, pagarReposicionModal.moneda)}</p>
               <p className="text-[8px] text-zinc-600 font-mono mt-1">{pagarReposicionModal.concepto}</p>
             </div>
-            <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">¿Desde qué Bóveda pagar?</label>
+            <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">¿Desde qué Bóveda?</label>
             <div className="grid grid-cols-2 gap-2 mb-6">
               {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>{
                 const saldo = getVaultBalance(m);
-                const suficiente = saldo >= pagarReposicionModal.monto_total;
                 return (
                   <button key={m} type="button" onClick={()=>setPagarReposicionMoneda(m)}
                     className={`p-3 rounded-xl border text-left transition-all ${pagarReposicionMoneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-500 hover:text-white'}`}>
                     <p className="text-[9px] font-black uppercase">{m}</p>
-                    <p className={`text-[10px] font-mono italic mt-1 ${suficiente?'':'text-red-400'}`}>{fmtMonto(saldo, m)}</p>
-                    {!suficiente && <p className="text-[7px] text-red-400 font-black uppercase mt-0.5">Insuficiente</p>}
+                    <p className={`text-[10px] font-mono italic mt-1 ${saldo>=pagarReposicionModal.monto_total?'':'text-red-400'}`}>{fmtMonto(saldo,m)}</p>
                   </button>
                 );
               })}
@@ -2048,14 +2618,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <button onClick={()=>setPagarReposicionModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={confirmarPagoReposicion} disabled={savingAction===pagarReposicionModal.id}
                 className="flex-[2] py-4 bg-purple-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-purple-400 disabled:opacity-40 flex items-center justify-center gap-2">
-                {savingAction===pagarReposicionModal.id?<Loader2 className="animate-spin h-4 w-4"/>:<><CheckCircle2 size={14}/> Confirmar Reposición</>}
+                {savingAction===pagarReposicionModal.id?<Loader2 className="animate-spin h-4 w-4"/>:<><CheckCircle2 size={14}/> Confirmar</>}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ══ MODAL: ELIMINAR TRANSFERENCIA SELECTIVA ════════════════════════ */}
+      {/* ── MODAL: ELIMINAR TRANSFERENCIA ────────────────────────────────── */}
       {deleteTransferModal && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-lg rounded-3xl p-7 border-t-2 border-t-red-500`}>
@@ -2065,42 +2635,40 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </div>
               <div>
                 <h3 className="text-[11px] font-black uppercase tracking-widest">Eliminar Transferencia</h3>
-                <p className="text-[8px] text-zinc-600 mt-1">Selecciona qué registros vinculados eliminar</p>
+                <p className="text-[8px] text-zinc-600 mt-1">Selecciona qué registros eliminar</p>
               </div>
             </div>
             <div className="space-y-2 mb-6">
               {deleteTransferModal.salida && (
                 <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.salida?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
                   <input type="checkbox" checked={deleteTransferSelection.salida} onChange={e=>setDeleteTransferSelection(p=>({...p,salida:e.target.checked}))} className="w-4 h-4 accent-red-500"/>
-                  <div className="flex-1">
+                  <div>
                     <p className="text-[10px] font-black uppercase text-red-400">Salida de {deleteTransferModal.cajaOrigenNombre}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono">-{fmtMonto(deleteTransferModal.salida.monto, deleteTransferModal.salida.moneda)} · {fmtDate(deleteTransferModal.salida.fecha)}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">-{fmtMonto(deleteTransferModal.salida.monto, deleteTransferModal.salida.moneda)}</p>
                   </div>
                 </label>
               )}
               {deleteTransferModal.entrada && (
                 <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.entrada?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
                   <input type="checkbox" checked={deleteTransferSelection.entrada} onChange={e=>setDeleteTransferSelection(p=>({...p,entrada:e.target.checked}))} className="w-4 h-4 accent-red-500"/>
-                  <div className="flex-1">
+                  <div>
                     <p className="text-[10px] font-black uppercase text-emerald-400">Entrada a {deleteTransferModal.cajaDestinoNombre}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono">+{fmtMonto(deleteTransferModal.entrada.monto, deleteTransferModal.entrada.moneda)} · {fmtDate(deleteTransferModal.entrada.fecha)}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">+{fmtMonto(deleteTransferModal.entrada.monto, deleteTransferModal.entrada.moneda)}</p>
                   </div>
                 </label>
               )}
               {deleteTransferModal.reposicion && (
                 <label className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${deleteTransferSelection.reposicion?'bg-red-500/10 border-red-500/30':'bg-white/[0.02] border-white/[0.05]'}`}>
                   <input type="checkbox" checked={deleteTransferSelection.reposicion} onChange={e=>setDeleteTransferSelection(p=>({...p,reposicion:e.target.checked}))} className="w-4 h-4 accent-red-500"/>
-                  <div className="flex-1">
+                  <div>
                     <p className="text-[10px] font-black uppercase text-purple-400">CxP Reposición ({deleteTransferModal.reposicion.estatus})</p>
-                    <p className="text-[8px] text-zinc-600 font-mono">{fmtMonto(deleteTransferModal.reposicion.monto_total, deleteTransferModal.reposicion.moneda)} · {deleteTransferModal.reposicion.entidad_nombre}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">{fmtMonto(deleteTransferModal.reposicion.monto_total, deleteTransferModal.reposicion.moneda)}</p>
                   </div>
                 </label>
               )}
             </div>
             <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 mb-4">
-              <p className="text-[9px] text-yellow-400 font-mono leading-relaxed">
-                ⚠ Eliminar solo una parte romperá la integridad contable. Marca los 3 elementos para deshacer completamente la operación.
-              </p>
+              <p className="text-[9px] text-yellow-400 font-mono">⚠ Marcar los 3 elementos mantiene integridad contable.</p>
             </div>
             <div className="flex gap-3">
               <button onClick={()=>setDeleteTransferModal(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
@@ -2114,7 +2682,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL: CLAVE DEL DIRECTOR ══════════════════════════════════════ */}
+      {/* ── MODAL: CLAVE DEL DIRECTOR ─────────────────────────────────────── */}
       {directorAuthOpen && (
         <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-sm rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
@@ -2123,8 +2691,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <KeyRound className="text-[#E1AD01] h-5 w-5" />
               </div>
               <div>
-                <h3 className="text-[11px] font-black uppercase tracking-widest">Autorización del Director</h3>
-                <p className="text-[8px] text-zinc-600 mt-1">Edición y eliminación financiera requieren clave.</p>
+                <h3 className="text-[11px] font-black uppercase tracking-widest">Autorización Director</h3>
+                <p className="text-[8px] text-zinc-600 mt-1">Clave de 4 dígitos requerida.</p>
               </div>
             </div>
             <input autoFocus type="password" inputMode="numeric" maxLength={4}
@@ -2142,19 +2710,19 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ══ MODAL: EDITAR LEDGER ═══════════════════════════════════════════ */}
+      {/* ── MODAL: EDITAR LEDGER ─────────────────────────────────────────── */}
       {editingTx && (
         <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
             <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-3"><Pencil className="text-[#E1AD01] h-4 w-4"/><h3 className="text-[10px] font-black uppercase tracking-widest">Editar Movimiento Financiero</h3></div>
+              <div className="flex items-center gap-3"><Pencil className="text-[#E1AD01] h-4 w-4"/><h3 className="text-[10px] font-black uppercase tracking-widest">Editar Movimiento</h3></div>
               <button onClick={()=>setEditingTx(null)} className="text-zinc-600 hover:text-white"><X size={16}/></button>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <select value={editTxForm.type} onChange={e=>setEditTxForm(p=>({...p,type:e.target.value as TransactionType}))} className={inp}>
                 <option value="INCOME">INGRESO (+)</option><option value="EXPENSE">EGRESO (-)</option>
                 <option value="INSTRUCTOR_PAY">NÓMINA</option><option value="PAYABLE">POR PAGAR</option>
-                <option value="RECEIVABLE">POR COBRAR</option>
+                <option value="RECEIVABLE">POR COBRAR</option><option value="FX_EXCHANGE">FX CAMBIO</option>
               </select>
               <select value={editTxForm.currency} onChange={e=>setEditTxForm(p=>({...p,currency:normalizePaymentMethod(e.target.value)}))} className={inp}>
                 <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
@@ -2167,24 +2735,27 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="flex gap-3 mt-6">
               <button onClick={()=>setEditingTx(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={saveEditedTx} disabled={savingAction===editingTx.id} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white disabled:opacity-40 flex items-center justify-center gap-2">
-                {savingAction===editingTx.id?<Loader2 size={13} className="animate-spin"/>:<ShieldCheck size={13}/>} Guardar Cambios
+                {savingAction===editingTx.id?<Loader2 size={13} className="animate-spin"/>:<ShieldCheck size={13}/>} Guardar
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ══ MODAL: EDITAR CAJA ════════════════════════════════════════════ */}
+      {/* ── MODAL: EDITAR CAJA ───────────────────────────────────────────── */}
       {editingMov && (
         <div className="fixed inset-0 z-[90] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-2xl rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
             <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-3"><Pencil className="text-[#E1AD01] h-4 w-4"/><h3 className="text-[10px] font-black uppercase tracking-widest">Editar Movimiento de Caja</h3></div>
+              <div className="flex items-center gap-3"><Pencil className="text-[#E1AD01] h-4 w-4"/><h3 className="text-[10px] font-black uppercase tracking-widest">Editar Movimiento Caja</h3></div>
               <button onClick={()=>setEditingMov(null)} className="text-zinc-600 hover:text-white"><X size={16}/></button>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <select value={editMovForm.tipo} onChange={e=>setEditMovForm(p=>({...p,tipo:e.target.value as 'ENTRADA'|'SALIDA'}))} className={inp}><option value="ENTRADA">+ ENTRADA</option><option value="SALIDA">- SALIDA</option></select>
-              <select value={editMovForm.moneda} onChange={e=>setEditMovForm(p=>({...p,moneda:normalizePaymentMethod(e.target.value)}))} className={inp}><option value="USDT">USDT</option><option value="ZELLE">ZELLE</option><option value="CASH">CASH</option><option value="BS">BS</option></select>
+              <select value={editMovForm.tipo} onChange={e=>setEditMovForm(p=>({...p,tipo:e.target.value as any}))} className={inp}><option value="ENTRADA">+ ENTRADA</option><option value="SALIDA">- SALIDA</option></select>
+              <select value={editMovForm.moneda} onChange={e=>setEditMovForm(p=>({...p,moneda:normalizePaymentMethod(e.target.value)}))} className={inp}>
+                <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
+                <option value="CASH">CASH</option><option value="BS">BS</option>
+              </select>
               <input type="number" min="0.01" step="0.01" value={editMovForm.monto} onChange={e=>setEditMovForm(p=>({...p,monto:e.target.value}))} className={inp} placeholder="MONTO"/>
               <input type="date" value={editMovForm.fecha} onChange={e=>setEditMovForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
               <input value={editMovForm.concepto} onChange={e=>setEditMovForm(p=>({...p,concepto:e.target.value}))} className={inp} placeholder="CONCEPTO"/>
@@ -2193,7 +2764,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="flex gap-3 mt-6">
               <button onClick={()=>setEditingMov(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={saveEditedMov} disabled={savingAction===editingMov.id} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white disabled:opacity-40 flex items-center justify-center gap-2">
-                {savingAction===editingMov.id?<Loader2 size={13} className="animate-spin"/>:<ShieldCheck size={13}/>} Guardar Cambios
+                {savingAction===editingMov.id?<Loader2 size={13} className="animate-spin"/>:<ShieldCheck size={13}/>} Guardar
               </button>
             </div>
           </div>
