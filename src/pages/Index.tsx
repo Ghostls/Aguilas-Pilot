@@ -33,7 +33,7 @@ import { supabase } from '@/lib/supabaseClient';
 import FlightRegister from '@/components/flights/FlightRegister';
 import { FlightCalendar } from '@/components/FlightCalendar';
 import FlightPlanningBoard from '@/components/FlightPlanningboard';   // [NEW v4.21]
-import { useAuth, PLANNER_ROLES } from '@/context/authcontext';       // [NEW v4.21]
+import { useAuth, PLANNER_ROLES } from '@/context/AuthContext';       // [NEW v4.21]
 import { WorkOrder, Vendor, SparePart, Aircraft } from '@/Types/Maintenance';
 
 import {
@@ -541,3 +541,4 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 };
 
 export default Index;
+
