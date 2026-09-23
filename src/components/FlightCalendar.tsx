@@ -1,5 +1,5 @@
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║                 OPERACIÓN ÁGUILAS — CALENDARIO CAPITÁN                     ║
+// ║                 OPERACIÓN ÁGUILAS — CALENDARIO CAPITÁN v2.0                 ║
 // ║                 VALKYRON OS — FLIGHT OPERATIONS                            ║
 // ╠══════════════════════════════════════════════════════════════════════════════╣
 // ║ FUENTE REAL: RESERVAS_SLOT_VUELO                                           ║
@@ -17,12 +17,25 @@
 // ║                                                                            ║
 // ║ CORRECCIÓN CRÍTICA:                                                       ║
 // ║   Las fechas se procesan en horario LOCAL y no mediante toISOString()    ║
+// ║                                                                            ║
+// ║ CHANGELOG v2.0:                                                           ║
+// ║   [NEW] Integración con Planificación de Vuelo:                          ║
+// ║         SOLICITADA = pendiente de planificación (no es misión aún)        ║
+// ║         CONFIRMADA = misión asignada por Planificación                    ║
+// ║         RECHAZADA  = estilo cancelado                                     ║
+// ║   [NEW] Badge "Reprogramado" + motivo/nota de Planificación en detalle   ║
+// ║   [NEW] Realtime filtrado por instructor_id (sin recargar pantalla)       ║
+// ║   [NEW] KPI "Pend. planificación"                                         ║
+// ║   [FIX] Nombres de alumnos: fallback a PERFILES_ESTUDIANTES               ║
+// ║         (los cadetes viven ahí, no en PERFILES)                           ║
+// ║   [FIX] Recarga silenciosa (sin parpadeo del loader) en eventos realtime  ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 import React, {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -35,8 +48,10 @@ import {
   ChevronRight,
   Clock3,
   FileText,
+  Hourglass,
   Loader2,
   Plane,
+  Repeat,
   ShieldCheck,
   User,
   X,
@@ -85,6 +100,11 @@ interface SlotVuelo {
 
   motivo_cierre: string | null;
   notas_capitan: string | null;
+
+  // [NEW v2.0] Planificación
+  reprogramada: boolean | null;
+  motivo_planificacion: string | null;
+  fecha_solicitada: string | null;
 
   created_at: string;
 }
@@ -238,6 +258,7 @@ const getStatusStyle = (status: string | null) => {
 
     case "CANCELADA":
     case "CANCELADO":
+    case "RECHAZADA":            // [NEW v2.0]
       return {
         wrapper:
           "border-red-500/20 bg-red-500/[0.04] opacity-70",
@@ -247,9 +268,10 @@ const getStatusStyle = (status: string | null) => {
       };
 
     case "PENDIENTE":
+    case "SOLICITADA":           // [NEW v2.0] aún no confirmada por Planificación
       return {
         wrapper:
-          "border-blue-500/20 bg-blue-500/[0.04]",
+          "border-blue-500/20 bg-blue-500/[0.04] border-dashed opacity-80",
         badge:
           "text-blue-400 bg-blue-400/10 border-blue-400/20",
         dot: "bg-blue-400",
@@ -270,6 +292,9 @@ const getStatusLabel = (
   status: string | null
 ): string => {
   if (!status) return "SIN ESTADO";
+
+  // [NEW v2.0]
+  if (status.toUpperCase() === "SOLICITADA") return "PEND. PLANIFICACIÓN";
 
   return status
     .replace(/_/g, " ")
@@ -357,6 +382,10 @@ export const FlightCalendar: React.FC<
 
   const [selectedSlot, setSelectedSlot] =
     useState<SlotVuelo | null>(null);
+
+  // [NEW v2.0] debounce realtime
+  const realtimeDebounce =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ────────────────────────────────────────────────────────────────────────────
   // AUTENTICACIÓN + INSTRUCTOR
@@ -465,15 +494,16 @@ export const FlightCalendar: React.FC<
   //     instructor_id = instructor.id
   //
   // ESTO ES LO QUE HACE QUE APAREZCAN LOS VUELOS DEL CAPITÁN.
+  // [CHG v2.0] silent=true → recarga sin loader (eventos realtime)
   // ══════════════════════════════════════════════════════════════════════════════
 
   const fetchSlots = useCallback(
-    async () => {
+    async (silent = false) => {
       if (!instructor?.id) {
         return;
       }
 
-      setLoading(true);
+      if (!silent) setLoading(true);
       setError(null);
 
       const desde = toYMD(
@@ -504,6 +534,9 @@ export const FlightCalendar: React.FC<
             status,
             motivo_cierre,
             notas_capitan,
+            reprogramada,
+            motivo_planificacion,
+            fecha_solicitada,
             created_at
           `)
           .eq(
@@ -526,7 +559,7 @@ export const FlightCalendar: React.FC<
         }
 
         const normalizedSlots =
-          (data ?? []).map((row) => ({
+          (data ?? []).map((row: any) => ({
             ...row,
             horas_planificadas:
               row.horas_planificadas !== null
@@ -536,6 +569,7 @@ export const FlightCalendar: React.FC<
               row.horas_reales !== null
                 ? Number(row.horas_reales)
                 : null,
+            reprogramada: !!row.reprogramada,
           })) as SlotVuelo[];
 
         setSlots(normalizedSlots);
@@ -544,6 +578,7 @@ export const FlightCalendar: React.FC<
         // CARGAR NOMBRES DE ALUMNOS
         //
         // Se intenta resolver student_id contra PERFILES.
+        // [FIX v2.0] Los faltantes se buscan en PERFILES_ESTUDIANTES.
         // Si no existe el registro, se muestra el UUID.
         // ══════════════════════════════════════════════════════════════════════
 
@@ -564,6 +599,9 @@ export const FlightCalendar: React.FC<
         );
 
         if (studentIds.length > 0) {
+          const map: StudentNameMap =
+            {};
+
           const {
             data: perfilesData,
             error: perfilesError,
@@ -578,9 +616,6 @@ export const FlightCalendar: React.FC<
             );
 
           if (!perfilesError) {
-            const map: StudentNameMap =
-              {};
-
             (
               perfilesData as Perfil[] | null
             )?.forEach(
@@ -591,9 +626,35 @@ export const FlightCalendar: React.FC<
                   perfil.id;
               }
             );
-
-            setStudentNames(map);
           }
+
+          // [FIX v2.0] fallback cadetes
+          const faltantes = studentIds.filter(
+            (id) => !map[id]
+          );
+
+          if (faltantes.length > 0) {
+            const {
+              data: estData,
+              error: estError,
+            } = await supabase
+              .from("perfiles_estudiantes")
+              .select("id,nombre_completo,email_registro")
+              .in("id", faltantes);
+
+            if (!estError) {
+              (estData ?? []).forEach(
+                (e: any) => {
+                  map[e.id] =
+                    e.nombre_completo ||
+                    e.email_registro ||
+                    e.id;
+                }
+              );
+            }
+          }
+
+          setStudentNames(map);
         } else {
           setStudentNames({});
         }
@@ -628,6 +689,36 @@ export const FlightCalendar: React.FC<
     instructor?.id,
     fetchSlots,
   ]);
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // [NEW v2.0] REALTIME — Planificación confirma/reprograma → aparece al instante
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  useEffect(() => {
+    if (!instructor?.id) return;
+
+    const channel = supabase
+      .channel(`captain-calendar-${instructor.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "reservas_slot_vuelo",
+          filter: `instructor_id=eq.${instructor.id}`,
+        },
+        () => {
+          if (realtimeDebounce.current) clearTimeout(realtimeDebounce.current);
+          realtimeDebounce.current = setTimeout(() => fetchSlots(true), 500);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      if (realtimeDebounce.current) clearTimeout(realtimeDebounce.current);
+      supabase.removeChannel(channel);
+    };
+  }, [instructor?.id, fetchSlots]);
 
   // ══════════════════════════════════════════════════════════════════════════════
   // AGRUPACIÓN POR DÍA
@@ -722,6 +813,13 @@ export const FlightCalendar: React.FC<
         );
       }).length;
 
+    // [NEW v2.0]
+    const pendientesPlan =
+      slots.filter(
+        (slot) =>
+          String(slot.status ?? "").toUpperCase() === "SOLICITADA"
+      ).length;
+
     const horasPlanificadas =
       slots.reduce(
         (sum, slot) =>
@@ -747,6 +845,7 @@ export const FlightCalendar: React.FC<
       hoy,
       programadas,
       completadas,
+      pendientesPlan,
       horasPlanificadas,
       horasReales,
     };
@@ -1032,6 +1131,9 @@ export const FlightCalendar: React.FC<
 
           <p className="text-[7px] text-slate-600 uppercase font-black mt-1">
             slots registrados
+            {stats.pendientesPlan > 0 && (
+              <span className="text-blue-400"> · {stats.pendientesPlan} pend. planificación</span>
+            )}
           </p>
 
         </div>
@@ -1285,10 +1387,17 @@ export const FlightCalendar: React.FC<
 
                                 <div className="flex items-center gap-1.5">
 
-                                  <Clock3
-                                    size={10}
-                                    className="text-[#E1AD01]"
-                                  />
+                                  {String(slot.status ?? "").toUpperCase() === "SOLICITADA" ? (
+                                    <Hourglass
+                                      size={10}
+                                      className="text-blue-400"
+                                    />
+                                  ) : (
+                                    <Clock3
+                                      size={10}
+                                      className="text-[#E1AD01]"
+                                    />
+                                  )}
 
                                   <span className="text-[10px] text-[#E1AD01] font-black font-mono">
                                     {formatHour(
@@ -1349,16 +1458,27 @@ export const FlightCalendar: React.FC<
 
                               <div className="mt-3 flex items-center justify-between gap-2">
 
-                                <span
-                                  className={`
-                                    inline-flex px-1.5 py-0.5 rounded-md border
-                                    text-[6px] font-black uppercase
-                                    ${tipoStyle}
-                                  `}
-                                >
-                                  {slot.tipo_vuelo ||
-                                    "VUELO"}
-                                </span>
+                                <div className="flex items-center gap-1">
+
+                                  <span
+                                    className={`
+                                      inline-flex px-1.5 py-0.5 rounded-md border
+                                      text-[6px] font-black uppercase
+                                      ${tipoStyle}
+                                    `}
+                                  >
+                                    {slot.tipo_vuelo ||
+                                      "VUELO"}
+                                  </span>
+
+                                  {/* [NEW v2.0] */}
+                                  {slot.reprogramada && (
+                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md border text-[6px] font-black uppercase text-amber-400 bg-amber-400/10 border-amber-400/20">
+                                      <Repeat size={6} /> REPROG.
+                                    </span>
+                                  )}
+
+                                </div>
 
                                 <span className="text-[7px] text-slate-600 font-mono">
                                   {Number(
@@ -1423,6 +1543,17 @@ export const FlightCalendar: React.FC<
                 </span>
               </div>
 
+              {/* [NEW v2.0] */}
+              <div className="px-3 py-2 rounded-xl bg-white/[0.02] border border-white/5">
+                <span className="text-[7px] text-slate-600 uppercase font-black">
+                  Pend. planificación
+                </span>
+
+                <span className="ml-2 text-[10px] text-blue-400 font-black">
+                  {stats.pendientesPlan}
+                </span>
+              </div>
+
               <div className="px-3 py-2 rounded-xl bg-white/[0.02] border border-white/5">
                 <span className="text-[7px] text-slate-600 uppercase font-black">
                   Reales
@@ -1458,11 +1589,11 @@ export const FlightCalendar: React.FC<
 
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-md p-4">
 
-          <div className="w-full max-w-lg rounded-3xl overflow-hidden border border-[#E1AD01]/20 bg-[#050505] shadow-2xl">
+          <div className="w-full max-w-lg rounded-3xl overflow-hidden border border-[#E1AD01]/20 bg-[#050505] shadow-2xl max-h-[92vh] flex flex-col">
 
             {/* Header */}
 
-            <div className="bg-[#E1AD01] text-black p-5 flex items-center justify-between">
+            <div className="bg-[#E1AD01] text-black p-5 flex items-center justify-between shrink-0">
 
               <div className="flex items-center gap-2">
 
@@ -1496,7 +1627,17 @@ export const FlightCalendar: React.FC<
 
             </div>
 
-            <div className="p-6 space-y-5">
+            <div className="p-6 space-y-5 overflow-y-auto">
+
+              {/* [NEW v2.0] Aviso pendiente de planificación */}
+              {String(selectedSlot.status ?? "").toUpperCase() === "SOLICITADA" && (
+                <div className="rounded-2xl border border-blue-500/20 bg-blue-500/[0.05] p-4 flex items-start gap-2">
+                  <Hourglass size={12} className="text-blue-400 shrink-0 mt-0.5" />
+                  <p className="text-[9px] text-blue-300 font-black uppercase leading-relaxed">
+                    Solicitud aún no confirmada por Planificación de Vuelo. Puede cambiar de capitán, aeronave u horario.
+                  </p>
+                </div>
+              )}
 
               {/* Fecha / hora */}
 
@@ -1515,6 +1656,13 @@ export const FlightCalendar: React.FC<
                         selectedSlot.fecha
                       )}
                     </p>
+
+                    {/* [NEW v2.0] */}
+                    {selectedSlot.reprogramada && selectedSlot.fecha_solicitada && (
+                      <p className="text-[8px] text-amber-400 font-black uppercase mt-1 flex items-center gap-1">
+                        <Repeat size={8} /> Solicitado originalmente {formatDateShort(selectedSlot.fecha_solicitada)}
+                      </p>
+                    )}
 
                   </div>
 
@@ -1694,6 +1842,23 @@ export const FlightCalendar: React.FC<
                 </span>
 
               </div>
+
+              {/* [NEW v2.0] Nota de Planificación */}
+              {selectedSlot.motivo_planificacion && (
+
+                <div className="rounded-2xl border border-amber-500/15 bg-amber-500/[0.03] p-4">
+
+                  <p className="text-[8px] text-amber-400 uppercase font-black tracking-widest">
+                    Nota de Planificación
+                  </p>
+
+                  <p className="text-[10px] text-slate-300 mt-2 uppercase">
+                    {selectedSlot.motivo_planificacion}
+                  </p>
+
+                </div>
+
+              )}
 
               {/* Notas del capitán */}
 

@@ -1,16 +1,26 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v14.0
-// CHANGELOG v14.0 vs v13.1:
-//   [NEW] Caja Efectivo dual: subcajas ADM (stand-by) / CEO (custodia física)
-//         → handleEntregaCEO: modal firma con concepto para mover efectivo ADM→CEO
-//   [NEW] FX Desk: cambio de moneda trazable (USDT/ZELLE/CASH → BS y viceversa)
-//         → tabla fx_registros + asiento doble en movimientos_caja_chica
-//   [NEW] Préstamos externos: Becquer/Roberto pueden prestar a Águilas
-//         → tipo 'PRESTAMO_EXTERNO' con campo prestamista trazable
-//   [CHG] Bancamiga reemplaza a Ederson — solo acepta BS
-//   [CHG] Caja Efectivo solo acepta CASH; mapa estático de restricciones por caja
-//   [CLN] Eliminadas: uuid4() inline duplicado, genHash repetida, dead-code physBalances reset
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v15.0
+// CHANGELOG v15.0 vs v14.0:
+//   [NEW] FX interconectado Caja ↔ Bóveda (partida doble real):
+//         → Caja ORIGEN (acepta moneda origen) + Caja DESTINO (acepta moneda destino)
+//         → Ej: USDT (Bóveda USDT / caja X) → BS (Bóveda BS + Caja Bancamiga)
+//         → 2 patas Ledger tipo FX_EXCHANGE con fx_leg OUT/IN (no infla ingresos/egresos)
+//         → RPC atómico fn_registrar_fx (1 transacción Postgres) + fallback compensado
+//   [NEW] signedLedgerAmount(): regla de signo ÚNICA para Bóvedas, KPIs, Libro Mayor y Cierre
+//   [NEW] Anular FX (clave Director): borra fx_registros → cascada a cajas y bóvedas
+//   [NEW] Conciliación Bóveda ↔ Σ Cajas por moneda (tab Bóvedas)
+//   [NEW] Subcaja ADM/CEO en FX cuando la caja origen/destino es Efectivo
+//   [FIX] v14 registraba el FX en UNA sola caja y en el Ledger como INCOME/EXPENSE
+//         de la moneda origen → la Bóveda BS nunca recibía los bolívares y el USDT
+//         se sumaba (INCOME) en vez de restarse. Corregido.
+//   [FIX] Borrar/editar una pata FX aislada rompía la partida → ahora se anula el FX completo
+//   [FIX] Tasa con 4 decimales (v14 truncaba a 2) · USD↔USD usa factor (1 = sin comisión)
+//   [FIX] Al activar una caja mono-moneda (Bancamiga=BS, Efectivo=CASH) el form fija su moneda
+//   [FIX] Edición de movimiento de caja valida la moneda permitida por la caja
 //   PRESERVADO: fetchLockRef, fetchAll(silent), realtime debounce, transferencia entre cajas,
-//   reposiciones, CxC/CxP, Libro Diario, Bóvedas, Cierre, Requisiciones, clave Director.
+//   reposiciones, CxC/CxP, Libro Diario, Bóvedas, Cierre, Requisiciones, clave Director,
+//   Caja Efectivo ADM/CEO, préstamos externos Becquer/Roberto.
+//
+// REQUISITO: ejecutar migracion_finance_v15.sql en Supabase antes de desplegar.
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
@@ -20,7 +30,7 @@ import {
   Wallet, ShieldCheck, Calculator, Landmark, CheckCircle2,
   FileSignature, Lock, Activity, Trash2, Download, Coins, Banknote,
   AlertTriangle, RefreshCw, ReceiptText, Plane, Pencil, KeyRound,
-  ArrowLeftRight, Repeat, TrendingUp, UserCheck, HandCoins,
+  ArrowLeftRight, Repeat, TrendingUp, UserCheck, HandCoins, Scale, Ban,
 } from 'lucide-react';
 
 // ─── TIPOS ────────────────────────────────────────────────────────────────────
@@ -30,7 +40,14 @@ export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE
 export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING';
 export type SubcajaEfectivo = 'ADM' | 'CEO';    // solo aplica a caja efectivo
 export type Prestamista     = 'BECQUER' | 'ROBERTO';
+export type FxLeg           = 'IN' | 'OUT';      // [NEW v15] pata FX en Ledger
 type FormTipo               = 'CXC' | 'HORAS_PAGADAS' | 'CXP';
+
+/** [NEW v15] Transacción de Ledger extendida con vínculo FX */
+type LedgerTx = FinanceTransaction & {
+  fx_id?: string | null;
+  fx_leg?: FxLeg | null;
+};
 
 interface CajaChica      { id: string; nombre: string; }
 interface MovimientoCaja {
@@ -40,13 +57,14 @@ interface MovimientoCaja {
   transfer_id?: string | null;
   transfer_role?: 'SALIDA' | 'ENTRADA' | null;
   transfer_peer_id?: string | null;
-  subcaja?: SubcajaEfectivo | null;          // [NEW] solo caja efectivo
-  prestamista?: Prestamista | null;          // [NEW] préstamos externos
+  subcaja?: SubcajaEfectivo | null;
+  prestamista?: Prestamista | null;
   es_prestamo?: boolean;
-  fx_id?: string | null;                     // [NEW] vínculo FX
+  fx_id?: string | null;
+  fx_role?: 'SALIDA' | 'ENTRADA' | null;    // [NEW v15]
 }
 
-/** [NEW] Registro de operación FX */
+/** Registro de operación FX (v15: origen/destino explícitos) */
 interface FXRecord {
   id: string;
   fecha: string;
@@ -57,7 +75,31 @@ interface FXRecord {
   tasa: number;
   concepto: string;
   registrado_por: string;
-  caja_id?: string | null;
+  caja_id?: string | null;                    // legacy v14
+  caja_origen_id?: string | null;             // [NEW v15]
+  caja_destino_id?: string | null;            // [NEW v15]
+  subcaja_origen?: SubcajaEfectivo | null;    // [NEW v15]
+  subcaja_destino?: SubcajaEfectivo | null;   // [NEW v15]
+  referencia?: string | null;                 // [NEW v15]
+}
+
+/** [NEW v15] Payload normalizado de una operación FX */
+interface FxPayload {
+  fxId: string;
+  referencia: string;
+  fechaISO: string;
+  monedaOrigen: PaymentMethod;
+  monedaDestino: PaymentMethod;
+  montoOrigen: number;
+  montoDestino: number;
+  tasa: number;
+  concepto: string;
+  cajaOrigenId: string | null;
+  cajaDestinoId: string | null;
+  cajaOrigenNombre: string;
+  cajaDestinoNombre: string;
+  subcajaOrigen: SubcajaEfectivo | null;
+  subcajaDestino: SubcajaEfectivo | null;
 }
 
 interface CuentaGeneral {
@@ -123,6 +165,7 @@ const inp   = "bg-black/50 border border-white/10 p-4 rounded-2xl text-white tex
 
 const DEFAULT_TASA_BS       = 36.50;
 const DIRECTOR_FINANCE_CODE = '4827';
+const ALL_METHODS: PaymentMethod[] = ['USDT','ZELLE','CASH','BS'];   // [NEW v15]
 
 const normalizePaymentMethod = (value: unknown): PaymentMethod => {
   const v = String(value ?? '').toUpperCase().trim();
@@ -143,6 +186,7 @@ const MONEDA_BG: Record<PaymentMethod, string> = {
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 const round2  = (n: number) => Math.round(n * 100) / 100;
+const round4  = (n: number) => Math.round(n * 10000) / 10000;   // [NEW v15] tasas FX
 const uuid4   = () => crypto.randomUUID?.() ?? 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
   const r = (Math.random() * 16) | 0;
   return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
@@ -162,6 +206,47 @@ const fmtMonto = (amount: number, moneda: PaymentMethod) => {
   const s = round2(amount).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return moneda === 'BS' ? `Bs ${s}` : `$${s}`;
 };
+const hoyISO = () => new Date().toISOString().split('T')[0];   // [NEW v15]
+
+/**
+ * [NEW v15] Regla de signo ÚNICA del Ledger (fuente de verdad de Bóvedas).
+ *  INCOME / RECEIVABLE            → +
+ *  EXPENSE / PAYABLE / NÓMINA     → −
+ *  FX_EXCHANGE con fx_leg IN      → +   (moneda destino entra)
+ *  FX_EXCHANGE con fx_leg OUT     → −   (moneda origen sale)
+ *  FX_EXCHANGE legacy sin pata    → −   (preserva el comportamiento histórico v14)
+ */
+const signedLedgerAmount = (t: LedgerTx): number => {
+  const ty = String(t.type);
+  if (ty === 'FX_EXCHANGE') {
+    if (t.fx_leg === 'IN')  return t.amount;
+    if (t.fx_leg === 'OUT') return -t.amount;
+    return -t.amount;
+  }
+  if (ty === 'INCOME' || ty === 'RECEIVABLE') return t.amount;
+  return -t.amount;
+};
+
+/** [NEW v15] ¿La transacción pertenece a una operación FX? (no cuenta como ingreso/egreso real) */
+const isFxTx = (t: LedgerTx) => String(t.type) === 'FX_EXCHANGE' || !!t.fx_id;
+
+/**
+ * [NEW v15] Conversión FX.
+ *  USD-like → BS : M_d = M_o · τ        (τ = Bs por 1 USD)
+ *  BS → USD-like : M_d = M_o / τ
+ *  USD ↔ USD     : M_d = M_o · f        (f = factor neto, 1 = sin comisión)
+ */
+const computeFxDestino = (origen: PaymentMethod, destino: PaymentMethod, montoOrigen: number, tasa: number): number | null => {
+  if (origen === destino) return null;
+  if (!Number.isFinite(montoOrigen) || !Number.isFinite(tasa) || montoOrigen <= 0 || tasa <= 0) return null;
+  if (destino === 'BS' && origen !== 'BS') return round2(montoOrigen * tasa);
+  if (origen === 'BS' && destino !== 'BS') return round2(montoOrigen / tasa);
+  return round2(montoOrigen * tasa);
+};
+
+/** [NEW v15] Detecta que el RPC aún no existe (migración no ejecutada) */
+const isMissingRpc = (err: { code?: string; message?: string } | null) =>
+  !!err && (err.code === 'PGRST202' || err.code === '42883' || /could not find the function/i.test(err.message ?? ''));
 
 // ─── ERROR BANNER ─────────────────────────────────────────────────────────────
 
@@ -184,7 +269,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [activeTab, setActiveTab] = useState<TabType>('LEDGER');
   const [tasaBCV,   setTasaBCV]   = useState(DEFAULT_TASA_BS);
 
-  const [transactions, setTransactions] = useState<FinanceTransaction[]>([]);
+  const [transactions, setTransactions] = useState<LedgerTx[]>([]);
   const [requests,     setRequests]     = useState<any[]>([]);
   const [cajas,        setCajas]        = useState<CajaChica[]>([]);
   const [movCajas,     setMovCajas]     = useState<MovimientoCaja[]>([]);
@@ -192,7 +277,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [capitanes,    setCapitanes]    = useState<any[]>([]);
   const [alumnos,      setAlumnos]      = useState<AlumnoCxC[]>([]);
   const [cuentasCxC,   setCuentasCxC]   = useState<CuentaPorCobrar[]>([]);
-  const [fxRegistros,  setFxRegistros]  = useState<FXRecord[]>([]);   // [NEW]
+  const [fxRegistros,  setFxRegistros]  = useState<FXRecord[]>([]);
 
   const [loading,       setLoading]       = useState(true);
   const [selectedVault, setSelectedVault] = useState<PaymentMethod>('USDT');
@@ -205,7 +290,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [cuentaError,   setCuentaError]   = useState<string | null>(null);
   const [reqError,      setReqError]      = useState<string | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
-  const [fxError,       setFxError]       = useState<string | null>(null);    // [NEW]
+  const [fxError,       setFxError]       = useState<string | null>(null);
 
   // estados de carga
   const [savingLedger,   setSavingLedger]   = useState(false);
@@ -213,7 +298,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [savingCuenta,   setSavingCuenta]   = useState(false);
   const [savingReq,      setSavingReq]      = useState(false);
   const [savingTransfer, setSavingTransfer] = useState(false);
-  const [savingFX,       setSavingFX]       = useState(false);              // [NEW]
+  const [savingFX,       setSavingFX]       = useState(false);
   const [savingAction,   setSavingAction]   = useState<string | null>(null);
 
   // seguridad director
@@ -223,7 +308,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [pendingSecureAction, setPendingSecureAction] = useState<(() => Promise<void>) | null>(null);
 
   // edición ledger
-  const [editingTx,  setEditingTx]  = useState<FinanceTransaction | null>(null);
+  const [editingTx,  setEditingTx]  = useState<LedgerTx | null>(null);
   const [editTxForm, setEditTxForm] = useState({
     amount: '', currency: 'USDT' as PaymentMethod, type: 'INCOME' as TransactionType,
     description: '', fecha: new Date().toISOString().split('T')[0],
@@ -250,25 +335,28 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [pagarReposicionModal,  setPagarReposicionModal]  = useState<CuentaGeneral | null>(null);
   const [pagarReposicionMoneda, setPagarReposicionMoneda] = useState<PaymentMethod>('USDT');
 
-  // [NEW] entrega efectivo ADM → CEO
+  // entrega efectivo ADM → CEO
   const [entregaCEOModal,  setEntregaCEOModal]  = useState(false);
   const [entregaCEOForm, setEntregaCEOForm] = useState({
     monto: '', concepto: '', fecha: new Date().toISOString().split('T')[0],
   });
 
-  // [NEW] FX Desk modal
+  // [CHG v15] FX Desk: caja origen + caja destino (antes una sola caja_id)
   const [fxModalOpen, setFxModalOpen] = useState(false);
   const [fxForm, setFxForm] = useState({
-    caja_id:        '',
-    moneda_origen:  'USDT' as PaymentMethod,
-    moneda_destino: 'BS'   as PaymentMethod,
-    monto_origen:   '',
-    tasa:           String(DEFAULT_TASA_BS),
-    concepto:       '',
-    fecha:          new Date().toISOString().split('T')[0],
+    caja_origen_id:  '',
+    caja_destino_id: '',
+    subcaja_origen:  'ADM' as SubcajaEfectivo,
+    subcaja_destino: 'ADM' as SubcajaEfectivo,
+    moneda_origen:   'USDT' as PaymentMethod,
+    moneda_destino:  'BS'   as PaymentMethod,
+    monto_origen:    '',
+    tasa:            String(DEFAULT_TASA_BS),
+    concepto:        '',
+    fecha:           new Date().toISOString().split('T')[0],
   });
 
-  // [NEW] préstamo externo modal
+  // préstamo externo modal
   const [prestamoModal, setPrestamoModal] = useState(false);
   const [prestamoForm, setPrestamoForm] = useState({
     prestamista:  'BECQUER' as Prestamista,
@@ -290,7 +378,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const [movForm, setMovForm] = useState({
     tipo: 'ENTRADA' as 'ENTRADA' | 'SALIDA', moneda: 'CASH' as PaymentMethod,
     monto: '', concepto: '', referencia: '', fecha: new Date().toISOString().split('T')[0],
-    subcaja: 'ADM' as SubcajaEfectivo,  // [NEW]
+    subcaja: 'ADM' as SubcajaEfectivo,
   });
 
   // cuentas form
@@ -316,6 +404,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   // cierre físico
   const [physBalances, setPhysBalances] = useState<Record<PaymentMethod, string>>({ USDT:'', ZELLE:'', CASH:'', BS:'' });
 
+  // ─── SYNC HISTÓRICO ───────────────────────────────────────────────────────
+
+  const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[]) => {
+    const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0);
+    for (const c of paid) {
+      const inv = `${c.horas_compradas > 0 ? 'HORA' : 'CXC'}-${c.id}`;
+      const { data: exists } = await supabase.from('transacciones_finanzas').select('id').eq('invoice_number', inv).limit(1);
+      if (exists?.length) continue;
+      await supabase.from('transacciones_finanzas').insert([{
+        id: uuid4(), type: 'INCOME', entity_id: c.student_id,
+        entity_name: c.nombre_alumno || 'ALUMNO',
+        amount: round2(Number(c.monto_total) || 0), invoice_number: inv,
+        description: `${c.concepto || 'COBRO'} · SINCRONIZACIÓN HISTÓRICA`,
+        status: 'PAID', category: 'Academia',
+        payment_method: normalizePaymentMethod(c.moneda),
+        issue_date: c.fecha_emision ? new Date(c.fecha_emision).toISOString() : new Date().toISOString(),
+      }]);
+    }
+  }, []);
+
   // ─── FETCH ────────────────────────────────────────────────────────────────
 
   const fetchAll = useCallback(async (silent = false) => {
@@ -333,7 +441,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         supabase.from('capitanes').select('*').order('nombre'),
         supabase.from('perfiles_estudiantes').select('id, nombre_completo, student_serial, sede').eq('role', 'student').order('nombre_completo'),
         supabase.from('cuentas_por_cobrar').select('*').order('fecha_emision', { ascending: false }),
-        supabase.from('fx_registros').select('*').order('fecha', { ascending: false }).limit(100),
+        supabase.from('fx_registros').select('*').order('fecha', { ascending: false }).limit(200),
       ]);
 
       if (txRes.data) setTransactions(txRes.data.map((t: any) => ({
@@ -344,13 +452,16 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         description: t.description || '', status: t.status || 'PENDING',
         issueDate: t.issue_date, category: t.category || 'General',
         payment_method: normalizePaymentMethod(t.payment_method),
-      })));
+        fx_id:  t.fx_id  ?? null,                                  // [NEW v15]
+        fx_leg: (t.fx_leg === 'IN' || t.fx_leg === 'OUT') ? t.fx_leg : null,   // [NEW v15]
+      } as LedgerTx)));
 
       if (reqRes.data)   setRequests(reqRes.data);
       if (cajasRes.data) setCajas(cajasRes.data);
 
       if (movRes.data) setMovCajas(movRes.data.map((m: any) => ({
         ...m,
+        moneda:           normalizePaymentMethod(m.moneda),
         monto:            round2(Number(m.monto) || 0),
         transfer_id:      m.transfer_id      ?? null,
         transfer_role:    m.transfer_role    ?? null,
@@ -359,6 +470,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         prestamista:      m.prestamista      ?? null,
         es_prestamo:      m.es_prestamo      ?? false,
         fx_id:            m.fx_id            ?? null,
+        fx_role:          m.fx_role          ?? null,              // [NEW v15]
       })));
 
       if (cuentasRes.data) setCuentas(cuentasRes.data.map((c: any) => ({
@@ -391,21 +503,27 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         await syncPaidAccountsToLedger(norm);
       }
 
-      // [NEW] fx_registros puede no existir aún — ignorar error gracefully
       if (fxRes.data) setFxRegistros(fxRes.data.map((f: any) => ({
         ...f,
-        monto_origen:  round2(Number(f.monto_origen) || 0),
-        monto_destino: round2(Number(f.monto_destino) || 0),
-        tasa:          round2(Number(f.tasa) || 0),
+        moneda_origen:   normalizePaymentMethod(f.moneda_origen),
+        moneda_destino:  normalizePaymentMethod(f.moneda_destino),
+        monto_origen:    round2(Number(f.monto_origen) || 0),
+        monto_destino:   round2(Number(f.monto_destino) || 0),
+        tasa:            round4(Number(f.tasa) || 0),                          // [CHG v15] 4 decimales
+        caja_origen_id:  f.caja_origen_id  ?? f.caja_id ?? null,               // [NEW v15] fallback legacy
+        caja_destino_id: f.caja_destino_id ?? null,
+        subcaja_origen:  f.subcaja_origen  ?? null,
+        subcaja_destino: f.subcaja_destino ?? null,
+        referencia:      f.referencia      ?? null,
       })));
 
     } catch (e) {
-      console.error('[FinancePanel v14.0] fetchAll error:', e);
+      console.error('[FinancePanel v15.0] fetchAll error:', e);
     } finally {
       setLoading(false);
       fetchLockRef.current = false;
     }
-  }, []);
+  }, [syncPaidAccountsToLedger]);
 
   const realtimeDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleRealtimeChange = useCallback(() => {
@@ -415,7 +533,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   useEffect(() => {
     fetchAll();
-    const ch = supabase.channel('finance-v14')
+    const ch = supabase.channel('finance-v15')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'transacciones_finanzas' },  handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'solicitudes_compra' },       handleRealtimeChange)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'cajas_chicas' },             handleRealtimeChange)
@@ -432,17 +550,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   // ─── MÉTRICAS ─────────────────────────────────────────────────────────────
 
+  /** [CHG v15] Saldo de bóveda usando la regla de signo única (incluye patas FX) */
   const getVaultBalance = useCallback((method: PaymentMethod) =>
     transactions
       .filter(t => t.payment_method === method && t.status === 'PAID')
-      .reduce((acc, t) => {
-        const isIn = t.type === 'INCOME' || t.type === 'RECEIVABLE';
-        return round2(isIn ? acc + t.amount : acc - t.amount);
-      }, 0),
+      .reduce((acc, t) => round2(acc + signedLedgerAmount(t)), 0),
   [transactions]);
 
   useEffect(() => {
-    const totals = (['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).reduce((acc, m) => {
+    const totals = ALL_METHODS.reduce((acc, m) => {
       acc[m] = getVaultBalance(m); return acc;
     }, { USDT: 0, ZELLE: 0, CASH: 0, BS: 0 } as Record<PaymentMethod, number>);
     setGlobalFinance(totals);
@@ -455,7 +571,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       .reduce((acc, m) => round2(m.tipo === 'ENTRADA' ? acc + m.monto : acc - m.monto), 0),
   [movCajas]);
 
-  /** [NEW] Saldo de una subcaja de efectivo específica (ADM o CEO) */
+  /** Saldo de una subcaja de efectivo específica (ADM o CEO) */
   const getSubcajaBalance = useCallback((cajaId: string, subcaja: SubcajaEfectivo) =>
     movCajas
       .filter(m => m.caja_id === cajaId && m.moneda === 'CASH' && m.subcaja === subcaja)
@@ -475,6 +591,34 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   const totalReposiciones = useMemo(() =>
     cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + c.monto_pendiente), 0),
   [cuentasReposiciones]);
+
+  // ─── [NEW v15] FX: soporte de cajas por moneda ────────────────────────────
+
+  /** Cajas que aceptan una moneda dada */
+  const cajasQueAceptan = useCallback((m: PaymentMethod) =>
+    cajas.filter(c => getCajaConfig(c.nombre).monedasPermitidas.includes(m)),
+  [cajas]);
+
+  /** Caja por defecto de una moneda: la caja exclusiva de esa moneda (BS→Bancamiga, CASH→Efectivo) */
+  const defaultCajaFor = useCallback((m: PaymentMethod): string => {
+    const exclusiva = cajas.find(c => {
+      const cf = getCajaConfig(c.nombre);
+      return cf.monedasPermitidas.length === 1 && cf.monedasPermitidas[0] === m;
+    });
+    return exclusiva?.id ?? '';
+  }, [cajas]);
+
+  const cajaNombre = useCallback((id?: string | null) =>
+    id ? (cajas.find(c => c.id === id)?.nombre ?? 'CAJA ELIMINADA') : 'SOLO BÓVEDA',
+  [cajas]);
+
+  /** Conciliación: Bóveda (consolidado) vs Σ Cajas (custodia física) */
+  const conciliacion = useMemo(() => ALL_METHODS.map(m => {
+    const boveda     = getVaultBalance(m);
+    const enCajas    = round2(cajas.reduce((a, c) => a + getCajaBalance(c.id, m), 0));
+    const sinAsignar = round2(boveda - enCajas);
+    return { m, boveda, enCajas, sinAsignar };
+  }), [cajas, getVaultBalance, getCajaBalance]);
 
   // ─── SEGURIDAD ────────────────────────────────────────────────────────────
 
@@ -500,29 +644,50 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     setDirectorAuthOpen(false); setDirectorCode(''); setDirectorAuthError(null); setPendingSecureAction(null);
   };
 
-  // ─── SYNC HISTÓRICO ───────────────────────────────────────────────────────
+  // ─── [NEW v15] FX: PURGA / ANULACIÓN ──────────────────────────────────────
+  // Elimina TODAS las patas de un FX: Ledger (fx_id + referencias legacy),
+  // movimientos de caja y el registro FX. Con la migración v15 el borrado
+  // de fx_registros cascadea; los deletes explícitos cubren datos legacy.
 
-  const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[]) => {
-    const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0);
-    for (const c of paid) {
-      const inv = `${c.horas_compradas > 0 ? 'HORA' : 'CXC'}-${c.id}`;
-      const { data: exists } = await supabase.from('transacciones_finanzas').select('id').eq('invoice_number', inv).limit(1);
-      if (exists?.length) continue;
-      await supabase.from('transacciones_finanzas').insert([{
-        id: uuid4(), type: 'INCOME', entity_id: c.student_id,
-        entity_name: c.nombre_alumno || 'ALUMNO',
-        amount: round2(Number(c.monto_total) || 0), invoice_number: inv,
-        description: `${c.concepto || 'COBRO'} · SINCRONIZACIÓN HISTÓRICA`,
-        status: 'PAID', category: 'Academia',
-        payment_method: normalizePaymentMethod(c.moneda),
-        issue_date: c.fecha_emision ? new Date(c.fecha_emision).toISOString() : new Date().toISOString(),
-      }]);
+  const purgeFx = useCallback(async (fxId: string, extraRef?: string) => {
+    const refs = Array.from(new Set([
+      ...movCajas.filter(m => m.fx_id === fxId).map(m => m.referencia),
+      ...fxRegistros.filter(f => f.id === fxId).map(f => f.referencia ?? ''),
+      extraRef ?? '',
+    ].filter((r): r is string => !!r)));
+
+    const { error: eTx } = await supabase.from('transacciones_finanzas').delete().eq('fx_id', fxId);
+    if (eTx) throw new Error(`Ledger FX: ${eTx.message}`);
+
+    if (refs.length) {
+      const invoices = refs.flatMap(r => [r, `${r}-OUT`, `${r}-IN`]);
+      const { error: eLeg } = await supabase.from('transacciones_finanzas').delete().in('invoice_number', invoices);
+      if (eLeg) throw new Error(`Ledger FX legacy: ${eLeg.message}`);
     }
-  }, []);
+
+    const { error: eMov } = await supabase.from('movimientos_caja_chica').delete().eq('fx_id', fxId);
+    if (eMov) throw new Error(`Cajas FX: ${eMov.message}`);
+
+    const { error: eFx } = await supabase.from('fx_registros').delete().eq('id', fxId);
+    if (eFx) throw new Error(`Registro FX: ${eFx.message}`);
+  }, [movCajas, fxRegistros]);
+
+  const anularFX = (fxId: string) => requireDirectorCode(async () => {
+    setSavingAction(fxId);
+    try {
+      await purgeFx(fxId);
+      fetchLockRef.current = false; await fetchAll(true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Error al anular FX.';
+      setLedgerError(msg); setCajaError(msg);
+    } finally { setSavingAction(null); }
+  });
 
   // ─── EDICIÓN ──────────────────────────────────────────────────────────────
 
-  const openEditTx = (tx: FinanceTransaction) => {
+  const openEditTx = (tx: LedgerTx) => {
+    // [NEW v15] las patas FX no se editan por separado — rompería la partida doble
+    if (tx.fx_id) { alert('Este asiento pertenece a una operación FX. Anule el FX completo y regístrelo de nuevo en FX Desk.'); return; }
     const d = tx.issueDate ? new Date(tx.issueDate) : new Date();
     setEditingTx(tx);
     setEditTxForm({
@@ -538,6 +703,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     if (!editingTx) return;
     const amount = round2(parseFloat(editTxForm.amount));
     if (!Number.isFinite(amount) || amount <= 0) { setLedgerError('Monto inválido.'); return; }
+    // [NEW v15] un FX manual de una sola pata descuadra bóvedas
+    if (editTxForm.type === 'FX_EXCHANGE' && !editingTx.fx_id) {
+      setLedgerError('Un cambio de moneda se registra en FX Desk (2 patas). Cambie el tipo a Ingreso/Egreso o elimine el asiento.');
+      return;
+    }
     setSavingAction(editingTx.id);
     try {
       const { error } = await supabase.from('transacciones_finanzas').update({
@@ -555,6 +725,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   const openEditMov = (mov: MovimientoCaja) => {
     if (mov.transfer_id) { alert('Forma parte de una transferencia. Elimínela completa y créela de nuevo.'); return; }
+    if (mov.fx_id) { alert('Forma parte de una operación FX. Anule el FX completo y regístrelo de nuevo.'); return; }   // [NEW v15]
     setEditingMov(mov);
     const d = new Date(mov.fecha);
     setEditMovForm({
@@ -572,6 +743,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const monto = round2(parseFloat(editMovForm.monto));
     if (!Number.isFinite(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
     if (!editMovForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
+    // [FIX v15] respetar monedas permitidas por la caja
+    const cajaObj = cajas.find(c => c.id === editingMov.caja_id);
+    const conf    = getCajaConfig(cajaObj?.nombre ?? '');
+    if (!conf.monedasPermitidas.includes(editMovForm.moneda)) {
+      setCajaError(`Esta caja solo acepta: ${conf.monedasPermitidas.join(', ')}`); return;
+    }
     setSavingAction(editingMov.id);
     try {
       const { error } = await supabase.from('movimientos_caja_chica').update({
@@ -590,25 +767,35 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   // ─── ELIMINACIÓN ──────────────────────────────────────────────────────────
 
-  const deleteTxProtected = (id: string) => requireDirectorCode(async () => {
-    setSavingAction(id);
-    try {
-      const tx = transactions.find(t => t.id === id);
-      const { error } = await supabase.from('transacciones_finanzas').delete().eq('id', id);
-      if (error) throw new Error(error.message);
-      if (tx?.invoiceNumber?.startsWith('CXC-') || tx?.invoiceNumber?.startsWith('HORA-')) {
-        const cxcId = tx.invoiceNumber.replace(/^CXC-/, '').replace(/^HORA-/, '');
-        await supabase.from('cuentas_por_cobrar').delete().eq('id', cxcId);
-      }
-      fetchLockRef.current = false; await fetchAll(true);
-    } catch (err) {
-      setLedgerError(err instanceof Error ? err.message : 'Error al eliminar.');
-    } finally { setSavingAction(null); }
-  });
+  const deleteTxProtected = (id: string) => {
+    // [NEW v15] si es pata FX (nueva o legacy) → anular el FX completo
+    const txSel  = transactions.find(t => t.id === id);
+    const fxLink = txSel?.fx_id
+      ?? (txSel?.invoiceNumber ? movCajas.find(m => m.fx_id && m.referencia === txSel.invoiceNumber)?.fx_id : null)
+      ?? null;
+    if (fxLink) { anularFX(fxLink); return; }
+
+    requireDirectorCode(async () => {
+      setSavingAction(id);
+      try {
+        const tx = transactions.find(t => t.id === id);
+        const { error } = await supabase.from('transacciones_finanzas').delete().eq('id', id);
+        if (error) throw new Error(error.message);
+        if (tx?.invoiceNumber?.startsWith('CXC-') || tx?.invoiceNumber?.startsWith('HORA-')) {
+          const cxcId = tx.invoiceNumber.replace(/^CXC-/, '').replace(/^HORA-/, '');
+          await supabase.from('cuentas_por_cobrar').delete().eq('id', cxcId);
+        }
+        fetchLockRef.current = false; await fetchAll(true);
+      } catch (err) {
+        setLedgerError(err instanceof Error ? err.message : 'Error al eliminar.');
+      } finally { setSavingAction(null); }
+    });
+  };
 
   const deleteMovProtected = (id: string) => {
     const mov = movCajas.find(m => m.id === id);
     if (mov?.transfer_id) { openDeleteTransferModal(mov.transfer_id); return; }
+    if (mov?.fx_id)       { anularFX(mov.fx_id); return; }   // [NEW v15]
     requireDirectorCode(async () => {
       setSavingAction(id);
       try {
@@ -648,6 +835,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
   const handleLedger = async (e: React.FormEvent) => {
     e.preventDefault(); setLedgerError(null);
+    // [NEW v15] FX nunca se registra manualmente en una sola pata
+    if (ledger.type === 'FX_EXCHANGE') { openFxDesk(ledger.currency); return; }
     const num = round2(parseFloat(ledger.amount));
     if (isNaN(num) || num <= 0) { setLedgerError('Monto inválido.'); return; }
     if (ledger.type === 'INSTRUCTOR_PAY' && !ledger.capitanId) { setLedgerError('Selecciona un capitán.'); return; }
@@ -681,7 +870,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     if (isNaN(num) || num <= 0) { setCajaError('Monto inválido.'); return; }
     if (!movForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
 
-    // validación de moneda según restricciones de la caja
     const cajaObj   = cajas.find(c => c.id === cajaActiva);
     const cajaConf  = getCajaConfig(cajaObj?.nombre ?? '');
     if (!cajaConf.monedasPermitidas.includes(movForm.moneda)) {
@@ -699,7 +887,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         referencia: movForm.referencia.toUpperCase().trim() || null,
         fecha:      new Date(movForm.fecha).toISOString(),
         registrado_por: userRole,
-        subcaja: esCajaEfectivo ? movForm.subcaja : null,   // [NEW]
+        subcaja: esCajaEfectivo ? movForm.subcaja : null,
       }]);
       if (error) { setCajaError(`Error: ${error.message}`); return; }
       setMovForm(p => ({ ...p, monto: '', concepto: '', referencia: '' }));
@@ -709,20 +897,28 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     } finally { setSavingCaja(false); }
   };
 
+  /** [FIX v15] Activar caja fija la moneda a una permitida */
+  const toggleCajaActiva = (caja: CajaChica) => {
+    if (cajaActiva === caja.id) { setCajaActiva(null); return; }
+    const conf = getCajaConfig(caja.nombre);
+    setCajaActiva(caja.id);
+    if (!conf.monedasPermitidas.includes(movForm.moneda)) {
+      setMovForm(p => ({ ...p, moneda: conf.monedasPermitidas[0] }));
+    }
+  };
+
   // ─── HANDLER: ENTREGA ADM → CEO ──────────────────────────────────────────
-  // [NEW] Caja Efectivo: mueve fondos de subcaja ADM a subcaja CEO.
-  // Genera SALIDA en ADM + ENTRADA en CEO dentro de la misma caja_id.
 
   const handleEntregaCEO = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cajaEfectivo = cajas.find(c => getCajaConfig(c.nombre).esCajaEfectivo);
-    if (!cajaEfectivo) { alert('No se encontró la caja de efectivo.'); return; }
+    const cajaEfectivoObj = cajas.find(c => getCajaConfig(c.nombre).esCajaEfectivo);
+    if (!cajaEfectivoObj) { alert('No se encontró la caja de efectivo.'); return; }
 
     const monto = round2(parseFloat(entregaCEOForm.monto));
     if (isNaN(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
     if (!entregaCEOForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
 
-    const saldoADM = getSubcajaBalance(cajaEfectivo.id, 'ADM');
+    const saldoADM = getSubcajaBalance(cajaEfectivoObj.id, 'ADM');
     if (monto > saldoADM) {
       const ok = window.confirm(`⚠️ ADM solo tiene ${fmtMonto(saldoADM, 'CASH')} disponible.\n¿Registrar de todas formas?`);
       if (!ok) return;
@@ -733,9 +929,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const fechaISO   = new Date(entregaCEOForm.fecha).toISOString();
 
     try {
-      // SALIDA de ADM
       const { error: e1 } = await supabase.from('movimientos_caja_chica').insert([{
-        id: uuid4(), caja_id: cajaEfectivo.id,
+        id: uuid4(), caja_id: cajaEfectivoObj.id,
         tipo: 'SALIDA', moneda: 'CASH', monto,
         concepto:   `ENTREGA A CEO ← ${entregaCEOForm.concepto.toUpperCase().trim()}`,
         referencia: refEntrega, fecha: fechaISO,
@@ -743,9 +938,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       }]);
       if (e1) throw new Error(`ADM Salida: ${e1.message}`);
 
-      // ENTRADA a CEO
       const { error: e2 } = await supabase.from('movimientos_caja_chica').insert([{
-        id: uuid4(), caja_id: cajaEfectivo.id,
+        id: uuid4(), caja_id: cajaEfectivoObj.id,
         tipo: 'ENTRADA', moneda: 'CASH', monto,
         concepto:   `RECIBIDO DE ADM → ${entregaCEOForm.concepto.toUpperCase().trim()}`,
         referencia: refEntrega, fecha: fechaISO,
@@ -764,91 +958,195 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     } finally { setSavingCaja(false); }
   };
 
-  // ─── HANDLER: FX DESK ────────────────────────────────────────────────────
-  // [NEW] Registra cambio de moneda con trazabilidad completa:
-  // (1) fx_registros — audit trail del tipo de cambio y montos
-  // (2) SALIDA en moneda_origen de la caja + ENTRADA en moneda_destino
-  //
-  // Caso de uso principal: vender USDT/ZELLE/CASH y recibir BS para pagar nómina.
+  // ─── [CHG v15] FX DESK INTERCONECTADO ─────────────────────────────────────
+  // Partida doble por operación (sin duplicar valor):
+  //   Bóveda origen  −M_o   (Ledger FX_EXCHANGE, fx_leg=OUT)
+  //   Caja origen    −M_o   (SALIDA, opcional si el dinero no estaba en una caja)
+  //   Bóveda destino +M_d   (Ledger FX_EXCHANGE, fx_leg=IN)
+  //   Caja destino   +M_d   (ENTRADA, ej. Bancamiga para BS)
+  // Las patas FX NO cuentan como ingreso/egreso operativo: solo mueven valor entre monedas.
+
+  /** Abre FX Desk con defaults: origen USDT/ZELLE/CASH → destino BS en su caja exclusiva */
+  const openFxDesk = (origenPreferido?: PaymentMethod) => {
+    const origen: PaymentMethod  = origenPreferido && origenPreferido !== 'BS' ? origenPreferido : 'USDT';
+    const destino: PaymentMethod = 'BS';
+    setFxError(null);
+    setFxForm({
+      caja_origen_id:  defaultCajaFor(origen),
+      caja_destino_id: defaultCajaFor(destino),
+      subcaja_origen:  'ADM',
+      subcaja_destino: 'ADM',
+      moneda_origen:   origen,
+      moneda_destino:  destino,
+      monto_origen:    '',
+      tasa:            String(tasaBCV),
+      concepto:        '',
+      fecha:           hoyISO(),
+    });
+    setFxModalOpen(true);
+  };
+
+  /** Cambia moneda de un lado; corrige caja incompatible y ajusta la tasa según el par */
+  const setFxMoneda = (lado: 'ORIGEN' | 'DESTINO', m: PaymentMethod) => {
+    setFxForm(p => {
+      const next = { ...p };
+      if (lado === 'ORIGEN') {
+        next.moneda_origen = m;
+        const caja = cajas.find(c => c.id === p.caja_origen_id);
+        if (!caja || !getCajaConfig(caja.nombre).monedasPermitidas.includes(m)) next.caja_origen_id = defaultCajaFor(m);
+      } else {
+        next.moneda_destino = m;
+        const caja = cajas.find(c => c.id === p.caja_destino_id);
+        if (!caja || !getCajaConfig(caja.nombre).monedasPermitidas.includes(m)) next.caja_destino_id = defaultCajaFor(m);
+      }
+      const prevBS = p.moneda_origen === 'BS' || p.moneda_destino === 'BS';
+      const nextBS = next.moneda_origen === 'BS' || next.moneda_destino === 'BS';
+      if (nextBS && !prevBS) next.tasa = String(tasaBCV);
+      if (!nextBS && prevBS) next.tasa = '1';
+      return next;
+    });
+  };
+
+  /** Fallback no-atómico con compensación (solo si el RPC no existe todavía) */
+  const registrarFxFallback = async (p: FxPayload) => {
+    try {
+      const { error: eFx } = await supabase.from('fx_registros').insert([{
+        id: p.fxId, fecha: p.fechaISO,
+        moneda_origen: p.monedaOrigen, moneda_destino: p.monedaDestino,
+        monto_origen: p.montoOrigen, monto_destino: p.montoDestino, tasa: p.tasa,
+        concepto: p.concepto, registrado_por: userRole,
+        caja_id: p.cajaOrigenId, caja_origen_id: p.cajaOrigenId, caja_destino_id: p.cajaDestinoId,
+        subcaja_origen: p.subcajaOrigen, subcaja_destino: p.subcajaDestino, referencia: p.referencia,
+      }]);
+      if (eFx) throw new Error(`Registro FX: ${eFx.message}`);
+
+      const movs: any[] = [];
+      if (p.cajaOrigenId) movs.push({
+        id: uuid4(), caja_id: p.cajaOrigenId, tipo: 'SALIDA', moneda: p.monedaOrigen, monto: p.montoOrigen,
+        concepto: `FX VENTA ${p.monedaOrigen}→${p.monedaDestino} · DESTINO ${p.cajaDestinoNombre} · ${p.concepto}`,
+        referencia: p.referencia, fecha: p.fechaISO, registrado_por: userRole,
+        subcaja: p.subcajaOrigen, fx_id: p.fxId, fx_role: 'SALIDA',
+      });
+      if (p.cajaDestinoId) movs.push({
+        id: uuid4(), caja_id: p.cajaDestinoId, tipo: 'ENTRADA', moneda: p.monedaDestino, monto: p.montoDestino,
+        concepto: `FX COMPRA ${p.monedaDestino}←${p.monedaOrigen} · ORIGEN ${p.cajaOrigenNombre} · ${p.concepto}`,
+        referencia: p.referencia, fecha: p.fechaISO, registrado_por: userRole,
+        subcaja: p.subcajaDestino, fx_id: p.fxId, fx_role: 'ENTRADA',
+      });
+      if (movs.length) {
+        const { error: eMov } = await supabase.from('movimientos_caja_chica').insert(movs);
+        if (eMov) throw new Error(`Cajas FX: ${eMov.message}`);
+      }
+
+      const desc = `Cambio ${p.monedaOrigen} → ${p.monedaDestino} @ ${p.tasa} · ${p.cajaOrigenNombre} → ${p.cajaDestinoNombre} · ${p.concepto}`;
+      const { error: eTx } = await supabase.from('transacciones_finanzas').insert([
+        {
+          id: uuid4(), type: 'FX_EXCHANGE',
+          entity_name: `FX SALIDA ${p.monedaOrigen}→${p.monedaDestino}`,
+          amount: p.montoOrigen, invoice_number: `${p.referencia}-OUT`, description: desc,
+          status: 'PAID', category: 'FX', payment_method: p.monedaOrigen, issue_date: p.fechaISO,
+          fx_id: p.fxId, fx_leg: 'OUT',
+        },
+        {
+          id: uuid4(), type: 'FX_EXCHANGE',
+          entity_name: `FX ENTRADA ${p.monedaDestino}←${p.monedaOrigen}`,
+          amount: p.montoDestino, invoice_number: `${p.referencia}-IN`, description: desc,
+          status: 'PAID', category: 'FX', payment_method: p.monedaDestino, issue_date: p.fechaISO,
+          fx_id: p.fxId, fx_leg: 'IN',
+        },
+      ]);
+      if (eTx) throw new Error(`Bóvedas FX: ${eTx.message}`);
+    } catch (err) {
+      try { await purgeFx(p.fxId, p.referencia); } catch (rb) { console.error('[FX v15] rollback falló:', rb); }
+      throw err;
+    }
+  };
 
   const handleFX = async (e: React.FormEvent) => {
     e.preventDefault(); setFxError(null);
+    const f = fxForm;
 
-    if (fxForm.moneda_origen === fxForm.moneda_destino) { setFxError('Las monedas deben ser distintas.'); return; }
-    if (!fxForm.caja_id) { setFxError('Selecciona la caja de operación.'); return; }
+    if (f.moneda_origen === f.moneda_destino) { setFxError('Las monedas deben ser distintas.'); return; }
+    const montoOrigen = round2(parseFloat(f.monto_origen));
+    const tasa        = round4(parseFloat(f.tasa));
+    if (!Number.isFinite(montoOrigen) || montoOrigen <= 0) { setFxError('Monto inválido.'); return; }
+    if (!Number.isFinite(tasa) || tasa <= 0)               { setFxError('Tasa inválida.'); return; }
+    if (!f.concepto.trim())                                { setFxError('Concepto obligatorio.'); return; }
 
-    const montoOrigen = round2(parseFloat(fxForm.monto_origen));
-    const tasa        = round2(parseFloat(fxForm.tasa));
-    if (isNaN(montoOrigen) || montoOrigen <= 0) { setFxError('Monto inválido.'); return; }
-    if (isNaN(tasa) || tasa <= 0)               { setFxError('Tasa inválida.'); return; }
-    if (!fxForm.concepto.trim())                { setFxError('Concepto obligatorio.'); return; }
+    const montoDestino = computeFxDestino(f.moneda_origen, f.moneda_destino, montoOrigen, tasa);
+    if (montoDestino === null || montoDestino <= 0) { setFxError('No se pudo calcular el monto destino.'); return; }
 
-    // Cálculo del monto destino según dirección del cambio
-    let montoDestino: number;
-    if (fxForm.moneda_destino === 'BS') {
-      montoDestino = round2(montoOrigen * tasa);      // USD → BS: multiplicar
-    } else if (fxForm.moneda_origen === 'BS') {
-      montoDestino = round2(montoOrigen / tasa);      // BS → USD: dividir
-    } else {
-      montoDestino = montoOrigen;                     // USD↔USD: 1:1 (ej. USDT↔ZELLE)
+    // Validación de cajas contra restricciones de moneda
+    const cajaO = f.caja_origen_id  ? cajas.find(c => c.id === f.caja_origen_id)  ?? null : null;
+    const cajaD = f.caja_destino_id ? cajas.find(c => c.id === f.caja_destino_id) ?? null : null;
+    if (f.caja_origen_id  && !cajaO) { setFxError('Caja origen no encontrada.'); return; }
+    if (f.caja_destino_id && !cajaD) { setFxError('Caja destino no encontrada.'); return; }
+    const confO = cajaO ? getCajaConfig(cajaO.nombre) : null;
+    const confD = cajaD ? getCajaConfig(cajaD.nombre) : null;
+    if (cajaO && confO && !confO.monedasPermitidas.includes(f.moneda_origen)) {
+      setFxError(`${cajaO.nombre} no opera ${f.moneda_origen}.`); return;
+    }
+    if (cajaD && confD && !confD.monedasPermitidas.includes(f.moneda_destino)) {
+      setFxError(`${cajaD.nombre} no opera ${f.moneda_destino}.`); return;
+    }
+    const subcajaOrigen  = confO?.esCajaEfectivo ? f.subcaja_origen  : null;
+    const subcajaDestino = confD?.esCajaEfectivo ? f.subcaja_destino : null;
+
+    // Verificación de fondos (advertencia, no bloqueo — igual que transferencias)
+    const avisos: string[] = [];
+    const saldoBoveda = getVaultBalance(f.moneda_origen);
+    if (saldoBoveda < montoOrigen) avisos.push(`Bóveda ${f.moneda_origen}: ${fmtMonto(saldoBoveda, f.moneda_origen)} disponible`);
+    if (cajaO) {
+      const saldoCaja = subcajaOrigen ? getSubcajaBalance(cajaO.id, subcajaOrigen) : getCajaBalance(cajaO.id, f.moneda_origen);
+      if (saldoCaja < montoOrigen) avisos.push(`${cajaO.nombre}${subcajaOrigen ? ` (${subcajaOrigen})` : ''}: ${fmtMonto(saldoCaja, f.moneda_origen)} disponible`);
+    }
+    if (avisos.length) {
+      const ok = window.confirm(`⚠️ Fondos insuficientes para vender ${fmtMonto(montoOrigen, f.moneda_origen)}\n\n${avisos.join('\n')}\n\n¿Registrar de todas formas?`);
+      if (!ok) return;
     }
 
+    const fxId = uuid4();
+    const payload: FxPayload = {
+      fxId,
+      referencia:        `FX-${genHash(fxId)}`,
+      fechaISO:          new Date(f.fecha).toISOString(),
+      monedaOrigen:      f.moneda_origen,
+      monedaDestino:     f.moneda_destino,
+      montoOrigen,
+      montoDestino,
+      tasa,
+      concepto:          f.concepto.toUpperCase().trim(),
+      cajaOrigenId:      cajaO?.id ?? null,
+      cajaDestinoId:     cajaD?.id ?? null,
+      cajaOrigenNombre:  cajaO ? cajaO.nombre.toUpperCase() : 'BÓVEDA',
+      cajaDestinoNombre: cajaD ? cajaD.nombre.toUpperCase() : 'BÓVEDA',
+      subcajaOrigen,
+      subcajaDestino,
+    };
+
     setSavingFX(true);
-    const fxId     = uuid4();
-    const fechaISO = new Date(fxForm.fecha).toISOString();
-    const refFX    = `FX-${genHash(fxId)}`;
-    const concepto = fxForm.concepto.toUpperCase().trim();
-
     try {
-      // (1) Registro FX — tabla de auditoría de cambios
-      const { error: fxErr } = await supabase.from('fx_registros').insert([{
-        id: fxId, fecha: fechaISO,
-        moneda_origen:  fxForm.moneda_origen,
-        moneda_destino: fxForm.moneda_destino,
-        monto_origen:   montoOrigen,
-        monto_destino:  montoDestino,
-        tasa,
-        concepto,
-        registrado_por: userRole,
-        caja_id: fxForm.caja_id,
-      }]);
-      if (fxErr) throw new Error(`FX registro: ${fxErr.message}`);
-
-      // (2) SALIDA en moneda origen — dinero que sale de la bóveda/caja
-      const { error: eS } = await supabase.from('movimientos_caja_chica').insert([{
-        id: uuid4(), caja_id: fxForm.caja_id,
-        tipo: 'SALIDA', moneda: fxForm.moneda_origen, monto: montoOrigen,
-        concepto:   `FX VENTA ${fxForm.moneda_origen}→${fxForm.moneda_destino} · ${concepto}`,
-        referencia: refFX, fecha: fechaISO,
-        registrado_por: userRole, fx_id: fxId,
-      }]);
-      if (eS) { await supabase.from('fx_registros').delete().eq('id', fxId); throw new Error(`FX salida: ${eS.message}`); }
-
-      // (3) ENTRADA en moneda destino — dinero que entra a la bóveda/caja
-      const { error: eE } = await supabase.from('movimientos_caja_chica').insert([{
-        id: uuid4(), caja_id: fxForm.caja_id,
-        tipo: 'ENTRADA', moneda: fxForm.moneda_destino, monto: montoDestino,
-        concepto:   `FX COMPRA ${fxForm.moneda_destino}←${fxForm.moneda_origen} · ${concepto}`,
-        referencia: refFX, fecha: fechaISO,
-        registrado_por: userRole, fx_id: fxId,
-      }]);
-      if (eE) {
-        await supabase.from('movimientos_caja_chica').delete().eq('fx_id', fxId);
-        await supabase.from('fx_registros').delete().eq('id', fxId);
-        throw new Error(`FX entrada: ${eE.message}`);
+      const { error: rpcErr } = await supabase.rpc('fn_registrar_fx', {
+        p_fx_id:           payload.fxId,
+        p_fecha:           payload.fechaISO,
+        p_moneda_origen:   payload.monedaOrigen,
+        p_moneda_destino:  payload.monedaDestino,
+        p_monto_origen:    payload.montoOrigen,
+        p_monto_destino:   payload.montoDestino,
+        p_tasa:            payload.tasa,
+        p_concepto:        payload.concepto,
+        p_referencia:      payload.referencia,
+        p_registrado_por:  userRole,
+        p_caja_origen_id:  payload.cajaOrigenId,
+        p_caja_destino_id: payload.cajaDestinoId,
+        p_subcaja_origen:  payload.subcajaOrigen,
+        p_subcaja_destino: payload.subcajaDestino,
+      });
+      if (rpcErr) {
+        if (!isMissingRpc(rpcErr)) throw new Error(`FX atómico: ${rpcErr.message}`);
+        console.warn('[FX v15] RPC fn_registrar_fx no encontrado — usando fallback compensado. Ejecute migracion_finance_v15.sql.');
+        await registrarFxFallback(payload);
       }
-
-      // (4) Asiento en Ledger como EXPENSE (para nómina) o INCOME según dirección
-      const isNomina = concepto.includes('NÓMIN') || concepto.includes('NOMINA');
-      await supabase.from('transacciones_finanzas').insert([{
-        id: uuid4(), type: isNomina ? 'EXPENSE' : 'INCOME',
-        entity_name: `FX ${fxForm.moneda_origen}→${fxForm.moneda_destino}`,
-        amount: montoOrigen, invoice_number: refFX,
-        description: `Cambio ${fxForm.moneda_origen} → ${fxForm.moneda_destino} @ ${tasa} · ${concepto}`,
-        status: 'PAID', category: isNomina ? 'Nomina' : 'FX',
-        payment_method: fxForm.moneda_origen,
-        issue_date: fechaISO,
-      }]);
 
       setFxForm(p => ({ ...p, monto_origen: '', concepto: '' }));
       setFxModalOpen(false);
@@ -859,19 +1157,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   // monto destino calculado en tiempo real para preview
-  const fxMontoDestino = useMemo(() => {
-    const mo = parseFloat(fxForm.monto_origen);
-    const t  = parseFloat(fxForm.tasa);
-    if (isNaN(mo) || isNaN(t) || mo <= 0 || t <= 0) return null;
-    if (fxForm.moneda_destino === 'BS') return round2(mo * t);
-    if (fxForm.moneda_origen  === 'BS') return round2(mo / t);
-    return round2(mo);
-  }, [fxForm.monto_origen, fxForm.tasa, fxForm.moneda_origen, fxForm.moneda_destino]);
+  const fxMontoDestino = useMemo(() =>
+    computeFxDestino(fxForm.moneda_origen, fxForm.moneda_destino, parseFloat(fxForm.monto_origen), parseFloat(fxForm.tasa)),
+  [fxForm.monto_origen, fxForm.tasa, fxForm.moneda_origen, fxForm.moneda_destino]);
 
   // ─── HANDLER: PRÉSTAMO EXTERNO ────────────────────────────────────────────
-  // [NEW] Becquer o Roberto prestan dinero a Águilas (o Águilas devuelve).
-  // Registra en movimientos_caja_chica con flags es_prestamo=true, prestamista.
-  // También crea CxP en cuentas_generales para trackear la deuda.
 
   const handlePrestamo = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -887,7 +1177,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
     try {
       if (!prestamoForm.es_devolucion) {
-        // ── PRÉSTAMO: entra dinero a la caja ──────────────────────────────
         const { error: eM } = await supabase.from('movimientos_caja_chica').insert([{
           id: uuid4(), caja_id: prestamoForm.caja_id,
           tipo: 'ENTRADA', moneda: prestamoForm.moneda, monto,
@@ -898,7 +1187,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         }]);
         if (eM) throw new Error(eM.message);
 
-        // CxP generada automáticamente — Águilas debe devolver este dinero
         const { error: eCxP } = await supabase.from('cuentas_generales').insert([{
           tipo: 'CXP',
           entidad_nombre: `DEVOLUCIÓN A ${prestamoForm.prestamista}`,
@@ -909,10 +1197,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
           fecha_emision: fechaISO, estatus: 'PENDIENTE',
           notas: `Ref: ${refPrestamo}`,
         }]);
-        if (eCxP) console.warn('[v14] CxP de préstamo falló (no bloquea):', eCxP.message);
+        if (eCxP) console.warn('[v15] CxP de préstamo falló (no bloquea):', eCxP.message);
 
       } else {
-        // ── DEVOLUCIÓN: sale dinero de la caja ────────────────────────────
         const { error: eM } = await supabase.from('movimientos_caja_chica').insert([{
           id: uuid4(), caja_id: prestamoForm.caja_id,
           tipo: 'SALIDA', moneda: prestamoForm.moneda, monto,
@@ -1213,6 +1500,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         await supabase.from('cuentas_generales').update({ estatus: 'PAGADO', monto_pendiente: 0 }).eq('id', id);
       }
       fetchLockRef.current = false; await fetchAll(true);
+    } catch (err) {
+      setCuentaError(err instanceof Error ? err.message : 'Error al registrar pago.');
     } finally { setSavingAction(null); }
   };
 
@@ -1264,8 +1553,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   };
 
   const handleExportCSV = () => downloadCSV([
-    ['Fecha','Ref','Entidad','Metodo','Monto','Tipo','Estatus'],
-    ...transactions.map(t => [fmtDate(t.issueDate), t.invoiceNumber, `"${t.entityName}"`, t.payment_method||'N/A', String(t.amount), t.type, t.status]),
+    ['Fecha','Ref','Entidad','Metodo','Monto','Tipo','Estatus','Pata FX','Monto con signo'],   // [CHG v15]
+    ...transactions.map(t => [
+      fmtDate(t.issueDate), t.invoiceNumber, `"${t.entityName}"`, t.payment_method||'N/A',
+      String(t.amount), String(t.type), t.status, t.fx_leg || '—', String(signedLedgerAmount(t)),
+    ]),
   ], `FinanzasAguilas_${new Date().toISOString().split('T')[0]}.csv`);
 
   const handleExportCajaIndividual = (cajaId: string) => {
@@ -1273,10 +1565,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const movs = movCajas.filter(m => m.caja_id === cajaId);
     downloadCSV([
       [`CAJA: ${caja.nombre.toUpperCase()}`], [`Exportado: ${new Date().toLocaleDateString('es-VE')}`], [],
-      ['Fecha','Tipo','Moneda','Monto','Concepto','Referencia','Por','Subcaja','Préstamo','Prestamista'],
+      ['Fecha','Tipo','Moneda','Monto','Concepto','Referencia','Por','Subcaja','Préstamo','Prestamista','FX'],
       ...movs.map(m => [fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2),
         `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.registrado_por||'Sistema',
-        m.subcaja||'—', m.es_prestamo?'SÍ':'NO', m.prestamista||'—']),
+        m.subcaja||'—', m.es_prestamo?'SÍ':'NO', m.prestamista||'—', m.fx_id?'SÍ':'NO']),
     ], `Caja_${caja.nombre.replace(/\s+/g,'_')}_${new Date().toISOString().split('T')[0]}.csv`);
   };
 
@@ -1284,9 +1576,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
     const all: string[][] = [[`CAJAS CHICAS · ${new Date().toLocaleDateString('es-VE')}`], []];
     cajas.forEach(caja => {
       const movs = movCajas.filter(m => m.caja_id === caja.id);
-      all.push([`CAJA: ${caja.nombre.toUpperCase()}`], ['Fecha','Tipo','Moneda','Monto','Concepto','Referencia','Subcaja','Prestamista']);
+      all.push([`CAJA: ${caja.nombre.toUpperCase()}`], ['Fecha','Tipo','Moneda','Monto','Concepto','Referencia','Subcaja','Prestamista','FX']);
       movs.forEach(m => all.push([fmtDate(m.fecha), m.tipo, m.moneda, m.monto.toFixed(2),
-        `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.subcaja||'—', m.prestamista||'—']));
+        `"${m.concepto||''}"`, `"${m.referencia||''}"`, m.subcaja||'—', m.prestamista||'—', m.fx_id?'SÍ':'NO']));
       all.push([]);
     });
     downloadCSV(all, `Cajas_${new Date().toISOString().split('T')[0]}.csv`);
@@ -1303,7 +1595,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
   if (loading) return (
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v14.0...</p>
+      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v15.0...</p>
     </div>
   );
 
@@ -1316,9 +1608,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
           <div>
-            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v14.0</p>
+            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v15.0</p>
             <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">
-              Caja Efectivo ADM/CEO · FX Desk · Préstamos Externos
+              FX interconectado Caja ↔ Bóveda · Partida doble · Conciliación
             </p>
           </div>
           <button onClick={() => { fetchLockRef.current = false; fetchAll(true); }} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors">
@@ -1346,12 +1638,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       </div>
 
-      {/* KPI BÓVEDAS */}
+      {/* KPI BÓVEDAS — [CHG v15] Ingresado/Egresado operativos + FX neto por separado */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m => {
-          const ing   = transactions.filter(t => t.payment_method===m && t.status==='PAID' && (t.type==='INCOME'||t.type==='RECEIVABLE')).reduce((a,t) => round2(a+t.amount), 0);
-          const egr   = transactions.filter(t => t.payment_method===m && t.status==='PAID' && (t.type==='EXPENSE'||t.type==='PAYABLE'||t.type==='INSTRUCTOR_PAY')).reduce((a,t) => round2(a+t.amount), 0);
-          const saldo = round2(ing - egr);
+        {ALL_METHODS.map(m => {
+          const paid  = transactions.filter(t => t.payment_method === m && t.status === 'PAID');
+          const ing   = paid.filter(t => !isFxTx(t) && signedLedgerAmount(t) > 0).reduce((a, t) => round2(a + t.amount), 0);
+          const egr   = paid.filter(t => !isFxTx(t) && signedLedgerAmount(t) < 0).reduce((a, t) => round2(a + t.amount), 0);
+          const saldo = getVaultBalance(m);
+          const fxNet = round2(saldo - ing + egr);
           const prefix = m === 'BS' ? 'Bs' : '$';
           const fmt = (n: number) => `${prefix} ${round2(n).toLocaleString('es-VE',{minimumFractionDigits:2})}`;
           return (
@@ -1360,9 +1654,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 <span className={`text-[9px] font-black uppercase tracking-widest ${MONEDA_COLOR[m]}`}>{m}</span>
                 <span className={`text-[7px] font-black px-2 py-1 rounded-full border ${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`}>{saldo >= 0 ? 'POSITIVO' : 'NEGATIVO'}</span>
               </div>
-              <div className="grid grid-cols-2 gap-2 text-center">
-                <div><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">Ingresado</p><p className="text-emerald-400 font-black text-xs italic">{fmt(ing)}</p></div>
-                <div><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">Egresado</p><p className="text-red-400 font-black text-xs italic">{fmt(egr)}</p></div>
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">Ingresado</p><p className="text-emerald-400 font-black text-[11px] italic">{fmt(ing)}</p></div>
+                <div><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">Egresado</p><p className="text-red-400 font-black text-[11px] italic">{fmt(egr)}</p></div>
+                <div><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">FX neto</p><p className={`font-black text-[11px] italic ${fxNet >= 0 ? 'text-teal-400' : 'text-teal-600'}`}>{fxNet >= 0 ? '+' : '−'}{fmt(Math.abs(fxNet))}</p></div>
               </div>
               <div className="border-t border-white/5 pt-2 text-center">
                 <p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">Saldo Neto</p>
@@ -1373,7 +1668,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         })}
       </div>
 
-      {/* [NEW] CAJA EFECTIVO — PANEL ADM/CEO (visible siempre) */}
+      {/* CAJA EFECTIVO — PANEL ADM/CEO */}
       {cajaEfectivo && (
         <div className={`${glass} bg-yellow-500/5 border border-yellow-500/20 rounded-2xl p-5`}>
           <div className="flex items-center justify-between mb-4">
@@ -1463,11 +1758,16 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <form onSubmit={handleLedger} className="space-y-4">
               <input type="date" required value={ledger.fecha} onChange={e=>setLedger(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}} />
               <div className="grid grid-cols-2 gap-3">
-                <select value={ledger.type} onChange={e=>setLedger(p=>({...p,type:e.target.value as any}))} className={inp}>
+                <select value={ledger.type}
+                  onChange={e=>{
+                    const v = e.target.value as TransactionType;
+                    if (v === 'FX_EXCHANGE') { openFxDesk(ledger.currency); return; }   // [NEW v15]
+                    setLedger(p=>({...p,type:v}));
+                  }} className={inp}>
                   <option value="INCOME">INGRESO (+)</option>
                   <option value="EXPENSE">EGRESO (-)</option>
                   <option value="INSTRUCTOR_PAY">NÓMINA</option>
-                  <option value="FX_EXCHANGE">FX CAMBIO</option>
+                  <option value="FX_EXCHANGE">FX CAMBIO → FX DESK</option>
                 </select>
                 <select value={ledger.currency} onChange={e=>setLedger(p=>({...p,currency:e.target.value as any}))} className={inp}>
                   <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
@@ -1500,7 +1800,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="p-6 border-b border-white/5 flex justify-between items-center">
               <h3 className="text-[10px] font-black uppercase tracking-widest italic">Libro Mayor</h3>
               <div className="flex gap-2">
-                <button onClick={() => setFxModalOpen(true)}
+                <button onClick={() => openFxDesk()}
                   className="bg-teal-500/10 text-teal-400 px-4 py-2 rounded-xl border border-teal-500/20 text-[9px] font-black uppercase hover:bg-teal-500/20 flex items-center gap-2 transition-all">
                   <TrendingUp size={11}/> FX Desk
                 </button>
@@ -1510,53 +1810,77 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </div>
             </div>
 
-            {/* [NEW] FX Registros recientes */}
+            {/* [CHG v15] FX recientes con ruta caja→caja y anulación */}
             {fxRegistros.length > 0 && (
               <div className="px-4 pt-4">
                 <p className="text-[8px] text-teal-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1">
-                  <TrendingUp size={10}/> Operaciones FX Recientes
+                  <TrendingUp size={10}/> Operaciones FX recientes
                 </p>
-                <div className="space-y-1 max-h-[120px] overflow-y-auto">
-                  {fxRegistros.slice(0,5).map(fx => (
-                    <div key={fx.id} className="bg-teal-500/5 border border-teal-500/10 p-3 rounded-xl flex justify-between items-center">
-                      <div>
-                        <p className="text-[9px] font-black uppercase text-teal-400">{fx.moneda_origen} → {fx.moneda_destino}</p>
-                        <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(fx.fecha)} · {fx.concepto}</p>
+                <div className="space-y-1 max-h-[160px] overflow-y-auto">
+                  {fxRegistros.slice(0,8).map(fx => {
+                    const tienePatas = transactions.some(t => t.fx_id === fx.id && !!t.fx_leg);
+                    return (
+                      <div key={fx.id} className="bg-teal-500/5 border border-teal-500/10 p-3 rounded-xl flex justify-between items-center group">
+                        <div className="min-w-0">
+                          <p className="text-[9px] font-black uppercase text-teal-400 flex items-center gap-2">
+                            {fx.moneda_origen} → {fx.moneda_destino}
+                            {!tienePatas && <span className="text-[7px] px-1.5 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20">LEGACY · anular y re-registrar</span>}
+                          </p>
+                          <p className="text-[8px] text-zinc-500 font-mono truncate">
+                            {cajaNombre(fx.caja_origen_id)}{fx.subcaja_origen ? ` (${fx.subcaja_origen})` : ''} → {cajaNombre(fx.caja_destino_id)}{fx.subcaja_destino ? ` (${fx.subcaja_destino})` : ''}
+                          </p>
+                          <p className="text-[8px] text-zinc-600 font-mono truncate">{fmtDate(fx.fecha)} · {fx.referencia ?? '—'} · {fx.concepto}</p>
+                        </div>
+                        <div className="flex items-center gap-3 ml-3">
+                          <div className="text-right">
+                            <p className="text-[10px] font-black italic text-white whitespace-nowrap">{fmtMonto(fx.monto_origen, fx.moneda_origen)} → {fmtMonto(fx.monto_destino, fx.moneda_destino)}</p>
+                            <p className="text-[8px] text-zinc-600 font-mono">@ {fx.tasa}</p>
+                          </div>
+                          <button onClick={() => anularFX(fx.id)} disabled={savingAction===fx.id} title="Anular FX completo"
+                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
+                            {savingAction===fx.id?<Loader2 size={13} className="animate-spin"/>:<Ban size={13}/>}
+                          </button>
+                        </div>
                       </div>
-                      <div className="text-right">
-                        <p className="text-[10px] font-black italic text-white">{fmtMonto(fx.monto_origen, fx.moneda_origen)} → {fmtMonto(fx.monto_destino, fx.moneda_destino)}</p>
-                        <p className="text-[8px] text-zinc-600 font-mono">@ {fx.tasa}</p>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
 
             <div className="flex-1 overflow-y-auto max-h-[400px] p-4 space-y-2 mt-2">
-              {transactions.map(t => (
-                <div key={t.id} className="bg-white/[0.02] border border-white/[0.05] p-4 rounded-2xl flex justify-between items-center group hover:bg-white/[0.04] transition-all">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-[10px] font-black uppercase truncate">{t.entityName}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-0.5">
-                      {fmtDate(t.issueDate)} · {t.invoiceNumber} · <span className={MONEDA_COLOR[t.payment_method as PaymentMethod]||'text-zinc-500'}>{t.payment_method}</span>
-                    </p>
+              {transactions.map(t => {
+                const s  = signedLedgerAmount(t);
+                const fx = isFxTx(t);
+                return (
+                  <div key={t.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group hover:bg-white/[0.04] transition-all ${fx ? 'border-teal-500/15' : 'border-white/[0.05]'}`}>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
+                        {fx && <span className="text-[7px] font-black px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/20 shrink-0">FX {t.fx_leg ?? 'LEGACY'}</span>}
+                        <span className="truncate">{t.entityName}</span>
+                      </p>
+                      <p className="text-[8px] text-zinc-600 font-mono mt-0.5">
+                        {fmtDate(t.issueDate)} · {t.invoiceNumber} · <span className={MONEDA_COLOR[t.payment_method as PaymentMethod]||'text-zinc-500'}>{t.payment_method}</span>
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3 ml-4">
+                      <span className={`font-black text-lg italic ${fx ? (s >= 0 ? 'text-teal-300' : 'text-teal-600') : (s >= 0 ? 'text-emerald-400' : 'text-red-400')}`}>
+                        {s >= 0 ? '+' : '-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
+                      </span>
+                      <CheckCircle2 className={`h-4 w-4 shrink-0 ${t.status==='PAID'?'text-emerald-500/40':'text-zinc-700'}`}/>
+                      {!t.fx_id && (
+                        <button onClick={()=>openEditTx(t)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
+                          <Pencil size={13}/>
+                        </button>
+                      )}
+                      <button onClick={()=>deleteTxProtected(t.id)} disabled={savingAction===t.id || (!!t.fx_id && savingAction===t.fx_id)}
+                        className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
+                        {savingAction===t.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3 ml-4">
-                    <span className={`font-black text-lg italic ${(t.type==='INCOME'||t.type==='RECEIVABLE')?'text-emerald-400':'text-red-400'}`}>
-                      {(t.type==='INCOME'||t.type==='RECEIVABLE')?'+':'-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
-                    </span>
-                    <CheckCircle2 className={`h-4 w-4 shrink-0 ${t.status==='PAID'?'text-emerald-500/40':'text-zinc-700'}`}/>
-                    <button onClick={()=>openEditTx(t)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
-                      <Pencil size={13}/>
-                    </button>
-                    <button onClick={()=>deleteTxProtected(t.id)} disabled={savingAction===t.id}
-                      className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
-                      {savingAction===t.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
               {transactions.length === 0 && (
                 <div className="text-center py-16 text-zinc-700">
                   <Activity className="h-8 w-8 mx-auto mb-3 opacity-20"/>
@@ -1571,48 +1895,83 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
       {/* ══ TAB: BÓVEDAS ════════════════════════════════════════════════════ */}
       {activeTab === 'BÓVEDAS' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className={`lg:col-span-4 ${glass} rounded-3xl p-7`}>
-            <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 flex items-center gap-2 italic">
-              <Wallet className="text-[#E1AD01] h-4 w-4"/> Bóvedas Principales
-            </h3>
-            <div className="space-y-3">
-              {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(curr => {
-                const bal = getVaultBalance(curr); const active = selectedVault===curr;
-                return (
-                  <button key={curr} onClick={()=>setSelectedVault(curr)}
-                    className={`w-full p-5 rounded-2xl flex justify-between items-center border transition-all ${active?`${MONEDA_BG[curr]} ${MONEDA_COLOR[curr]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-500 hover:text-white hover:bg-white/[0.04]'}`}>
-                    <div className="flex items-center gap-3">
-                      <Coins className={`h-4 w-4 ${active?'':'text-zinc-700'}`}/>
-                      <span className="font-black uppercase tracking-widest text-[10px]">{curr}</span>
+          <div className="lg:col-span-4 space-y-6">
+            <div className={`${glass} rounded-3xl p-7`}>
+              <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 flex items-center gap-2 italic">
+                <Wallet className="text-[#E1AD01] h-4 w-4"/> Bóvedas Principales
+              </h3>
+              <div className="space-y-3">
+                {ALL_METHODS.map(curr => {
+                  const bal = getVaultBalance(curr); const active = selectedVault===curr;
+                  return (
+                    <button key={curr} onClick={()=>setSelectedVault(curr)}
+                      className={`w-full p-5 rounded-2xl flex justify-between items-center border transition-all ${active?`${MONEDA_BG[curr]} ${MONEDA_COLOR[curr]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-500 hover:text-white hover:bg-white/[0.04]'}`}>
+                      <div className="flex items-center gap-3">
+                        <Coins className={`h-4 w-4 ${active?'':'text-zinc-700'}`}/>
+                        <span className="font-black uppercase tracking-widest text-[10px]">{curr}</span>
+                      </div>
+                      <span className={`font-mono font-black text-lg italic ${active?'':'text-zinc-400'}`}>{fmtMonto(bal, curr)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* [NEW v15] Conciliación Bóveda ↔ Cajas */}
+            <div className={`${glass} rounded-3xl p-7`}>
+              <h3 className="text-[10px] font-black uppercase tracking-widest mb-2 flex items-center gap-2 italic">
+                <Scale className="text-teal-400 h-4 w-4"/> Conciliación Bóveda ↔ Cajas
+              </h3>
+              <p className="text-[8px] text-zinc-600 font-mono mb-5">Bóveda = posición total por moneda. Cajas = dónde está físicamente. La diferencia es saldo aún no ubicado en una caja.</p>
+              <div className="space-y-2">
+                {conciliacion.map(({ m, boveda, enCajas, sinAsignar }) => (
+                  <div key={m} className={`rounded-xl border p-3 ${MONEDA_BG[m]}`}>
+                    <div className="flex justify-between items-center mb-1">
+                      <span className={`text-[9px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
+                      <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full ${Math.abs(sinAsignar) <= 0.01 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-white/5 text-zinc-400'}`}>
+                        {Math.abs(sinAsignar) <= 0.01 ? 'Cuadrado' : 'Sin ubicar'}
+                      </span>
                     </div>
-                    <span className={`font-mono font-black text-lg italic ${active?'':'text-zinc-400'}`}>{fmtMonto(bal, curr)}</span>
-                  </button>
-                );
-              })}
+                    <div className="grid grid-cols-3 gap-2 text-center">
+                      <div><p className="text-[7px] text-zinc-600 font-black uppercase">Bóveda</p><p className="text-[10px] font-black italic">{fmtMonto(boveda, m)}</p></div>
+                      <div><p className="text-[7px] text-zinc-600 font-black uppercase">En cajas</p><p className="text-[10px] font-black italic">{fmtMonto(enCajas, m)}</p></div>
+                      <div><p className="text-[7px] text-zinc-600 font-black uppercase">Diferencia</p><p className={`text-[10px] font-black italic ${sinAsignar < -0.01 ? 'text-red-400' : ''}`}>{fmtMonto(sinAsignar, m)}</p></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
+
           <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
             <div className="p-6 border-b border-white/5">
               <h3 className="text-[10px] font-black uppercase tracking-widest italic">Auditoría Bóveda: <span className={MONEDA_COLOR[selectedVault]}>{selectedVault}</span></h3>
             </div>
-            <div className="flex-1 overflow-y-auto max-h-[520px] p-4 space-y-2">
-              {transactions.filter(t=>t.payment_method===selectedVault).map(t=>(
-                <div key={t.id} className="bg-white/[0.02] border border-white/[0.05] p-4 rounded-2xl flex justify-between items-center group">
-                  <div>
-                    <p className="text-[10px] font-black uppercase">{t.entityName}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{fmtDate(t.issueDate)} · {t.description}</p>
+            <div className="flex-1 overflow-y-auto max-h-[720px] p-4 space-y-2">
+              {transactions.filter(t=>t.payment_method===selectedVault).map(t=>{
+                const s  = signedLedgerAmount(t);
+                const fx = isFxTx(t);
+                return (
+                  <div key={t.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${fx ? 'border-teal-500/15' : 'border-white/[0.05]'}`}>
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-black uppercase flex items-center gap-2">
+                        {fx && <span className="text-[7px] font-black px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/20 shrink-0">FX {t.fx_leg ?? 'LEGACY'}</span>}
+                        <span className="truncate">{t.entityName}</span>
+                      </p>
+                      <p className="text-[8px] text-zinc-600 font-mono mt-0.5 truncate">{fmtDate(t.issueDate)} · {t.description}</p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className={`font-black text-lg italic ${fx ? (s >= 0 ? 'text-teal-300' : 'text-teal-600') : (s >= 0 ? 'text-emerald-400' : 'text-red-400')}`}>
+                        {s >= 0 ? '+' : '-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
+                      </span>
+                      <button onClick={()=>deleteTxProtected(t.id)} disabled={savingAction===t.id}
+                        className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
+                        {savingAction===t.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
+                      </button>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-3">
-                    <span className={`font-black text-lg italic ${(t.type==='INCOME'||t.type==='RECEIVABLE')?'text-emerald-400':'text-red-400'}`}>
-                      {(t.type==='INCOME'||t.type==='RECEIVABLE')?'+':'-'}{fmtMonto(t.amount, t.payment_method as PaymentMethod)}
-                    </span>
-                    <button onClick={()=>deleteTxProtected(t.id)} disabled={savingAction===t.id}
-                      className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
-                      {savingAction===t.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>
@@ -1626,12 +1985,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               {cajas.length} cajas operativas
             </p>
             <div className="flex gap-2 flex-wrap">
-              {/* [NEW] FX Desk */}
-              <button onClick={()=>setFxModalOpen(true)}
+              <button onClick={()=>openFxDesk()}
                 className="bg-teal-500/10 text-teal-400 border border-teal-500/20 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-teal-500/20 transition-all flex items-center gap-2">
                 <TrendingUp size={13}/> FX Desk
               </button>
-              {/* [NEW] Préstamo externo */}
               <button onClick={()=>setPrestamoModal(true)}
                 className="bg-violet-500/10 text-violet-400 border border-violet-500/20 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-violet-500/20 transition-all flex items-center gap-2">
                 <HandCoins size={13}/> Préstamo Externo
@@ -1657,7 +2014,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               const esCajaEfe  = cajaConf.esCajaEfectivo;
 
               return (
-                <button key={caja.id} onClick={()=>setCajaActiva(active?null:caja.id)}
+                <button key={caja.id} onClick={()=>toggleCajaActiva(caja)}
                   className={`${glass} rounded-2xl p-5 text-left border transition-all ${active?'border-[#E1AD01]/50 bg-[#E1AD01]/5':'border-white/[0.07] hover:border-white/20'}`}>
                   <div className="flex justify-between items-center mb-4">
                     <div className={`w-8 h-8 rounded-xl flex items-center justify-center ${active?'bg-[#E1AD01] text-black':'bg-white/5 text-zinc-600'}`}>
@@ -1674,7 +2031,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   </div>
                   <p className="text-[10px] text-zinc-400 font-black uppercase tracking-widest mb-3">{caja.nombre}</p>
 
-                  {/* [NEW] Subcajas para caja efectivo */}
                   {esCajaEfe ? (
                     <div className="space-y-1.5">
                       <div className="flex justify-between items-center">
@@ -1705,7 +2061,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
           {/* Panel de movimientos de caja activa */}
           {cajaActiva && (() => {
-            const caja      = cajas.find(c => c.id === cajaActiva)!;
+            const caja      = cajas.find(c => c.id === cajaActiva);
+            if (!caja) return null;
             const cajaConf  = getCajaConfig(caja.nombre);
             const movs      = movCajas.filter(m => m.caja_id === cajaActiva);
             const esCajaEfe = cajaConf.esCajaEfectivo;
@@ -1725,7 +2082,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                       ))}
                     </div>
 
-                    {/* [NEW] Selector de subcaja para caja efectivo */}
                     {esCajaEfe && (
                       <div>
                         <label className="text-[8px] text-zinc-600 font-black uppercase tracking-widest block mb-2">Registrar en</label>
@@ -1775,7 +2131,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                   <div className="p-6 border-b border-white/5">
                     <div className="flex justify-between items-center mb-3">
                       <h3 className="text-[10px] font-black uppercase tracking-widest italic">Historial · {caja.nombre}</h3>
-                      <button onClick={()=>handleExportCajaIndividual(cajaActiva!)} className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/20 text-[8px] font-black uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1.5">
+                      <button onClick={()=>handleExportCajaIndividual(caja.id)} className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/20 text-[8px] font-black uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1.5">
                         <Download size={10}/> Exportar
                       </button>
                     </div>
@@ -1795,7 +2151,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                         </>
                       ) : (
                         cajaConf.monedasPermitidas.map(m => {
-                          const s = getCajaBalance(cajaActiva!, m);
+                          const s = getCajaBalance(caja.id, m);
                           const hasMov = movs.some(mv => mv.moneda === m);
                           if (!hasMov) return null;
                           return (
@@ -1809,37 +2165,47 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                     </div>
                   </div>
                   <div className="flex-1 overflow-y-auto max-h-[400px] p-4 space-y-2">
-                    {movs.map(m => (
-                      <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${m.transfer_id?'border-purple-500/20':m.es_prestamo?'border-violet-500/20':m.fx_id?'border-teal-500/20':'border-white/[0.05]'}`}>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-                            <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full border ${MONEDA_BG[m.moneda]} ${MONEDA_COLOR[m.moneda]}`}>{m.moneda}</span>
-                            {m.subcaja && (
-                              <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full border ${m.subcaja==='CEO'?'bg-yellow-500/10 text-yellow-400 border-yellow-500/20':'bg-blue-500/10 text-blue-400 border-blue-500/20'}`}>
-                                {m.subcaja}
-                              </span>
-                            )}
-                            {m.transfer_id && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center gap-1"><ArrowLeftRight size={8}/> Transferencia</span>}
-                            {m.es_prestamo && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-violet-500/10 text-violet-400 border border-violet-500/20 flex items-center gap-1"><HandCoins size={8}/> {m.prestamista}</span>}
-                            {m.fx_id && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/20 flex items-center gap-1"><TrendingUp size={8}/> FX</span>}
-                            <p className="text-[10px] font-black uppercase truncate">{m.concepto||'—'}</p>
+                    {movs.map(m => {
+                      const fxRec = m.fx_id ? fxRegistros.find(f => f.id === m.fx_id) : null;
+                      const fxPeer = fxRec
+                        ? (m.fx_role === 'SALIDA' || m.tipo === 'SALIDA'
+                            ? `→ ${cajaNombre(fxRec.caja_destino_id)} · ${fmtMonto(fxRec.monto_destino, fxRec.moneda_destino)} @ ${fxRec.tasa}`
+                            : `← ${cajaNombre(fxRec.caja_origen_id)} · ${fmtMonto(fxRec.monto_origen, fxRec.moneda_origen)} @ ${fxRec.tasa}`)
+                        : null;
+                      return (
+                        <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${m.transfer_id?'border-purple-500/20':m.es_prestamo?'border-violet-500/20':m.fx_id?'border-teal-500/20':'border-white/[0.05]'}`}>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                              <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full border ${MONEDA_BG[m.moneda]} ${MONEDA_COLOR[m.moneda]}`}>{m.moneda}</span>
+                              {m.subcaja && (
+                                <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full border ${m.subcaja==='CEO'?'bg-yellow-500/10 text-yellow-400 border-yellow-500/20':'bg-blue-500/10 text-blue-400 border-blue-500/20'}`}>
+                                  {m.subcaja}
+                                </span>
+                              )}
+                              {m.transfer_id && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 flex items-center gap-1"><ArrowLeftRight size={8}/> Transferencia</span>}
+                              {m.es_prestamo && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-violet-500/10 text-violet-400 border border-violet-500/20 flex items-center gap-1"><HandCoins size={8}/> {m.prestamista}</span>}
+                              {m.fx_id && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-400 border border-teal-500/20 flex items-center gap-1"><TrendingUp size={8}/> FX</span>}
+                              <p className="text-[10px] font-black uppercase truncate">{m.concepto||'—'}</p>
+                            </div>
+                            <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(m.fecha)}{m.referencia?` · ${m.referencia}`:''}</p>
+                            {fxPeer && <p className="text-[8px] text-teal-400/70 font-mono mt-0.5">{fxPeer}</p>}
                           </div>
-                          <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(m.fecha)}{m.referencia?` · ${m.referencia}`:''}</p>
-                        </div>
-                        <div className="flex items-center gap-3 ml-3">
-                          <span className={`font-black text-base italic ${m.tipo==='ENTRADA'?'text-emerald-400':'text-red-400'}`}>{m.tipo==='ENTRADA'?'+':'-'}{fmtMonto(m.monto,m.moneda)}</span>
-                          {!m.transfer_id && !m.fx_id && (
-                            <button onClick={()=>openEditMov(m)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
-                              <Pencil size={13}/>
+                          <div className="flex items-center gap-3 ml-3">
+                            <span className={`font-black text-base italic ${m.tipo==='ENTRADA'?'text-emerald-400':'text-red-400'}`}>{m.tipo==='ENTRADA'?'+':'-'}{fmtMonto(m.monto,m.moneda)}</span>
+                            {!m.transfer_id && !m.fx_id && (
+                              <button onClick={()=>openEditMov(m)} className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-[#E1AD01] transition-all p-1.5 rounded-lg hover:bg-[#E1AD01]/10">
+                                <Pencil size={13}/>
+                              </button>
+                            )}
+                            <button onClick={()=>deleteMovProtected(m.id)} disabled={savingAction===m.id || (!!m.fx_id && savingAction===m.fx_id)}
+                              title={m.fx_id ? 'Anular FX completo' : 'Eliminar'}
+                              className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
+                              {savingAction===m.id?<Loader2 size={13} className="animate-spin"/>:m.fx_id?<Ban size={13}/>:<Trash2 size={13}/>}
                             </button>
-                          )}
-                          <button onClick={()=>deleteMovProtected(m.id)} disabled={savingAction===m.id}
-                            className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-500 transition-all p-1.5 rounded-lg hover:bg-red-500/10 disabled:opacity-30">
-                            {savingAction===m.id?<Loader2 size={13} className="animate-spin"/>:<Trash2 size={13}/>}
-                          </button>
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                     {movs.length===0 && (
                       <div className="text-center py-16 text-zinc-700">
                         <Banknote className="h-8 w-8 mx-auto mb-3 opacity-20"/>
@@ -2212,11 +2578,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className={`${glass} rounded-2xl p-5 flex items-center justify-between`}>
               <div>
                 <p className="text-[9px] font-black text-zinc-500 uppercase tracking-widest mb-1">Tasa BCV (Bs/USD)</p>
-                <p className="text-[8px] text-zinc-700">Solo afecta display. BD guarda en moneda nativa.</p>
+                <p className="text-[8px] text-zinc-700">Afecta display y es la tasa sugerida en FX Desk. BD guarda en moneda nativa.</p>
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[#E1AD01] font-black font-mono">Bs</span>
-                <input type="number" step="0.01" min="1" value={tasaBCV}
+                <input type="number" step="0.0001" min="1" value={tasaBCV}
                   onChange={e=>{const n=parseFloat(e.target.value);if(!isNaN(n)&&n>0)setTasaBCV(n);}}
                   className="w-28 bg-black/40 border border-[#E1AD01]/30 rounded-xl px-3 py-2 text-[#E1AD01] font-black font-mono text-sm text-center outline-none"/>
               </div>
@@ -2268,7 +2634,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
 
       {/* ══ MODALES ══════════════════════════════════════════════════════════ */}
 
-      {/* ── [NEW] MODAL: ENTREGA ADM → CEO ───────────────────────────────── */}
+      {/* ── MODAL: ENTREGA ADM → CEO ─────────────────────────────────────── */}
       {entregaCEOModal && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-yellow-500`}>
@@ -2305,6 +2671,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               </div>
               <input required value={entregaCEOForm.concepto} onChange={e=>setEntregaCEOForm(p=>({...p,concepto:e.target.value}))}
                 placeholder="CONCEPTO (ej: COBRO PAQUETE 10H - CARLOS PÉREZ)" className={inp} disabled={savingCaja}/>
+              <ErrorBanner msg={cajaError} onClose={()=>setCajaError(null)}/>
               <div className="flex gap-3">
                 <button type="button" onClick={()=>setEntregaCEOModal(false)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
                 <button type="submit" disabled={savingCaja} className="flex-[2] py-4 bg-yellow-500 text-black rounded-2xl text-[10px] font-black uppercase hover:bg-yellow-400 disabled:opacity-40 flex items-center justify-center gap-2">
@@ -2316,110 +2683,178 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
         </div>
       )}
 
-      {/* ── [NEW] MODAL: FX DESK ─────────────────────────────────────────── */}
-      {fxModalOpen && (
-        <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-          <div className={`${glass} w-full max-w-lg rounded-3xl p-7 border-t-2 border-t-teal-500`}>
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-2xl bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
-                  <TrendingUp className="text-teal-400 h-5 w-5"/>
+      {/* ── [CHG v15] MODAL: FX DESK INTERCONECTADO ──────────────────────── */}
+      {fxModalOpen && (() => {
+        const cajasO = cajasQueAceptan(fxForm.moneda_origen);
+        const cajasD = cajasQueAceptan(fxForm.moneda_destino);
+        const cajaO  = cajas.find(c => c.id === fxForm.caja_origen_id)  ?? null;
+        const cajaD  = cajas.find(c => c.id === fxForm.caja_destino_id) ?? null;
+        const esEfeO = !!cajaO && getCajaConfig(cajaO.nombre).esCajaEfectivo;
+        const esEfeD = !!cajaD && getCajaConfig(cajaD.nombre).esCajaEfectivo;
+        const saldoBovedaO = getVaultBalance(fxForm.moneda_origen);
+        const saldoCajaO   = cajaO ? (esEfeO ? getSubcajaBalance(cajaO.id, fxForm.subcaja_origen) : getCajaBalance(cajaO.id, fxForm.moneda_origen)) : null;
+        const mo           = parseFloat(fxForm.monto_origen);
+        const insufBoveda  = Number.isFinite(mo) && mo > saldoBovedaO;
+        const insufCaja    = Number.isFinite(mo) && saldoCajaO !== null && mo > saldoCajaO;
+        const involvesBS   = fxForm.moneda_origen === 'BS' || fxForm.moneda_destino === 'BS';
+        const tasaLabel    = involvesBS ? 'Tasa (Bs por 1 USD)' : 'Factor neto (1 = sin comisión)';
+        const cerrar = () => { setFxModalOpen(false); setFxError(null); };
+
+        return (
+          <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+            <div className={`${glass} w-full max-w-3xl rounded-3xl p-7 border-t-2 border-t-teal-500 max-h-[92vh] overflow-y-auto`}>
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-2xl bg-teal-500/10 border border-teal-500/20 flex items-center justify-center">
+                    <TrendingUp className="text-teal-400 h-5 w-5"/>
+                  </div>
+                  <div>
+                    <h3 className="text-[11px] font-black uppercase tracking-widest">FX Desk — Cambio de moneda</h3>
+                    <p className="text-[8px] text-zinc-600 mt-1">Sale de la bóveda/caja origen y entra a la bóveda/caja destino en una sola operación</p>
+                  </div>
                 </div>
-                <div>
-                  <h3 className="text-[11px] font-black uppercase tracking-widest">FX Desk — Cambio de Moneda</h3>
-                  <p className="text-[8px] text-zinc-600 mt-1">Trazabilidad de conversión USDT/ZELLE/CASH → BS</p>
-                </div>
+                <button onClick={cerrar} className="text-zinc-600 hover:text-white"><X size={18}/></button>
               </div>
-              <button onClick={()=>{setFxModalOpen(false);setFxError(null);}} className="text-zinc-600 hover:text-white"><X size={18}/></button>
+
+              <form onSubmit={handleFX} className="space-y-5">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* ORIGEN */}
+                  <div className="rounded-2xl border border-red-500/15 bg-red-500/[0.03] p-4 space-y-3">
+                    <p className="text-[9px] text-red-400 font-black uppercase tracking-widest">Sale · moneda que vendes</p>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {ALL_METHODS.map(m=>(
+                        <button key={m} type="button" onClick={()=>setFxMoneda('ORIGEN', m)}
+                          disabled={m === fxForm.moneda_destino}
+                          className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all disabled:opacity-20 ${fxForm.moneda_origen===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                    <div>
+                      <label className="text-[8px] text-zinc-500 font-black uppercase tracking-widest block mb-1.5">Caja de donde sale</label>
+                      <select value={fxForm.caja_origen_id} onChange={e=>setFxForm(p=>({...p,caja_origen_id:e.target.value}))} className={inp}>
+                        <option value="">SOLO BÓVEDA · no estaba en una caja</option>
+                        {cajasO.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+                      </select>
+                    </div>
+                    {esEfeO && (
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {(['ADM','CEO'] as SubcajaEfectivo[]).map(sc=>(
+                          <button key={sc} type="button" onClick={()=>setFxForm(p=>({...p,subcaja_origen:sc}))}
+                            className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${fxForm.subcaja_origen===sc?'bg-yellow-500/20 text-yellow-400 border-yellow-500/30':'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                            {sc==='ADM'?'Administración':'Custodia CEO'}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="text-[8px] font-mono space-y-0.5">
+                      <p className={insufBoveda ? 'text-red-400' : 'text-zinc-500'}>Bóveda {fxForm.moneda_origen}: {fmtMonto(saldoBovedaO, fxForm.moneda_origen)}</p>
+                      {saldoCajaO !== null && cajaO && (
+                        <p className={insufCaja ? 'text-red-400' : 'text-zinc-500'}>{cajaO.nombre}{esEfeO ? ` (${fxForm.subcaja_origen})` : ''}: {fmtMonto(saldoCajaO, fxForm.moneda_origen)}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* DESTINO */}
+                  <div className="rounded-2xl border border-emerald-500/15 bg-emerald-500/[0.03] p-4 space-y-3">
+                    <p className="text-[9px] text-emerald-400 font-black uppercase tracking-widest">Entra · moneda que recibes</p>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {ALL_METHODS.map(m=>(
+                        <button key={m} type="button" onClick={()=>setFxMoneda('DESTINO', m)}
+                          disabled={m === fxForm.moneda_origen}
+                          className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all disabled:opacity-20 ${fxForm.moneda_destino===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                    <div>
+                      <label className="text-[8px] text-zinc-500 font-black uppercase tracking-widest block mb-1.5">Caja donde entra</label>
+                      <select value={fxForm.caja_destino_id} onChange={e=>setFxForm(p=>({...p,caja_destino_id:e.target.value}))} className={inp}>
+                        <option value="">SOLO BÓVEDA · sin caja física</option>
+                        {cajasD.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
+                      </select>
+                    </div>
+                    {esEfeD && (
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {(['ADM','CEO'] as SubcajaEfectivo[]).map(sc=>(
+                          <button key={sc} type="button" onClick={()=>setFxForm(p=>({...p,subcaja_destino:sc}))}
+                            className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${fxForm.subcaja_destino===sc?'bg-yellow-500/20 text-yellow-400 border-yellow-500/30':'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
+                            {sc==='ADM'?'Administración':'Custodia CEO'}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <p className="text-[8px] font-mono text-zinc-500">Bóveda {fxForm.moneda_destino}: {fmtMonto(getVaultBalance(fxForm.moneda_destino), fxForm.moneda_destino)}</p>
+                  </div>
+                </div>
+
+                {/* Montos y tasa */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Monto {fxForm.moneda_origen} que sale</label>
+                    <div className="relative">
+                      <span className={`absolute left-4 top-1/2 -translate-y-1/2 font-black ${MONEDA_COLOR[fxForm.moneda_origen]}`}>{fxForm.moneda_origen==='BS'?'Bs':'$'}</span>
+                      <input type="number" step="0.01" min="0.01" required value={fxForm.monto_origen}
+                        onChange={e=>setFxForm(p=>({...p,monto_origen:e.target.value}))}
+                        onBlur={e=>{const n=parseFloat(e.target.value);if(!isNaN(n))setFxForm(p=>({...p,monto_origen:round2(n).toString()}));}}
+                        className="w-full bg-black/50 border border-white/10 py-4 pl-10 pr-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white"
+                        placeholder="0.00"/>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">{tasaLabel}</label>
+                    <input type="number" step="0.0001" min="0.0001" required value={fxForm.tasa}
+                      onChange={e=>setFxForm(p=>({...p,tasa:e.target.value}))}
+                      className="w-full bg-black/50 border border-white/10 py-4 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white"
+                      placeholder={involvesBS ? String(tasaBCV) : '1'}/>
+                    {involvesBS && (
+                      <button type="button" onClick={()=>setFxForm(p=>({...p,tasa:String(tasaBCV)}))}
+                        className="text-[8px] text-zinc-500 hover:text-teal-400 font-mono mt-1">Usar tasa BCV del sistema ({tasaBCV})</button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Asientos que se generarán */}
+                {fxMontoDestino !== null && (
+                  <div className="bg-teal-500/5 border border-teal-500/20 rounded-2xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <p className="text-[9px] text-teal-400 font-black uppercase tracking-widest">Recibes</p>
+                      <p className={`text-xl font-black italic ${MONEDA_COLOR[fxForm.moneda_destino]}`}>{fmtMonto(fxMontoDestino, fxForm.moneda_destino)}</p>
+                    </div>
+                    <div className="border-t border-teal-500/10 pt-3 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
+                      <p className="text-red-400">− {fmtMonto(Number.isFinite(mo) ? mo : 0, fxForm.moneda_origen)} · Bóveda {fxForm.moneda_origen}</p>
+                      <p className="text-emerald-400">+ {fmtMonto(fxMontoDestino, fxForm.moneda_destino)} · Bóveda {fxForm.moneda_destino}</p>
+                      <p className={cajaO ? 'text-red-400' : 'text-zinc-600'}>
+                        {cajaO ? `− ${fmtMonto(Number.isFinite(mo) ? mo : 0, fxForm.moneda_origen)} · Caja ${cajaO.nombre}${esEfeO ? ` (${fxForm.subcaja_origen})` : ''}` : 'Sin movimiento de caja origen'}
+                      </p>
+                      <p className={cajaD ? 'text-emerald-400' : 'text-zinc-600'}>
+                        {cajaD ? `+ ${fmtMonto(fxMontoDestino, fxForm.moneda_destino)} · Caja ${cajaD.nombre}${esEfeD ? ` (${fxForm.subcaja_destino})` : ''}` : 'Sin movimiento de caja destino'}
+                      </p>
+                    </div>
+                    <p className="text-[8px] text-zinc-600 font-mono">No cuenta como ingreso ni egreso: solo cambia el valor de moneda.</p>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <input required value={fxForm.concepto} onChange={e=>setFxForm(p=>({...p,concepto:e.target.value}))}
+                    placeholder="CONCEPTO (ej: BS PARA NÓMINA INSTRUCTORES)" className={inp}/>
+                  <input type="date" required value={fxForm.fecha} onChange={e=>setFxForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
+                </div>
+
+                <ErrorBanner msg={fxError} onClose={()=>setFxError(null)}/>
+                <div className="flex gap-3">
+                  <button type="button" onClick={cerrar} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
+                  <button type="submit" disabled={savingFX || fxMontoDestino === null} className="flex-[2] py-4 bg-teal-500 text-black rounded-2xl text-[10px] font-black uppercase hover:bg-teal-400 disabled:opacity-40 flex items-center justify-center gap-2">
+                    {savingFX?<Loader2 className="animate-spin h-4 w-4"/>:<><TrendingUp size={14}/> Registrar cambio</>}
+                  </button>
+                </div>
+              </form>
             </div>
-            <form onSubmit={handleFX} className="space-y-4">
-              {/* Selector de monedas */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Moneda Origen (vendo)</label>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
-                      <button key={m} type="button" onClick={()=>setFxForm(p=>({...p,moneda_origen:m}))}
-                        className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${fxForm.moneda_origen===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
-                        {m}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div>
-                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Moneda Destino (recibo)</label>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
-                      <button key={m} type="button" onClick={()=>setFxForm(p=>({...p,moneda_destino:m}))}
-                        className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${fxForm.moneda_destino===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
-                        {m}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* Caja de operación */}
-              <div>
-                <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Caja donde se registra la operación</label>
-                <select required value={fxForm.caja_id} onChange={e=>setFxForm(p=>({...p,caja_id:e.target.value}))} className={inp}>
-                  <option value="">— CAJA —</option>
-                  {cajas.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
-                </select>
-              </div>
-
-              {/* Montos y tasa */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">
-                    Monto {fxForm.moneda_origen}
-                  </label>
-                  <div className="relative">
-                    <span className={`absolute left-4 top-1/2 -translate-y-1/2 font-black ${MONEDA_COLOR[fxForm.moneda_origen]}`}>{fxForm.moneda_origen==='BS'?'Bs':'$'}</span>
-                    <input type="number" step="0.01" min="0.01" required value={fxForm.monto_origen}
-                      onChange={e=>setFxForm(p=>({...p,monto_origen:e.target.value}))}
-                      className="w-full bg-black/50 border border-white/10 py-4 pl-10 pr-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white"
-                      placeholder="0.00"/>
-                  </div>
-                </div>
-                <div>
-                  <label className="text-[9px] text-teal-400 font-black uppercase tracking-widest block mb-2">Tasa de Cambio</label>
-                  <input type="number" step="0.01" min="0.01" required value={fxForm.tasa}
-                    onChange={e=>setFxForm(p=>({...p,tasa:e.target.value}))}
-                    className="w-full bg-black/50 border border-white/10 py-4 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white"
-                    placeholder={String(DEFAULT_TASA_BS)}/>
-                </div>
-              </div>
-
-              {/* Preview del monto destino */}
-              {fxMontoDestino !== null && (
-                <div className="bg-teal-500/5 border border-teal-500/20 rounded-2xl p-4 flex items-center justify-between">
-                  <p className="text-[9px] text-teal-400 font-black uppercase tracking-widest">Recibirás</p>
-                  <p className={`text-xl font-black italic ${MONEDA_COLOR[fxForm.moneda_destino]}`}>
-                    {fmtMonto(fxMontoDestino, fxForm.moneda_destino)}
-                  </p>
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 gap-4">
-                <input required value={fxForm.concepto} onChange={e=>setFxForm(p=>({...p,concepto:e.target.value}))}
-                  placeholder="CONCEPTO (ej: NÓMINA INSTRUCTORES)" className={inp}/>
-                <input type="date" required value={fxForm.fecha} onChange={e=>setFxForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
-              </div>
-
-              <ErrorBanner msg={fxError} onClose={()=>setFxError(null)}/>
-              <div className="flex gap-3">
-                <button type="button" onClick={()=>{setFxModalOpen(false);setFxError(null);}} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
-                <button type="submit" disabled={savingFX} className="flex-[2] py-4 bg-teal-500 text-black rounded-2xl text-[10px] font-black uppercase hover:bg-teal-400 disabled:opacity-40 flex items-center justify-center gap-2">
-                  {savingFX?<Loader2 className="animate-spin h-4 w-4"/>:<><TrendingUp size={14}/> Ejecutar Cambio</>}
-                </button>
-              </div>
-            </form>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
-      {/* ── [NEW] MODAL: PRÉSTAMO EXTERNO ────────────────────────────────── */}
+      {/* ── MODAL: PRÉSTAMO EXTERNO ──────────────────────────────────────── */}
       {prestamoModal && (
         <div className="fixed inset-0 z-[95] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className={`${glass} w-full max-w-md rounded-3xl p-7 border-t-2 border-t-violet-500`}>
@@ -2436,7 +2871,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <button onClick={()=>setPrestamoModal(false)} className="text-zinc-600 hover:text-white"><X size={18}/></button>
             </div>
             <form onSubmit={handlePrestamo} className="space-y-4">
-              {/* Dirección: préstamo o devolución */}
               <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10">
                 <button type="button" onClick={()=>setPrestamoForm(p=>({...p,es_devolucion:false}))}
                   className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${!prestamoForm.es_devolucion?'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30':'text-zinc-600 hover:text-zinc-400'}`}>
@@ -2448,7 +2882,6 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </button>
               </div>
 
-              {/* Prestamista */}
               <div>
                 <label className="text-[9px] text-violet-400 font-black uppercase tracking-widest block mb-2">Prestamista</label>
                 <div className="grid grid-cols-2 gap-2">
@@ -2461,15 +2894,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </div>
               </div>
 
-              {/* Caja receptora */}
               <select required value={prestamoForm.caja_id} onChange={e=>setPrestamoForm(p=>({...p,caja_id:e.target.value}))} className={inp}>
                 <option value="">— CAJA RECEPTORA —</option>
                 {cajas.map(c=><option key={c.id} value={c.id}>{c.nombre}</option>)}
               </select>
 
-              {/* Moneda */}
               <div className="grid grid-cols-4 gap-2">
-                {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                {ALL_METHODS.map(m=>(
                   <button key={m} type="button" onClick={()=>setPrestamoForm(p=>({...p,moneda:m}))}
                     className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${prestamoForm.moneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
                     {m}
@@ -2499,6 +2930,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </div>
               )}
 
+              <ErrorBanner msg={cajaError} onClose={()=>setCajaError(null)}/>
               <div className="flex gap-3">
                 <button type="button" onClick={()=>setPrestamoModal(false)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
                 <button type="submit" disabled={savingCaja} className="flex-[2] py-4 bg-violet-500 text-white rounded-2xl text-[10px] font-black uppercase hover:bg-violet-400 disabled:opacity-40 flex items-center justify-center gap-2">
@@ -2521,7 +2953,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
                 </div>
                 <div>
                   <h3 className="text-[11px] font-black uppercase tracking-widest">Transferir entre Cajas</h3>
-                  <p className="text-[8px] text-zinc-600 mt-1">Genera CxP de reposición automáticamente</p>
+                  <p className="text-[8px] text-zinc-600 mt-1">Genera CxP de reposición automáticamente · misma moneda (para cambiar moneda use FX Desk)</p>
                 </div>
               </div>
               <button onClick={()=>{setTransferModalOpen(false);setTransferError(null);}} className="text-zinc-600 hover:text-white"><X size={18}/></button>
@@ -2551,7 +2983,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <div>
                 <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">Moneda</label>
                 <div className="grid grid-cols-4 gap-2">
-                  {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>(
+                  {ALL_METHODS.map(m=>(
                     <button key={m} type="button" onClick={()=>setTransferForm(p=>({...p,moneda:m}))}
                       className={`py-3 rounded-xl text-[10px] font-black uppercase border transition-all ${transferForm.moneda===m?`${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`:'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400'}`}>
                       {m}
@@ -2603,7 +3035,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             </div>
             <label className="text-[9px] text-purple-400 font-black uppercase tracking-widest block mb-2">¿Desde qué Bóveda?</label>
             <div className="grid grid-cols-2 gap-2 mb-6">
-              {(['USDT','ZELLE','CASH','BS'] as PaymentMethod[]).map(m=>{
+              {ALL_METHODS.map(m=>{
                 const saldo = getVaultBalance(m);
                 return (
                   <button key={m} type="button" onClick={()=>setPagarReposicionMoneda(m)}
@@ -2722,7 +3154,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <select value={editTxForm.type} onChange={e=>setEditTxForm(p=>({...p,type:e.target.value as TransactionType}))} className={inp}>
                 <option value="INCOME">INGRESO (+)</option><option value="EXPENSE">EGRESO (-)</option>
                 <option value="INSTRUCTOR_PAY">NÓMINA</option><option value="PAYABLE">POR PAGAR</option>
-                <option value="RECEIVABLE">POR COBRAR</option><option value="FX_EXCHANGE">FX CAMBIO</option>
+                <option value="RECEIVABLE">POR COBRAR</option><option value="FX_EXCHANGE">FX CAMBIO (solo vía FX Desk)</option>
               </select>
               <select value={editTxForm.currency} onChange={e=>setEditTxForm(p=>({...p,currency:normalizePaymentMethod(e.target.value)}))} className={inp}>
                 <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
@@ -2732,6 +3164,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
               <input type="date" value={editTxForm.fecha} onChange={e=>setEditTxForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
               <textarea value={editTxForm.description} onChange={e=>setEditTxForm(p=>({...p,description:e.target.value}))} className="md:col-span-2 w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-[#E1AD01] resize-none" rows={3} placeholder="DESCRIPCIÓN"/>
             </div>
+            <div className="mt-4"><ErrorBanner msg={ledgerError} onClose={()=>setLedgerError(null)}/></div>
             <div className="flex gap-3 mt-6">
               <button onClick={()=>setEditingTx(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={saveEditedTx} disabled={savingAction===editingTx.id} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white disabled:opacity-40 flex items-center justify-center gap-2">
@@ -2753,14 +3186,16 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <select value={editMovForm.tipo} onChange={e=>setEditMovForm(p=>({...p,tipo:e.target.value as any}))} className={inp}><option value="ENTRADA">+ ENTRADA</option><option value="SALIDA">- SALIDA</option></select>
               <select value={editMovForm.moneda} onChange={e=>setEditMovForm(p=>({...p,moneda:normalizePaymentMethod(e.target.value)}))} className={inp}>
-                <option value="USDT">USDT</option><option value="ZELLE">ZELLE</option>
-                <option value="CASH">CASH</option><option value="BS">BS</option>
+                {getCajaConfig(cajas.find(c=>c.id===editingMov.caja_id)?.nombre ?? '').monedasPermitidas.map(m=>(
+                  <option key={m} value={m}>{m}</option>
+                ))}
               </select>
               <input type="number" min="0.01" step="0.01" value={editMovForm.monto} onChange={e=>setEditMovForm(p=>({...p,monto:e.target.value}))} className={inp} placeholder="MONTO"/>
               <input type="date" value={editMovForm.fecha} onChange={e=>setEditMovForm(p=>({...p,fecha:e.target.value}))} className={inp} style={{textTransform:'none'}}/>
               <input value={editMovForm.concepto} onChange={e=>setEditMovForm(p=>({...p,concepto:e.target.value}))} className={inp} placeholder="CONCEPTO"/>
               <input value={editMovForm.referencia} onChange={e=>setEditMovForm(p=>({...p,referencia:e.target.value}))} className={inp} placeholder="REFERENCIA"/>
             </div>
+            <div className="mt-4"><ErrorBanner msg={cajaError} onClose={()=>setCajaError(null)}/></div>
             <div className="flex gap-3 mt-6">
               <button onClick={()=>setEditingMov(null)} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">Cancelar</button>
               <button onClick={saveEditedMov} disabled={savingAction===editingMov.id} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl text-[9px] font-black uppercase hover:bg-white disabled:opacity-40 flex items-center justify-center gap-2">

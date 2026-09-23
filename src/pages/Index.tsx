@@ -1,12 +1,18 @@
 // src/pages/Index.tsx
-// VALKYRON OS v4.20 — FIX: syncFleet como callback en ControlHub + canal realtime con timestamp
+// VALKYRON OS v4.21 — TAB PLANIFICACIÓN DE VUELO EN EL NAV
 // ─────────────────────────────────────────────────────────────────────────────
-// CHANGELOG v4.20:
-//   [FIX] Canal realtime renombrado con timestamp → evita conflicto con sesiones previas
-//   [FIX] syncFleet pasado como onFleetChange a ControlHub → se llama después de
-//         handleConfirmAndSend y handleFinalCertification para forzar re-fetch
-//   [FIX] FleetDashboard también recibe onFleetChange para sincronizar desde ese módulo
-// v4.19 PRESERVADO: filtro de tabs por rol, OPERACIONES = MECANICO, toda la estructura intacta
+// CHANGELOG v4.21:
+//   [NEW] Tab 'planificacion' → FlightPlanningBoard dentro del mismo nav/header
+//         Visible para: CEO, ADMIN, DIRECTOR, PLANIFICADOR o usuarios con
+//         fn_es_planificador() = true (planificadores_vuelo) vía useAuth().canPlan
+//   [NEW] Rol PLANIFICADOR: Inicio · Flota · Calendario · Planificación
+//   [FIX] Rol CAPITAN / INSTRUCTOR caía al filtro por defecto y solo veía "Inicio"
+//         → ahora ve Mi Bitácora, Vuelos, Flota y Calendario (igual que PILOTO)
+//   [FIX] DIRECTOR tratado como ADMIN + Planificación
+//   [FIX] Si el tab activo deja de ser visible para el rol, vuelve a 'home'
+// v4.20 PRESERVADO: syncFleet como callback para ControlHub/FleetDashboard, canal
+//   realtime con timestamp, filtro de tabs por rol, OPERACIONES = MECANICO,
+//   toda la estructura intacta.
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -26,29 +32,34 @@ import { CaptainDashboard } from '@/components/CaptainDashboard';
 import { supabase } from '@/lib/supabaseClient';
 import FlightRegister from '@/components/flights/FlightRegister';
 import { FlightCalendar } from '@/components/FlightCalendar';
+import FlightPlanningBoard from '@/components/FlightPlanningboard';   // [NEW v4.21]
+import { useAuth, PLANNER_ROLES } from '@/context/authcontext';       // [NEW v4.21]
 import { WorkOrder, Vendor, SparePart, Aircraft } from '@/Types/Maintenance';
 
 import {
   Plane, Package, LogOut, Wrench, ClipboardCheck,
-  Truck, Home, Fuel, X, DollarSign, Menu, FileText, Award, CalendarDays
+  Truck, Home, Fuel, X, DollarSign, Menu, FileText, Award, CalendarDays,
+  CalendarCheck,
 } from 'lucide-react';
 
 type TabKey =
   | 'home' | 'captain-log' | 'fleet' | 'inventory'
-  | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights' | 'calendario';
+  | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights' | 'calendario'
+  | 'planificacion';
 
 const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-  { key: 'home',        label: 'Inicio',      icon: Home           },
-  { key: 'captain-log', label: 'Mi Bitácora', icon: Award          },
-  { key: 'fleet',       label: 'Flota',       icon: Plane          },
-  { key: 'flights',     label: 'Vuelos',      icon: FileText       },
-  { key: 'inventory',   label: 'Stock',       icon: Package        },
-  { key: 'control-hub', label: 'Hangar',      icon: Wrench         },
-  { key: 'checkout',    label: 'Salidas',     icon: ClipboardCheck },
-  { key: 'fuel',        label: 'AVGAS',       icon: Fuel           },
-  { key: 'finance',     label: 'Dinero',      icon: DollarSign     },
-  { key: 'vendors',     label: 'Aliados',     icon: Truck          },
-  { key: 'calendario',  label: 'Calendario',  icon: CalendarDays   },
+  { key: 'home',          label: 'Inicio',        icon: Home           },
+  { key: 'captain-log',   label: 'Mi Bitácora',   icon: Award          },
+  { key: 'fleet',         label: 'Flota',         icon: Plane          },
+  { key: 'flights',       label: 'Vuelos',        icon: FileText       },
+  { key: 'planificacion', label: 'Planificación', icon: CalendarCheck  },   // [NEW v4.21]
+  { key: 'inventory',     label: 'Stock',         icon: Package        },
+  { key: 'control-hub',   label: 'Hangar',        icon: Wrench         },
+  { key: 'checkout',      label: 'Salidas',       icon: ClipboardCheck },
+  { key: 'fuel',          label: 'AVGAS',         icon: Fuel           },
+  { key: 'finance',       label: 'Dinero',        icon: DollarSign     },
+  { key: 'vendors',       label: 'Aliados',       icon: Truck          },
+  { key: 'calendario',    label: 'Calendario',    icon: CalendarDays   },
 ];
 
 // ─── NORMALIZACIÓN DE ESTADO ──────────────────────────────────────────────────
@@ -76,6 +87,12 @@ const resolveRol = (
   return 'MECANICO';
 };
 
+const normRol = (rol: string) => rol
+  .toUpperCase()
+  .trim()
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '');
+
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   const [activeTab,        setActiveTab]        = useState<TabKey>('home');
@@ -86,6 +103,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
     rol: string; nombre_completo: string; sede: string;
   } | null>(null);
   const navigate = useNavigate();
+  const { canPlan } = useAuth();   // [NEW v4.21] permiso real de planificación (BD)
 
   const [fleetData,        setFleetData]        = useState<Aircraft[]>([]);
   const [partsData,        setPartsData]        = useState<SparePart[]>([]);
@@ -95,7 +113,6 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   const [vendorsData,      setVendorsData]      = useState<Vendor[]>([]);
 
   // ── SYNC FLOTA ───────────────────────────────────────────────────────────
-  // [FIX v4.20] Expuesto como callback estable — se pasa a ControlHub y FleetDashboard
   const syncFleet = useCallback(async () => {
     const { data: aircrafts, error } = await supabase
       .from('flota_aviones')
@@ -192,7 +209,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 
     syncTerminalData();
 
-    // [FIX v4.20] Canal con nombre único por sesión → evita conflicto con canales huérfanos
+    // Canal con nombre único por sesión → evita conflicto con canales huérfanos
     const channelName = `index-fleet-monitor-${Date.now()}`;
     const fleetChannel = supabase
       .channel(channelName)
@@ -214,26 +231,39 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
   const visibleTabs = tabs.filter(tab => {
     if (!userProfile) return tab.key === 'home';
 
-    const rol = userProfile.rol
-      .toUpperCase()
-      .trim()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
+    const rol = normRol(userProfile.rol);
+
+    // [NEW v4.21] Planificación: por rango o por registro en planificadores_vuelo
+    if (tab.key === 'planificacion') {
+      return canPlan || (PLANNER_ROLES as string[]).includes(rol);
+    }
 
     if (rol === 'CEO') return true;
 
-    if (rol === 'ADMIN' || rol.includes('ADMIN'))
+    if (rol === 'ADMIN' || rol.includes('ADMIN') || rol === 'DIRECTOR')
       return ['home', 'inventory', 'fuel', 'finance', 'vendors', 'flights', 'fleet', 'calendario'].includes(tab.key);
 
-    // FIX v4.19: OPERACIONES comparte exactamente la misma vista que MECANICO
+    // OPERACIONES comparte exactamente la misma vista que MECANICO
     if (rol === 'MECANICO' || rol === 'OPERACIONES')
       return ['home', 'fleet', 'inventory', 'control-hub', 'checkout', 'fuel'].includes(tab.key);
 
-    if (rol === 'PILOTO' || rol === 'ESTUDIANTE')
+    // [FIX v4.21] CAPITAN / INSTRUCTOR ahora con su vista operativa
+    if (rol === 'PILOTO' || rol === 'ESTUDIANTE' || rol === 'CAPITAN' || rol === 'INSTRUCTOR')
       return ['home', 'captain-log', 'flights', 'fleet', 'calendario'].includes(tab.key);
+
+    // [NEW v4.21]
+    if (rol === 'PLANIFICADOR' || rol === 'PLANIFICACION' || rol === 'DESPACHO')
+      return ['home', 'fleet', 'calendario'].includes(tab.key);
 
     return tab.key === 'home';
   });
+
+  // [FIX v4.21] El tab activo siempre debe ser uno visible
+  useEffect(() => {
+    if (userProfile && !visibleTabs.some(t => t.key === activeTab)) {
+      setActiveTab('home');
+    }
+  }, [userProfile, canPlan, activeTab]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── LOADING ──────────────────────────────────────────────────────────────
   if (loading) {
@@ -254,47 +284,122 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
     <div className="flex min-h-screen flex-col bg-[#020202] text-white font-sans text-left overflow-x-hidden">
       <StatusBar onOpenRegister={() => setIsRegisterOpen(true)} />
 
-      {/* NAV */}
-      <nav className="z-50 px-4 pt-4 sticky top-0">
-        <div className="max-w-[1920px] mx-auto flex items-center justify-between lg:justify-center
-                        bg-[#0a0a0a]/90 backdrop-blur-2xl border border-white/10 rounded-2xl p-1 shadow-2xl">
+      
+      
+      {/* NAV v4.23 — COMPACTO Y RESPONSIVE */}
+      <nav className="sticky top-0 z-50 w-full px-2 pt-3">
+        <div className="mx-auto flex w-full max-w-[1920px] min-w-0 items-center rounded-2xl border border-white/10 bg-[#0a0a0a]/95 px-1 py-1 shadow-2xl backdrop-blur-2xl">
+
+          {/* BOTÓN MÓVIL */}
           <button
-            className="lg:hidden p-3 text-[#E1AD01]"
+            type="button"
+            aria-label="Abrir menú"
+            aria-expanded={isMobileMenuOpen}
             onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            className="flex items-center gap-2 rounded-xl p-3 text-[#E1AD01] lg:hidden"
           >
-            {isMobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+            {isMobileMenuOpen
+              ? <X className="h-5 w-5" />
+              : <Menu className="h-5 w-5" />}
+            <span className="text-xs font-bold">MENÚ</span>
           </button>
-          <div className={`${isMobileMenuOpen
-            ? 'flex absolute top-20 left-4 right-4 bg-[#0a0a0a] border border-white/10 rounded-2xl p-4 flex-col'
-            : 'hidden lg:flex'} items-center lg:flex-row lg:gap-1`}>
-            {visibleTabs.map(tab => (
-              <button
-                key={tab.key}
-                onClick={() => { setActiveTab(tab.key); setIsMobileMenuOpen(false); }}
-                className={`flex items-center gap-2 px-3 lg:px-5 py-3 text-[9px] font-black transition-all
-                            uppercase tracking-[0.2em] rounded-xl w-full lg:w-auto
-                            ${activeTab === tab.key
-                              ? 'text-[#E1AD01] bg-white/5 border border-[#E1AD01]/20'
-                              : 'text-slate-500 hover:text-white hover:bg-white/[0.02]'}`}
-              >
-                {(() => {
-                  const Icon = tab.icon;
-                  return (
-                    <Icon className={`h-3.5 w-3.5 ${activeTab === tab.key ? 'animate-pulse' : 'opacity-40'}`} />
-                  );
-                })()}
-                <span>{tab.label}</span>
-              </button>
-            ))}
-            <div className="h-[1px] w-full bg-white/10 my-2 lg:h-6 lg:w-[1px] lg:mx-2 lg:my-0" />
+
+          {/* NAVEGACIÓN ESCRITORIO */}
+          <div className="hidden w-full min-w-0 items-center lg:flex">
+
+            <div className="flex min-w-0 flex-1 items-center justify-between gap-0.5">
+              {visibleTabs.map(tab => {
+                const Icon = tab.icon;
+
+                return (
+                  <button
+                    type="button"
+                    key={tab.key}
+                    onClick={() => setActiveTab(tab.key)}
+                    title={tab.label}
+                    className={`
+                      flex h-10 min-w-0 shrink items-center justify-center
+                      gap-1 whitespace-nowrap rounded-lg border
+                      px-1.5 text-[8px] font-black uppercase
+                      tracking-normal transition-all
+                      xl:px-2 xl:text-[9px]
+                      2xl:gap-1.5 2xl:px-2.5
+                      ${
+                        activeTab === tab.key
+                          ? 'border-[#E1AD01]/25 bg-white/5 text-[#E1AD01]'
+                          : 'border-transparent text-slate-500 hover:bg-white/[0.04] hover:text-white'
+                      }
+                    `}
+                  >
+                    <Icon
+                      className={`h-3 w-3 shrink-0 2xl:h-3.5 2xl:w-3.5 ${
+                        activeTab === tab.key ? '' : 'opacity-50'
+                      }`}
+                    />
+
+                    <span className="whitespace-nowrap">
+                      {tab.label}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* CERRAR SESIÓN */}
+            <div className="mx-1.5 h-5 w-px shrink-0 bg-white/10" />
+
             <button
+              type="button"
               onClick={handleLogout}
-              className="flex items-center gap-2 px-5 py-3 text-[9px] font-black text-red-500/60
-                         hover:text-red-500 transition-all uppercase tracking-[0.2em] rounded-xl w-full lg:w-auto"
+              title="Cerrar sesión"
+              className="flex h-10 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg px-1.5 text-[8px] font-black uppercase tracking-normal text-red-500/70 transition-all hover:bg-red-500/5 hover:text-red-400 xl:px-2 xl:text-[9px]"
             >
-              <LogOut className="h-3.5 w-3.5" /> <span>Cerrar Sesión</span>
+              <LogOut className="h-3 w-3 shrink-0" />
+              <span>Cerrar sesión</span>
             </button>
           </div>
+
+          {/* NAVEGACIÓN MÓVIL */}
+          {isMobileMenuOpen && (
+            <div className="absolute left-2 right-2 top-full mt-2 max-h-[80vh] overflow-y-auto rounded-xl border border-white/10 bg-[#0a0a0a] p-3 shadow-2xl lg:hidden">
+
+              <div className="grid grid-cols-2 gap-2">
+                {visibleTabs.map(tab => {
+                  const Icon = tab.icon;
+
+                  return (
+                    <button
+                      type="button"
+                      key={tab.key}
+                      onClick={() => {
+                        setActiveTab(tab.key);
+                        setIsMobileMenuOpen(false);
+                      }}
+                      className={`flex min-h-11 items-center gap-2 rounded-lg border px-3 py-2 text-left text-[10px] font-bold uppercase ${
+                        activeTab === tab.key
+                          ? 'border-[#E1AD01]/25 bg-white/5 text-[#E1AD01]'
+                          : 'border-transparent text-slate-500'
+                      }`}
+                    >
+                      <Icon className="h-4 w-4 shrink-0" />
+                      <span>{tab.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="my-3 h-px bg-white/10" />
+
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-3 text-xs font-bold uppercase text-red-400"
+              >
+                <LogOut className="h-4 w-4" />
+                Cerrar sesión
+              </button>
+            </div>
+          )}
         </div>
       </nav>
 
@@ -406,6 +511,14 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
+          {/* [NEW v4.21] */}
+          {activeTab === 'planificacion' && (
+            <FlightPlanningBoard
+              userRole={userProfile?.rol}
+              userProfile={userProfile}
+            />
+          )}
+
           {activeTab === 'flights' && (
             <FlightRegister onFlightLogUpdate={() => {}} />
           )}
@@ -420,7 +533,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           Águilas Pilot — Strategic Division 2026
         </div>
         <div className="text-[8px] text-[#E1AD01] font-black uppercase tracking-[0.3em] italic text-right">
-          Valkyron OS v4.20
+          Valkyron OS v4.21
         </div>
       </footer>
     </div>

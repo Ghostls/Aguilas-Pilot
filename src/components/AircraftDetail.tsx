@@ -1,57 +1,24 @@
 // src/components/AircraftDetail.tsx
-// VALKYRON OS v3.2 — Detalle de Aeronave + Historial Técnico Imprimible
-//
-// CHANGELOG v3.2:
-//   [NEW] Botón "Imprimir Historial"
-//   [NEW] Consulta TODAS las órdenes de trabajo de la aeronave
-//   [NEW] El documento incluye el detalle completo almacenado en cada tarjeta de servicio
-//   [NEW] Incluye campos dinámicos adicionales de ordenes_trabajo
-//   [NEW] Formato A4 optimizado para impresión
-//   [FIX] escapeHtml movido a scope global del archivo
-//
-// v3.1 PRESERVADO:
-//   [NEW] Botón "✓ Completar Orden"
-//   [NEW] Modal de cierre pide observaciones finales + horas de vuelo actuales
-//   [NEW] Al completar: OT → 'Completed', flota → 'operational', horas actualizadas
-//   [NEW] Botón directo "📜 Ver Historial"
-//   [FIX] hoursFlown → hours_vuelo_totales
-//
-// v3.0 PRESERVADO:
-//   fetch de última orden
-//   edición estado In Progress/Pending Parts
-//   dashboard TSN/TSMOH/TSOH
-//   telemetría de motor
-//   CRUD existente
-// ─────────────────────────────────────────────────────────────
-
+// VALKYRON OS v3.4.1 — FUSIÓN v3.2 + v3.3; FIX TS2322 LucideIcon
+// v3.2: Historial técnico completo imprimible A4 con todas las órdenes,
+// campos adicionales dinámicos y etiquetas humanas; UI histórico preservado.
+// v3.3: Lectura en vivo del estado MRO, cierre transaccional mediante RPC,
+// registro de liberación autorizada, actualización de flota y estados seguros.
+// El cierre de una OT NUNCA libera por sí mismo la aeronave al servicio.
 import React, { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import type { Aircraft } from '../Types/Maintenance';
-
 import {
-  ArrowLeft,
-  Plane,
-  Wrench,
-  Loader2,
-  Cpu,
-  AlertTriangle,
-  Clock,
-  Signal,
-  HardDrive,
-  Save,
-  AlertCircle,
-  CheckCircle2,
-  History,
-  X,
-  Printer,
+  ArrowLeft, Plane, Wrench, Loader2, AlertTriangle, Clock, Cpu, HardDrive, Signal,
+  Save, AlertCircle, CheckCircle2, History, X, Printer, ShieldCheck, RefreshCw, type LucideIcon,
 } from 'lucide-react';
 
 interface AircraftDetailProps {
   aircraft: Aircraft;
   onBack: () => void;
   onOpenHistorial?: (aircraft: Aircraft) => void;
+  onFleetChange?: () => Promise<void>;
 }
-
 type OrderRecord = {
   id: string;
   descripcion_tarea: string;
@@ -60,343 +27,166 @@ type OrderRecord = {
   observaciones: string;
   created_at: string;
 };
-
-// ─────────────────────────────────────────────────────────────
-// HELPER GLOBAL
-// Escapa valores antes de insertarlos en HTML de impresión.
-// Debe estar fuera de handlePrintHistory para poder utilizarse
-// tanto en try como en catch.
-// ─────────────────────────────────────────────────────────────
-
-const escapeHtml = (value: unknown): string => {
-  if (value === null || value === undefined) {
-    return '—';
-  }
-
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+type FleetRecord = {
+  id: string;
+  matricula: string;
+  estado: string;
+  horas_vuelo_totales: number | null;
+};
+const OPEN_STATES = ['In Progress', 'Pending Parts', 'On Hold'];
+const escapeHtml = (v: unknown): string =>
+  String(v === null || v === undefined || v === '' ? '—' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+const formatDate = (v: unknown): string => {
+  const d = new Date(String(v));
+  return Number.isNaN(d.getTime()) ? String(v ?? '—')
+    : d.toLocaleString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 };
 
-// ─────────────────────────────────────────────────────────────
-// COMPONENTE PRINCIPAL
-// ─────────────────────────────────────────────────────────────
-
-const AircraftDetail = ({
-  aircraft,
-  onBack,
-  onOpenHistorial,
-}: AircraftDetailProps) => {
-  const [orderRecord, setOrderRecord] =
-    useState<OrderRecord | null>(null);
-
-  const [status, setStatus] =
-    useState('In Progress');
-
-  const [notes, setNotes] =
-    useState('');
-
-  const [isSaving, setIsSaving] =
-    useState(false);
-
-  const [isFetching, setIsFetching] =
-    useState(true);
-
-  const [errorMsg, setErrorMsg] =
-    useState<string | null>(null);
-
-  const [successMsg, setSuccessMsg] =
-    useState(false);
-
-  // ─────────────────────────────────────────────────────────────
-  // MODAL DE CIERRE
-  // ─────────────────────────────────────────────────────────────
-
-  const [isCompleteOpen, setIsCompleteOpen] =
-    useState(false);
-
+const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpenHistorial, onFleetChange }) => {
+  const [orderRecord, setOrderRecord] = useState<OrderRecord | null>(null);
+  const [flotaActual, setFlotaActual] = useState<FleetRecord | null>(null);
+  const [status, setStatus] = useState('In Progress');
+  const [notes, setNotes] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [isFetching, setIsFetching] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState(false);
+  const [isCompleteOpen, setIsCompleteOpen] = useState(false);
+  const [isReleaseOpen, setIsReleaseOpen] = useState(false);
+  const [releaseForm, setReleaseForm] = useState({ referencia: '', observaciones: '' });
   const [completeForm, setCompleteForm] = useState({
-    observacionesFinales: '',
-    horasActuales: '',
-    mecanicoCierre: '',
+    observacionesFinales: '', horasActuales: '', mecanicoCierre: '',
   });
 
-  const isMaintenance =
-    aircraft.status === 'maintenance';
-
-  // ─────────────────────────────────────────────────────────────
-  // FETCH: ÚLTIMA ORDEN ACTIVA
-  // ─────────────────────────────────────────────────────────────
+  const matricula = aircraft.tailNumber;
+  // Nunca dependemos exclusivamente del prop del dashboard, que podría estar desactualizado.
+  const isMaintenance = flotaActual?.estado === 'maintenance' ||
+    flotaActual?.estado === 'mantenimiento' || orderRecord !== null ||
+    (!flotaActual && aircraft.status === 'maintenance');
+  const isGrounded = flotaActual?.estado === 'grounded' ||
+    flotaActual?.estado === 'aog';
 
   const fetchLatestOrder = useCallback(async () => {
-    if (!isMaintenance) {
-      setIsFetching(false);
-      return;
-    }
-
     setIsFetching(true);
     setErrorMsg(null);
-
     try {
-      const { data, error } = await supabase
-        .from('ordenes_trabajo')
-        .select(
-          'id, descripcion_tarea, nombre_mecanico, estado, observaciones, created_at'
-        )
-        .eq('matricula', aircraft.tailNumber)
-        .in('estado', [
-          'In Progress',
-          'Pending Parts',
-          'On Hold',
-        ])
-        .order('created_at', {
-          ascending: false,
-        })
-        .limit(1)
-        .maybeSingle();
-
-      if (error) {
-        throw error;
-      }
-
-      if (data) {
-        setOrderRecord(data as OrderRecord);
-
-        setStatus(
-          data.estado || 'In Progress'
-        );
-
-        setNotes(
-          data.observaciones || ''
-        );
-      } else {
-        setOrderRecord(null);
-      }
+      const [fleetRes, orderRes] = await Promise.all([
+        supabase.from('flota_aviones')
+          .select('id, matricula, estado, horas_vuelo_totales')
+          .eq('id', aircraft.id).single(),
+        supabase.from('ordenes_trabajo')
+          .select('id, descripcion_tarea, nombre_mecanico, estado, observaciones, created_at')
+          .eq('matricula', matricula)
+          .in('estado', OPEN_STATES)
+          .order('created_at', { ascending: false })
+          .limit(1).maybeSingle(),
+      ]);
+      if (fleetRes.error) throw fleetRes.error;
+      if (orderRes.error) throw orderRes.error;
+      const o = (orderRes.data ?? null) as OrderRecord | null;
+      setFlotaActual(fleetRes.data as FleetRecord);
+      setOrderRecord(o);
+      setStatus(o?.estado || 'In Progress');
+      setNotes(o?.observaciones || '');
     } catch (err: any) {
-      setErrorMsg(
-        err?.message ??
-          'Error al cargar la orden.'
-      );
+      setErrorMsg(err?.message ?? 'No se pudieron consultar flota y órdenes.');
     } finally {
       setIsFetching(false);
     }
-  }, [
-    aircraft.tailNumber,
-    isMaintenance,
-  ]);
+  }, [aircraft.id, matricula]);
 
+  useEffect(() => { void fetchLatestOrder(); }, [fetchLatestOrder]);
   useEffect(() => {
-    fetchLatestOrder();
-  }, [fetchLatestOrder]);
+    if (!isCompleteOpen || !orderRecord) return;
+    setCompleteForm(prev => ({
+      ...prev,
+      horasActuales: String(flotaActual?.horas_vuelo_totales ?? aircraft.hours_vuelo_totales ?? 0),
+      mecanicoCierre: orderRecord.nombre_mecanico === 'POR ASIGNAR' ? '' : (orderRecord.nombre_mecanico || ''),
+    }));
+  }, [isCompleteOpen, orderRecord?.id, flotaActual?.horas_vuelo_totales, aircraft.hours_vuelo_totales]);
 
-  // ─────────────────────────────────────────────────────────────
-  // PRE-LLENAR HORAS AL ABRIR MODAL
-  // ─────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (
-      isCompleteOpen &&
-      orderRecord
-    ) {
-      setCompleteForm((prev) => ({
-        ...prev,
-        horasActuales: String(
-          aircraft.hours_vuelo_totales ?? 0
-        ),
-        mecanicoCierre:
-          orderRecord.nombre_mecanico ?? '',
-      }));
-    }
-  }, [
-    isCompleteOpen,
-    orderRecord,
-    aircraft.hours_vuelo_totales,
-  ]);
-
-  // ─────────────────────────────────────────────────────────────
-  // ACTUALIZAR ORDEN
-  // ─────────────────────────────────────────────────────────────
-
-  const handleUpdate = async (
-    e: React.FormEvent
-  ) => {
+  const handleUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
-
-    if (!orderRecord) {
-      return;
-    }
-
-    setIsSaving(true);
-    setErrorMsg(null);
-
+    if (!orderRecord || isSaving) return;
+    setIsSaving(true); setErrorMsg(null);
     try {
-      const { error } = await supabase
-        .from('ordenes_trabajo')
-        .update({
-          estado: status,
-          observaciones: notes,
-        })
-        .eq('id', orderRecord.id);
-
-      if (error) {
-        throw error;
-      }
-
-      setOrderRecord({
-        ...orderRecord,
-        estado: status,
-        observaciones: notes,
-      });
-
+      const { data, error } = await supabase.from('ordenes_trabajo')
+        .update({ estado: status, observaciones: notes })
+        .eq('id', orderRecord.id).in('estado', OPEN_STATES)
+        .select('id').single();
+      if (error) throw error;
+      if (!data) throw new Error('No fue posible verificar la actualización.');
       setSuccessMsg(true);
-
-      setTimeout(() => {
-        setSuccessMsg(false);
-      }, 2500);
+      await fetchLatestOrder();
+      await onFleetChange?.();
     } catch (err: any) {
-      setErrorMsg(
-        err?.message ??
-          'Error al actualizar.'
-      );
-    } finally {
-      setIsSaving(false);
-    }
+      setErrorMsg(err?.message ?? 'Error al guardar el progreso.');
+    } finally { setIsSaving(false); }
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // COMPLETAR ORDEN
-  // ─────────────────────────────────────────────────────────────
-
-  const handleCompleteOrder = async (
-    e: React.FormEvent
-  ) => {
+  const handleCompleteOrder = async (e: React.FormEvent) => {
     e.preventDefault();
-
-    if (!orderRecord) {
-      return;
+    if (!orderRecord || isSaving) return;
+    const horas = Number(completeForm.horasActuales);
+    if (!completeForm.horasActuales.trim() || !Number.isFinite(horas) || horas < 0) {
+      setErrorMsg('Horas de aeronave inválidas.'); return;
     }
-
-    const horas = parseFloat(
-      completeForm.horasActuales
-    );
-
-    if (
-      Number.isNaN(horas) ||
-      horas < 0
-    ) {
-      alert(
-        'Horas de aeronave inválidas.'
-      );
-      return;
+    if (!completeForm.observacionesFinales.trim() || !completeForm.mecanicoCierre.trim()) {
+      setErrorMsg('Mecánico y observaciones finales son obligatorios.'); return;
     }
-
-    if (
-      !completeForm.observacionesFinales.trim()
-    ) {
-      alert(
-        'Debe registrar las observaciones finales del cierre.'
-      );
-      return;
-    }
-
-    setIsSaving(true);
-    setErrorMsg(null);
-
+    setIsSaving(true); setErrorMsg(null);
     try {
-      const timestamp =
-        new Date().toLocaleString(
-          'es-VE',
-          {
-            day: '2-digit',
-            month: '2-digit',
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-          }
-        );
-
-      const obsPrevias =
-        orderRecord.observaciones ?? '';
-
-      const obsFinal =
-        `${obsPrevias}\n` +
-        `[${timestamp}] CIERRE DE ORDEN por ` +
-        `${
-          completeForm.mecanicoCierre
-            .toUpperCase() || 'N/A'
-        } ` +
-        `@ ${horas}h TT: ` +
-        `${completeForm.observacionesFinales
-          .trim()
-          .toUpperCase()}`;
-
-      // 1. COMPLETAR ORDEN
-      const {
-        error: ordenError,
-      } = await supabase
-        .from('ordenes_trabajo')
-        .update({
-          estado: 'Completed',
-          observaciones: obsFinal,
-          nombre_mecanico:
-            completeForm.mecanicoCierre.trim() ||
-            orderRecord.nombre_mecanico,
-        })
-        .eq(
-          'id',
-          orderRecord.id
-        );
-
-      if (ordenError) {
-        throw ordenError;
-      }
-
-      // 2. LIBERAR AERONAVE
-      const {
-        error: flotaError,
-      } = await supabase
-        .from('flota_aviones')
-        .update({
-          estado: 'operational',
-          horas_vuelo_totales: horas,
-        })
-        .eq(
-          'matricula',
-          aircraft.tailNumber
-        );
-
-      if (flotaError) {
-        console.warn(
-          '[v3.2] No se pudo liberar aeronave:',
-          flotaError.message
-        );
-      }
-
+      // RPC: la OT, historial y las horas se actualizan en UNA transacción.
+      const { error } = await supabase.rpc('fn_mro_cerrar_orden', {
+        p_orden_id: orderRecord.id,
+        p_observaciones: completeForm.observacionesFinales.trim(),
+        p_mecanico: completeForm.mecanicoCierre.trim(),
+        p_horas: horas,
+      });
+      if (error) throw error;
       setIsCompleteOpen(false);
-
-      alert(
-        `✓ Orden completada exitosamente\n\n` +
-        `La aeronave ${aircraft.tailNumber} ha sido liberada a OPERATIVA.\n` +
-        `El registro aparecerá en el Historial de la aeronave.`
-      );
-
+      await fetchLatestOrder();
+      await onFleetChange?.();
+      alert(`✓ Orden cerrada: ${matricula}.\n` +
+        'La aeronave NO está liberada. Requiere autorización de retorno al servicio.');
       onBack();
     } catch (err: any) {
-      setErrorMsg(
-        err?.message ??
-          'Error al completar la orden.'
-      );
+      setErrorMsg(err?.message ?? 'Error al cerrar la orden.');
+    } finally { setIsSaving(false); }
+  };
+
+  // El botón sólo inicia una solicitud; el RPC comprueba en servidor
+  // la identidad habilitada, la ausencia de OT y registra la liberación.
+  const handleRelease = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (isSaving || !flotaActual || orderRecord) return;
+    if (!releaseForm.referencia.trim() || !releaseForm.observaciones.trim()) {
+      setErrorMsg('Referencia documental y observaciones obligatorias.');
+      return;
+    }
+    setIsSaving(true);
+    setErrorMsg(null);
+    try {
+      const { error } = await supabase.rpc('fn_mro_liberar_aeronave', {
+        p_matricula: matricula,
+        p_referencia: releaseForm.referencia.trim(),
+        p_observaciones: releaseForm.observaciones.trim(),
+      });
+      if (error) throw error;
+      setIsReleaseOpen(false);
+      setReleaseForm({ referencia: '', observaciones: '' });
+      await fetchLatestOrder();
+      await onFleetChange?.();
+      alert(`Liberación registrada en sistema para ${matricula}. Comprueba la documentación técnica.`);
+      onBack();
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'No fue posible registrar la liberación.');
     } finally {
       setIsSaving(false);
     }
   };
-
-  // ─────────────────────────────────────────────────────────────
-  // IMPRIMIR HISTORIAL COMPLETO
-  // ─────────────────────────────────────────────────────────────
 
   const handlePrintHistory = async () => {
     const printWindow =
@@ -1107,11 +897,17 @@ const AircraftDetail = ({
       // ESTADO AERONAVE
       // ─────────────────────────────────────────────────────────
 
-      const aircraftStatus =
-        aircraft.status ===
-        'maintenance'
-          ? 'EN MANTENIMIENTO'
-          : 'OPERATIVA';
+      const estadoBD = flotaActual?.estado ?? aircraft.status;
+      const aircraftStatus = orderRecord !== null ||
+          ['maintenance', 'mantenimiento'].includes(estadoBD?.toLowerCase().trim() ?? '')
+        ? 'EN MANTENIMIENTO'
+        : ['operational', 'operativa'].includes(estadoBD?.toLowerCase().trim() ?? '')
+        ? 'OPERATIVA EN SISTEMA'
+        : ['grounded', 'aog', 'tierra'].includes(estadoBD?.toLowerCase().trim() ?? '')
+        ? 'EN TIERRA / AOG'
+        : ['flight', 'en vuelo'].includes(estadoBD?.toLowerCase().trim() ?? '')
+        ? 'EN VUELO (REGISTRO EN SISTEMA)'
+        : 'ESTADO NO VERIFICADO';
 
       // ─────────────────────────────────────────────────────────
       // DOCUMENTO FINAL
@@ -1212,7 +1008,8 @@ const AircraftDetail = ({
 
             <div class="value">
               ${escapeHtml(
-                aircraft.hours_vuelo_totales ??
+                flotaActual?.horas_vuelo_totales ??
+                  aircraft.hours_vuelo_totales ??
                   0
               )} h
             </div>
@@ -1250,8 +1047,8 @@ const AircraftDetail = ({
         <div class="footer">
 
           <span>
-            VALKYRON OS — Registro técnico
-            de aeronave
+            VALKYRON OS — Registro técnico de aeronave.
+            Este documento no constituye certificación de aeronavegabilidad.
           </span>
 
           <span>
@@ -1332,1528 +1129,193 @@ const AircraftDetail = ({
     }
   };
 
-  // ─────────────────────────────────────────────────────────────
-  // ESTADO
-  // ─────────────────────────────────────────────────────────────
 
-  const isCompleted =
-    orderRecord?.estado ===
-    'Completed';
-
-  // ─────────────────────────────────────────────────────────────
-  // RENDER
-  // ─────────────────────────────────────────────────────────────
+  const inputCls = `w-full bg-black border border-white/10 rounded-xl p-4 text-white text-xs uppercase
+    outline-none focus:border-[#E1AD01] transition-all placeholder:text-white/20 font-mono`;
+  const btnCls = 'flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-40';
+  const statusLabel = isFetching ? 'Sincronizando MRO' : isMaintenance ? 'EN HANGAR / MANTENIMIENTO'
+    : isGrounded ? 'AOG / TIERRA' : flotaActual?.estado === 'operational' ? 'OPERATIVA EN SISTEMA'
+    : (flotaActual?.estado ?? aircraft.status).toUpperCase();
 
   return (
-    <div className="p-6 min-h-screen text-white animate-in fade-in duration-500">
-
-      {/* HEADER */}
-
-      <div className="flex justify-between items-center mb-8">
-
-        <button
-          onClick={onBack}
-          className="
-            text-gray-400
-            flex
-            items-center
-            gap-2
-            hover:text-[#E1AD01]
-            transition-colors
-            group
-          "
-        >
-          <ArrowLeft
-            className="
-              h-4 w-4
-              group-hover:-translate-x-1
-              transition-transform
-            "
-          />
-
-          <span
-            className="
-              text-[10px]
-              font-black
-              uppercase
-              tracking-[0.3em]
-              italic
-            "
-          >
-            Volver al Dashboard
-          </span>
+    <div className="p-6 min-h-screen text-white animate-in fade-in duration-500 space-y-8">
+      {/* Barra de navegación y accesos al historial completo */}
+      <header className="flex justify-between items-center gap-4 flex-wrap">
+        <button type="button" onClick={onBack} className="text-gray-400 flex gap-2 items-center hover:text-[#E1AD01] text-[10px] font-black uppercase tracking-widest">
+          <ArrowLeft size={16}/> Volver al Dashboard
         </button>
-
-        {/* ACCIONES */}
-
-        <div className="flex items-center gap-2 flex-wrap justify-end">
-
-          {/* VER HISTORIAL */}
-
-          {onOpenHistorial && (
-            <button
-              onClick={() =>
-                onOpenHistorial(
-                  aircraft
-                )
-              }
-              className="
-                bg-[#E1AD01]/10
-                border
-                border-[#E1AD01]/30
-                text-[#E1AD01]
-                px-4
-                py-2
-                rounded-xl
-                text-[9px]
-                font-black
-                uppercase
-                tracking-widest
-                hover:bg-[#E1AD01]
-                hover:text-black
-                transition-all
-                flex
-                items-center
-                gap-2
-              "
-            >
-              <History className="h-3.5 w-3.5" />
-              Ver Historial
-            </button>
-          )}
-
-          {/* IMPRIMIR HISTORIAL */}
-
-          <button
-            onClick={
-              handlePrintHistory
-            }
-            className="
-              bg-white/[0.04]
-              border
-              border-white/15
-              text-white
-              px-4
-              py-2
-              rounded-xl
-              text-[9px]
-              font-black
-              uppercase
-              tracking-widest
-              hover:bg-white
-              hover:text-black
-              transition-all
-              flex
-              items-center
-              gap-2
-            "
-          >
-            <Printer className="h-3.5 w-3.5" />
-            Imprimir Historial
-          </button>
-
-          <div
-            className="
-              text-[8px]
-              font-black
-              text-slate-500
-              uppercase
-              tracking-widest
-              bg-black/30
-              px-3
-              py-1.5
-              rounded-full
-            "
-          >
-            ID: {aircraft.tailNumber}
-          </div>
-
+        <div className="flex flex-wrap gap-2 items-center">
+          <button type="button" onClick={() => void fetchLatestOrder()} disabled={isFetching || isSaving}
+            className={`${btnCls} border border-white/15 hover:bg-white/10`}><RefreshCw size={14}/> Actualizar</button>
+          {onOpenHistorial && <button type="button" onClick={() => onOpenHistorial(aircraft)}
+            className={`${btnCls} bg-[#E1AD01]/10 border border-[#E1AD01]/30 text-[#E1AD01] hover:bg-[#E1AD01] hover:text-black`}>
+            <History size={14}/> Ver Historial</button>}
+          <button type="button" onClick={() => void handlePrintHistory()}
+            className={`${btnCls} bg-white/[0.04] border border-white/15 hover:bg-white hover:text-black`}>
+            <Printer size={14}/> Imprimir Historial</button>
+          <span className="text-[9px] font-mono text-slate-500 bg-black/30 p-2 rounded">ID: {matricula}</span>
         </div>
-      </div>
+      </header>
 
-      {/* HERO */}
-
-      <div
-        className="
-          mb-8
-          p-8
-          bg-black/30
-          border
-          border-white/10
-          rounded-3xl
-          relative
-          overflow-hidden
-          shadow-2xl
-        "
-      >
-
-        <Plane
-          className="
-            absolute
-            -right-4
-            -bottom-4
-            h-40
-            w-40
-            text-white/[0.02]
-          "
-        />
-
-        <div
-          className="
-            relative
-            flex
-            justify-between
-            items-end
-            flex-wrap
-            gap-4
-          "
-        >
-
+      {/* Estado de aeronave consultado directamente de PostgreSQL */}
+      <section className="p-8 bg-black/30 border border-white/10 rounded-3xl relative overflow-hidden shadow-2xl">
+        <Plane size={160} className="absolute -right-5 -bottom-5 text-white/[0.025]"/>
+        <div className="relative flex justify-between items-end flex-wrap gap-6">
           <div>
-
-            <p
-              className="
-                text-[10px]
-                text-[#E1AD01]
-                font-black
-                uppercase
-                tracking-[0.3em]
-                mb-2
-              "
-            >
-              Diagnóstico de Aeronave
-            </p>
-
-            <h2
-              className="
-                text-5xl
-                font-black
-                text-white
-                leading-none
-                italic
-              "
-            >
-              {aircraft.model}
-            </h2>
-
-            <p
-              className="
-                text-[10px]
-                text-slate-500
-                font-black
-                mt-3
-                uppercase
-                tracking-widest
-              "
-            >
-              {aircraft.tailNumber}
-              {' | '}
-              Rol Táctico:{' '}
-
-              <span className="text-white/70">
-                {isMaintenance
-                  ? 'Hangar'
-                  : 'Operativa'}
-              </span>
-            </p>
-
+            <p className="text-[10px] text-[#E1AD01] font-black uppercase tracking-[0.3em] mb-2">Diagnóstico de Aeronave</p>
+            <h2 className="text-5xl font-black italic">{aircraft.model}</h2>
+            <p className="text-[10px] text-slate-500 font-black mt-3 uppercase tracking-widest">{matricula} · Base {aircraft.location}</p>
           </div>
-
-          <div
-            className={`
-              p-4
-              rounded-2xl
-              border-2
-              ${
-                isMaintenance
-                  ? `
-                    bg-red-500/10
-                    border-red-500
-                    shadow-red-500/20
-                    shadow-lg
-                  `
-                  : `
-                    bg-emerald-500/10
-                    border-emerald-500
-                    shadow-emerald-500/20
-                    shadow-lg
-                  `
-              }
-            `}
-          >
-
-            <p
-              className={`
-                text-[10px]
-                font-black
-                uppercase
-                tracking-widest
-                italic
-                ${
-                  isMaintenance
-                    ? 'text-red-400'
-                    : 'text-emerald-400'
-                }
-              `}
-            >
-              {isMaintenance
-                ? '/// EN HANGAR'
-                : '✓ LISTA VUELO'}
-            </p>
-
+          <div className={`p-4 rounded-2xl border-2 font-black text-xs flex gap-3 items-center ${isMaintenance ?
+            'bg-amber-500/10 border-amber-500 text-amber-400' : isGrounded ?
+            'bg-red-500/10 border-red-500 text-red-400' : 'bg-emerald-500/10 border-emerald-500 text-emerald-400'}`}>
+            {isFetching ? <Loader2 className="animate-spin" size={20}/> : isMaintenance ? <Wrench size={20}/> : <Plane size={20}/>}
+            {statusLabel}
           </div>
-
         </div>
+      </section>
+
+      {/* Métricas: solo las respaldadas por la base de datos */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <MetricCard label="Time Since New (TSN)" value={`${flotaActual?.horas_vuelo_totales ?? aircraft.hours_vuelo_totales ?? 0} h`} icon={Clock}/>
+        <MetricCard label="Órdenes activas" value={isFetching ? 'Consultando' : orderRecord ? 'Hay OT activa' : 'Ninguna detectada'} icon={Wrench}/>
+        <MetricCard label="Estado en BD" value={flotaActual?.estado ?? 'Consultando'} icon={HardDrive}/>
       </div>
 
-      {/* DASHBOARD */}
-
-      <div
-        className="
-          grid
-          grid-cols-1
-          md:grid-cols-3
-          gap-6
-          mb-8
-        "
-      >
-
-        <MetricCard
-          label="Time Since New"
-          value={`${aircraft.hours_vuelo_totales ?? 0} h`}
-          icon={Clock}
-          color="#E1AD01"
-        />
-
-        <MetricCard
-          label="TSMOH"
-          value="1580 h"
-          icon={Wrench}
-          color="#E1AD01"
-        />
-
-        <MetricCard
-          label="TSOH"
-          value="120 h"
-          icon={HardDrive}
-          color="#E1AD01"
-        />
-
-      </div>
-
-      {/* TELEMETRÍA MOTOR */}
-
-      <div
-        className="
-          bg-white/[0.03]
-          p-6
-          rounded-3xl
-          border
-          border-white/10
-          mb-8
-          shadow-xl
-        "
-      >
-
-        <p
-          className="
-            text-[10px]
-            text-[#E1AD01]
-            font-black
-            mb-6
-            uppercase
-            tracking-[0.3em]
-            italic
-            flex
-            items-center
-            gap-2
-          "
-        >
-          <Cpu className="h-3 w-3" />
-          Módulo de Análisis Predictivo Motor
-        </p>
-
-        <div
-          className="
-            grid
-            grid-cols-2
-            md:grid-cols-4
-            gap-6
-          "
-        >
-
-          <TelemetryDot
-            label="Estado Motor"
-            value="NORMAL"
-            tone="ok"
-            pulse
-          />
-
-          <TelemetryDot
-            label="Vibración"
-            value="0.15 IPS"
-            tone="ok"
-          />
-
-          <TelemetryDot
-            label="Temp Aceite"
-            value="180°F"
-            tone="ok"
-          />
-
-          <TelemetryDot
-            label="Alerta Proactiva"
-            value="NINGUNA"
-            tone="ok"
-          />
-
+      {/* Conserva el panel visual sin inventar telemetría del motor */}
+      <section className="bg-white/[0.03] p-6 rounded-3xl border border-white/10 shadow-xl">
+        <h3 className="text-[10px] text-[#E1AD01] font-black mb-6 uppercase tracking-[0.3em] flex gap-2 items-center">
+          <Cpu size={14}/> Módulo de Análisis Predictivo Motor
+        </h3>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+          <TelemetryDot label="Estado Motor" value="SIN TELEMETRÍA"/>
+          <TelemetryDot label="Vibración" value="NO DISPONIBLE"/>
+          <TelemetryDot label="Temperatura de aceite" value="NO DISPONIBLE"/>
+          <TelemetryDot label="Alerta predictiva" value="SIN DATOS"/>
         </div>
-      </div>
+        <p className="text-[9px] text-slate-600 mt-5 font-mono">Estos campos requieren sensores o una fuente verificada; no representan diagnóstico técnico.</p>
+      </section>
 
-      {/* PANEL ORDEN ACTIVA */}
+      {errorMsg && <FeedbackBanner tone="error" text={errorMsg} onClose={() => setErrorMsg(null)}/>}
+      {successMsg && <FeedbackBanner tone="success" text="Orden actualizada correctamente."/>}
 
-      {isMaintenance && (
-        <div
-          className="
-            p-8
-            bg-red-950/20
-            rounded-3xl
-            border-2
-            border-red-900/50
-            space-y-4
-            shadow-2xl
-            shadow-red-500/10
-          "
-        >
-
-          <p
-            className="
-              text-[11px]
-              text-red-400
-              font-black
-              uppercase
-              tracking-widest
-              italic
-              flex
-              items-center
-              gap-3
-            "
-          >
-            <AlertTriangle
-              className="
-                h-4 w-4
-                animate-pulse
-              "
-            />
-
-            Panel de Orden de Trabajo Activa
-          </p>
-
-          {isFetching ? (
-
-            <div
-              className="
-                flex
-                items-center
-                justify-center
-                gap-3
-                py-6
-                text-slate-500
-              "
-            >
-
-              <Loader2
-                className="
-                  h-4 w-4
-                  animate-spin
-                "
-              />
-
-              <span
-                className="
-                  text-[9px]
-                  font-black
-                  uppercase
-                  tracking-widest
-                "
-              >
-                Sincronizando con MRO...
-              </span>
-
+      {/* Panel de la última OT activa: busca aunque el dashboard tenga un estado obsoleto */}
+      {isMaintenance && <section className="p-8 bg-amber-950/10 border-2 border-amber-500/30 rounded-3xl space-y-5 shadow-2xl">
+        <h3 className="text-[11px] text-amber-400 font-black uppercase tracking-widest flex items-center gap-3">
+          <AlertTriangle size={18}/> Panel de Orden de Trabajo Activa
+        </h3>
+        {isFetching ? <div className="flex items-center gap-3 py-8 text-slate-500"><Loader2 className="animate-spin"/> Sincronizando con MRO...</div>
+          : orderRecord ? <>
+            <div className="grid md:grid-cols-2 gap-5 p-5 bg-black/40 border border-white/5 rounded-2xl">
+              <div><p className="text-[9px] text-slate-500 uppercase font-black">Tarea</p>
+                <p className="text-xs text-white font-bold mt-2 whitespace-pre-line">{orderRecord.descripcion_tarea}</p></div>
+              <div><p className="text-[9px] text-slate-500 uppercase font-black">Técnico asignado</p>
+                <p className="text-xs text-white font-bold mt-2">{orderRecord.nombre_mecanico}</p></div>
             </div>
-
-          ) : errorMsg &&
-            !orderRecord ? (
-
-            <FeedbackBanner
-              tone="error"
-              text={errorMsg}
-              onClose={() =>
-                setErrorMsg(null)
-              }
-            />
-
-          ) : orderRecord ? (
-
-            <>
-
-              <div
-                className="
-                  grid
-                  grid-cols-1
-                  md:grid-cols-2
-                  gap-4
-                  p-4
-                  bg-black/40
-                  border
-                  border-white/5
-                  rounded-2xl
-                "
-              >
-
-                <div>
-
-                  <p
-                    className="
-                      text-[8px]
-                      text-slate-500
-                      font-black
-                      uppercase
-                      tracking-widest
-                    "
-                  >
-                    Tarea
-                  </p>
-
-                  <p
-                    className="
-                      text-[11px]
-                      text-white
-                      font-black
-                      uppercase
-                      mt-1
-                    "
-                  >
-                    {orderRecord.descripcion_tarea}
-                  </p>
-
-                </div>
-
-                <div>
-
-                  <p
-                    className="
-                      text-[8px]
-                      text-slate-500
-                      font-black
-                      uppercase
-                      tracking-widest
-                    "
-                  >
-                    Técnico Asignado
-                  </p>
-
-                  <p
-                    className="
-                      text-[11px]
-                      text-white
-                      font-black
-                      uppercase
-                      mt-1
-                    "
-                  >
-                    {orderRecord.nombre_mecanico}
-                  </p>
-
-                </div>
-
+            <form onSubmit={handleUpdate} className="space-y-5">
+              <div><label className="block mb-2 text-[10px] text-[#E1AD01] font-black uppercase">Estado de la orden</label>
+                <select value={status} onChange={e => setStatus(e.target.value)} className={inputCls}>
+                  <option value="In Progress">EN PROGRESO</option>
+                  <option value="Pending Parts">ESPERANDO REPUESTOS</option>
+                  <option value="On Hold">EN ESPERA</option>
+                </select>
+                <p className="text-[9px] text-slate-500 mt-2">Completar la orden requiere registrar el cierre técnico.</p>
               </div>
-
-              <form
-                onSubmit={handleUpdate}
-                className="space-y-4"
-              >
-
-                <div
-                  className="
-                    grid
-                    grid-cols-1
-                    md:grid-cols-2
-                    gap-4
-                  "
-                >
-
-                  <div className="space-y-2">
-
-                    <label
-                      className="
-                        text-[9px]
-                        font-black
-                        text-[#E1AD01]
-                        uppercase
-                        tracking-widest
-                        block
-                      "
-                    >
-                      Estado de la Orden
-                    </label>
-
-                    <select
-                      value={status}
-                      onChange={(e) =>
-                        setStatus(
-                          e.target.value
-                        )
-                      }
-                      className="
-                        w-full
-                        bg-black
-                        border
-                        border-white/10
-                        p-4
-                        rounded-xl
-                        text-white
-                        text-xs
-                        font-black
-                        outline-none
-                        focus:border-[#E1AD01]
-                        transition-all
-                      "
-                    >
-
-                      <option value="In Progress">
-                        EN PROGRESO
-                      </option>
-
-                      <option value="Pending Parts">
-                        ESPERANDO REPUESTOS
-                      </option>
-
-                      <option value="On Hold">
-                        EN ESPERA
-                      </option>
-
-                    </select>
-
-                    <p
-                      className="
-                        text-[8px]
-                        text-slate-500
-                        font-mono
-                      "
-                    >
-                      Para{' '}
-                      <span
-                        className="
-                          text-[#E1AD01]
-                          font-black
-                        "
-                      >
-                        completar
-                      </span>{' '}
-                      usa el botón dedicado abajo.
-                    </p>
-
-                  </div>
-
-                </div>
-
-                <div className="space-y-2">
-
-                  <label
-                    className="
-                      text-[9px]
-                      font-black
-                      text-[#E1AD01]
-                      uppercase
-                      tracking-widest
-                      block
-                    "
-                  >
-                    Observaciones / Notas de Progreso
-                  </label>
-
-                  <textarea
-                    rows={3}
-                    value={notes}
-                    onChange={(e) =>
-                      setNotes(
-                        e.target.value
-                      )
-                    }
-                    placeholder="AVANCES, DIAGNÓSTICO, REPUESTOS PEDIDOS..."
-                    className="
-                      w-full
-                      bg-black
-                      border
-                      border-white/10
-                      p-4
-                      rounded-xl
-                      text-white
-                      text-xs
-                      resize-none
-                      outline-none
-                      focus:border-[#E1AD01]
-                      transition-all
-                      placeholder:text-white/20
-                      uppercase
-                      font-mono
-                    "
-                  />
-
-                </div>
-
-                {errorMsg && (
-                  <FeedbackBanner
-                    tone="error"
-                    text={errorMsg}
-                    onClose={() =>
-                      setErrorMsg(null)
-                    }
-                  />
-                )}
-
-                {successMsg && (
-                  <FeedbackBanner
-                    tone="success"
-                    text="Orden actualizada correctamente."
-                  />
-                )}
-
-                <div
-                  className="
-                    flex
-                    gap-3
-                    pt-2
-                  "
-                >
-
-                  <button
-                    type="submit"
-                    disabled={isSaving}
-                    className="
-                      flex-1
-                      py-4
-                      rounded-2xl
-                      bg-[#E1AD01]
-                      text-black
-                      text-[10px]
-                      font-black
-                      uppercase
-                      tracking-widest
-                      hover:bg-white
-                      transition-all
-                      disabled:opacity-40
-                      flex
-                      items-center
-                      justify-center
-                      gap-2
-                    "
-                  >
-
-                    {isSaving ? (
-                      <Loader2
-                        className="
-                          h-4 w-4
-                          animate-spin
-                        "
-                      />
-                    ) : (
-                      <Save className="h-4 w-4" />
-                    )}
-
-                    {isSaving
-                      ? 'Guardando...'
-                      : 'Guardar Progreso'}
-
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setIsCompleteOpen(true)
-                    }
-                    disabled={
-                      isSaving ||
-                      isCompleted
-                    }
-                    className="
-                      flex-1
-                      py-4
-                      rounded-2xl
-                      bg-emerald-500
-                      text-black
-                      text-[10px]
-                      font-black
-                      uppercase
-                      tracking-widest
-                      hover:bg-emerald-400
-                      transition-all
-                      disabled:opacity-40
-                      flex
-                      items-center
-                      justify-center
-                      gap-2
-                      shadow-lg
-                      shadow-emerald-500/20
-                    "
-                  >
-
-                    <CheckCircle2
-                      className="h-4 w-4"
-                    />
-
-                    Completar Orden
-
-                  </button>
-
-                </div>
-
-              </form>
-
-            </>
-
-          ) : (
-
-            <div
-              className="
-                text-center
-                py-10
-                bg-black/40
-                rounded-2xl
-                border
-                border-white/5
-              "
-            >
-
-              <p
-                className="
-                  text-[10px]
-                  text-slate-500
-                  font-black
-                  uppercase
-                  tracking-widest
-                "
-              >
-                Sin órdenes activas
-              </p>
-
-              <p
-                className="
-                  text-[9px]
-                  text-slate-700
-                  mt-2
-                  font-mono
-                "
-              >
-                La aeronave está en mantenimiento
-                sin OT abierta. Crea una desde
-                el Control Hub.
-              </p>
-
-            </div>
-
-          )}
-
-        </div>
-      )}
-
-      {/* MODAL CIERRE */}
-
-      {isCompleteOpen &&
-        orderRecord && (
-
-          <div
-            className="
-              fixed
-              inset-0
-              z-[70]
-              flex
-              items-center
-              justify-center
-              bg-black/98
-              backdrop-blur-xl
-              p-4
-              animate-in
-              fade-in
-              duration-200
-            "
-          >
-
-            <div
-              className="
-                bg-[#0a0a0a]
-                border
-                border-emerald-500/40
-                w-full
-                max-w-lg
-                rounded-[2.5rem]
-                shadow-[0_0_80px_rgba(16,185,129,0.15)]
-                overflow-hidden
-              "
-            >
-
-              <div
-                className="
-                  bg-emerald-500/10
-                  border-b
-                  border-emerald-500/20
-                  px-7
-                  py-5
-                  flex
-                  items-center
-                  justify-between
-                "
-              >
-
-                <div
-                  className="
-                    flex
-                    items-center
-                    gap-4
-                  "
-                >
-
-                  <div
-                    className="
-                      w-11
-                      h-11
-                      rounded-xl
-                      bg-emerald-500
-                      flex
-                      items-center
-                      justify-center
-                      shrink-0
-                    "
-                  >
-
-                    <CheckCircle2
-                      size={20}
-                      className="text-black"
-                    />
-
-                  </div>
-
-                  <div>
-
-                    <p
-                      className="
-                        text-[12px]
-                        font-black
-                        text-white
-                        uppercase
-                        tracking-wider
-                      "
-                    >
-                      Cerrar Orden de Trabajo
-                    </p>
-
-                    <p
-                      className="
-                        text-[9px]
-                        text-emerald-400/70
-                        font-mono
-                        uppercase
-                        tracking-widest
-                        mt-0.5
-                      "
-                    >
-                      {aircraft.tailNumber}
-                      {' · '}
-                      {aircraft.model}
-                    </p>
-
-                  </div>
-
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    setIsCompleteOpen(false)
-                  }
-                  className="
-                    text-zinc-600
-                    hover:text-white
-                    hover:rotate-90
-                    transition-all
-                  "
-                >
-                  <X size={20} />
+              <div><label className="block mb-2 text-[10px] text-[#E1AD01] font-black uppercase">Observaciones / progreso</label>
+                <textarea rows={5} value={notes} onChange={e => setNotes(e.target.value)}
+                  placeholder="AVANCES, DIAGNÓSTICO, REPUESTOS PEDIDOS..." className={`${inputCls} resize-none`}/></div>
+              <div className="flex gap-3 flex-wrap">
+                <button type="submit" disabled={isSaving} className={`${btnCls} flex-1 bg-[#E1AD01] text-black hover:bg-white`}>
+                  {isSaving ? <Loader2 className="animate-spin" size={14}/> : <Save size={14}/>} Guardar progreso
                 </button>
-
+                <button type="button" onClick={() => setIsCompleteOpen(true)} disabled={isSaving}
+                  className={`${btnCls} flex-1 bg-emerald-500 text-black hover:bg-emerald-400`}>
+                  <CheckCircle2 size={14}/> Completar Orden
+                </button>
               </div>
+            </form>
+          </> : <div className="bg-black/40 border border-white/10 rounded-2xl p-5 space-y-4">
+            <p className="text-xs text-amber-400">La aeronave permanece en mantenimiento sin órdenes abiertas. No está liberada para vuelo.</p>
+            <p className="text-xs text-slate-500">Si existe documentación de retorno al servicio, una persona expresamente autorizada puede registrar su liberación.</p>
+            <button type="button" onClick={() => setIsReleaseOpen(true)} disabled={isSaving}
+              className={`${btnCls} bg-emerald-500 text-black hover:bg-emerald-400`}><ShieldCheck size={14}/> Registrar liberación autorizada</button>
+          </div>}
+      </section>}
 
-              <form
-                onSubmit={
-                  handleCompleteOrder
-                }
-                className="
-                  p-7
-                  space-y-5
-                  font-mono
-                "
-              >
-
-                <div
-                  className="
-                    bg-white/[0.02]
-                    border
-                    border-white/[0.07]
-                    rounded-2xl
-                    p-4
-                  "
-                >
-
-                  <p
-                    className="
-                      text-[8px]
-                      text-zinc-600
-                      font-black
-                      uppercase
-                      tracking-widest
-                      mb-2
-                    "
-                  >
-                    Tarea a Cerrar
-                  </p>
-
-                  <p
-                    className="
-                      text-[10px]
-                      text-white
-                      font-black
-                      uppercase
-                      leading-snug
-                    "
-                  >
-                    {orderRecord.descripcion_tarea}
-                  </p>
-
-                </div>
-
-                <div className="space-y-1.5">
-
-                  <label
-                    className="
-                      text-[9px]
-                      font-black
-                      text-emerald-400
-                      uppercase
-                      tracking-widest
-                      block
-                    "
-                  >
-                    Mecánico / Inspector *
-                  </label>
-
-                  <input
-                    required
-                    className="
-                      w-full
-                      bg-black
-                      border
-                      border-emerald-500/30
-                      rounded-xl
-                      p-4
-                      text-white
-                      text-xs
-                      uppercase
-                      outline-none
-                      focus:border-emerald-500
-                      transition-all
-                      placeholder:text-white/20
-                      font-mono
-                    "
-                    placeholder="Nombre completo"
-                    value={
-                      completeForm.mecanicoCierre
-                    }
-                    onChange={(e) =>
-                      setCompleteForm(
-                        (prev) => ({
-                          ...prev,
-                          mecanicoCierre:
-                            e.target.value,
-                        })
-                      )
-                    }
-                  />
-
-                </div>
-
-                <div className="space-y-1.5">
-
-                  <label
-                    className="
-                      text-[9px]
-                      font-black
-                      text-[#E1AD01]
-                      uppercase
-                      tracking-widest
-                      block
-                    "
-                  >
-                    Horas Totales al Cierre
-                    (TSN) *
-                  </label>
-
-                  <input
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    required
-                    className="
-                      w-full
-                      bg-black
-                      border
-                      border-[#E1AD01]/30
-                      rounded-xl
-                      p-5
-                      text-white
-                      text-3xl
-                      font-black
-                      text-center
-                      outline-none
-                      focus:border-[#E1AD01]
-                      transition-all
-                      font-mono
-                    "
-                    placeholder="0.0"
-                    value={
-                      completeForm.horasActuales
-                    }
-                    onChange={(e) =>
-                      setCompleteForm(
-                        (prev) => ({
-                          ...prev,
-                          horasActuales:
-                            e.target.value,
-                        })
-                      )
-                    }
-                  />
-
-                  <p
-                    className="
-                      text-[8px]
-                      text-slate-600
-                      font-mono
-                    "
-                  >
-                    Esto actualizará las horas
-                    totales de la aeronave.
-                  </p>
-
-                </div>
-
-                <div className="space-y-1.5">
-
-                  <label
-                    className="
-                      text-[9px]
-                      font-black
-                      text-emerald-400
-                      uppercase
-                      tracking-widest
-                      flex
-                      items-center
-                      gap-2
-                    "
-                  >
-                    <Wrench size={11} />
-
-                    Observaciones Finales *
-                  </label>
-
-                  <textarea
-                    required
-                    rows={4}
-                    className="
-                      w-full
-                      bg-black
-                      border
-                      border-emerald-500/30
-                      rounded-xl
-                      p-4
-                      text-white
-                      text-xs
-                      resize-none
-                      outline-none
-                      focus:border-emerald-500
-                      transition-all
-                      placeholder:text-white/20
-                      uppercase
-                      font-mono
-                    "
-                    placeholder="TRABAJO REALIZADO, REPUESTOS INSTALADOS, PRUEBAS EJECUTADAS, CERTIFICACIÓN FINAL..."
-                    value={
-                      completeForm.observacionesFinales
-                    }
-                    onChange={(e) =>
-                      setCompleteForm(
-                        (prev) => ({
-                          ...prev,
-                          observacionesFinales:
-                            e.target.value,
-                        })
-                      )
-                    }
-                  />
-
-                  <p
-                    className="
-                      text-[8px]
-                      text-slate-600
-                      font-mono
-                    "
-                  >
-                    Se agregará con timestamp al
-                    historial de la orden y aparecerá
-                    en el Historial de la aeronave.
-                  </p>
-
-                </div>
-
-                <div
-                  className="
-                    flex
-                    items-start
-                    gap-2
-                    bg-emerald-500/5
-                    border
-                    border-emerald-500/15
-                    rounded-xl
-                    p-3
-                  "
-                >
-
-                  <AlertCircle
-                    size={13}
-                    className="
-                      text-emerald-400
-                      shrink-0
-                      mt-0.5
-                    "
-                  />
-
-                  <p
-                    className="
-                      text-[9px]
-                      text-emerald-400/80
-                      leading-relaxed
-                    "
-                  >
-                    Al confirmar: la orden pasa a{' '}
-                    <span className="font-black">
-                      COMPLETADA
-                    </span>
-                    , la aeronave se libera a{' '}
-                    <span className="font-black">
-                      OPERATIVA
-                    </span>
-                    , y el registro aparece en el
-                    Timeline de la aeronave.
-                  </p>
-
-                </div>
-
-                {errorMsg && (
-                  <FeedbackBanner
-                    tone="error"
-                    text={errorMsg}
-                    onClose={() =>
-                      setErrorMsg(null)
-                    }
-                  />
-                )}
-
-                <div
-                  className="
-                    flex
-                    gap-3
-                    pt-1
-                  "
-                >
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setIsCompleteOpen(false)
-                    }
-                    className="
-                      flex-1
-                      py-4
-                      rounded-xl
-                      border
-                      border-white/10
-                      text-zinc-400
-                      text-[10px]
-                      font-black
-                      uppercase
-                      hover:bg-white/5
-                      transition-all
-                    "
-                  >
-                    Cancelar
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={isSaving}
-                    className="
-                      flex-1
-                      py-4
-                      rounded-xl
-                      bg-emerald-500
-                      text-black
-                      text-[10px]
-                      font-black
-                      uppercase
-                      hover:bg-emerald-400
-                      transition-all
-                      disabled:opacity-40
-                      flex
-                      items-center
-                      justify-center
-                      gap-2
-                      shadow-lg
-                      shadow-emerald-500/20
-                    "
-                  >
-
-                    {isSaving ? (
-                      <Loader2
-                        size={14}
-                        className="animate-spin"
-                      />
-                    ) : (
-                      <CheckCircle2
-                        size={14}
-                      />
-                    )}
-
-                    {isSaving
-                      ? 'Cerrando...'
-                      : 'Confirmar Cierre'}
-
-                  </button>
-
-                </div>
-
-              </form>
-
-            </div>
-
+      {/* Modal de cierre: no libera automáticamente la aeronave */}
+      {isCompleteOpen && orderRecord && <div className="fixed inset-0 z-[90] bg-black/95 flex items-center justify-center p-4 overflow-y-auto">
+        <div className="w-full max-w-lg bg-[#0a0a0a] border border-emerald-500/40 rounded-3xl shadow-2xl overflow-hidden">
+          <div className="bg-emerald-500/10 border-b border-emerald-500/20 p-6 flex justify-between items-center">
+            <div><h3 className="text-sm font-black uppercase">Cerrar orden de trabajo</h3><p className="text-[10px] text-emerald-400 mt-2">{matricula} · {aircraft.model}</p></div>
+            <button type="button" onClick={() => setIsCompleteOpen(false)}><X size={20}/></button>
           </div>
-        )}
+          <form onSubmit={handleCompleteOrder} className="p-7 space-y-5">
+            <p className="bg-amber-500/10 border border-amber-500/20 p-3 rounded-xl text-xs text-amber-400">
+              El cierre de esta orden NO autoriza el regreso al servicio de la aeronave.
+            </p>
+            <div className="bg-white/[0.03] border border-white/10 p-4 rounded-xl"><p className="text-[9px] text-slate-500 uppercase">Tarea</p>
+              <p className="text-xs font-bold whitespace-pre-line mt-2">{orderRecord.descripcion_tarea}</p></div>
+            <div><label className="block mb-2 text-[10px] text-emerald-400 font-black uppercase">Mecánico / inspector *</label>
+              <input required className={inputCls} value={completeForm.mecanicoCierre}
+                onChange={e => setCompleteForm(p => ({...p, mecanicoCierre:e.target.value}))}/></div>
+            <div><label className="block mb-2 text-[10px] text-[#E1AD01] font-black uppercase">Horas totales al cierre (TSN) *</label>
+              <input required type="number" min="0" step="0.1" className={`${inputCls} text-2xl text-center font-black`}
+                value={completeForm.horasActuales} onChange={e => setCompleteForm(p => ({...p, horasActuales:e.target.value}))}/></div>
+            <div><label className="block mb-2 text-[10px] text-emerald-400 font-black uppercase">Observaciones finales *</label>
+              <textarea required rows={5} className={inputCls} value={completeForm.observacionesFinales}
+                onChange={e => setCompleteForm(p => ({...p, observacionesFinales:e.target.value}))}/></div>
+            {errorMsg && <p className="text-xs text-red-400">{errorMsg}</p>}
+            <div className="flex gap-3"><button type="button" onClick={() => setIsCompleteOpen(false)} className={`${btnCls} flex-1 border border-white/10`}>Cancelar</button>
+              <button type="submit" disabled={isSaving} className={`${btnCls} flex-1 bg-emerald-500 text-black`}>
+                {isSaving ? <Loader2 size={14} className="animate-spin"/> : <CheckCircle2 size={14}/>} Confirmar cierre</button></div>
+          </form>
+        </div>
+      </div>}
 
+      {/* Modal de autorización: validación completa dentro del RPC */}
+      {isReleaseOpen && !orderRecord && <div className="fixed inset-0 z-[95] bg-black/95 flex justify-center items-center p-4 overflow-y-auto">
+        <div className="bg-[#0a0a0a] border border-emerald-500/40 rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl">
+          <div className="bg-emerald-500/10 p-6 flex justify-between items-center border-b border-emerald-500/20">
+            <div><h3 className="uppercase font-black">Retorno al servicio · {matricula}</h3><p className="text-[10px] text-slate-400 mt-2">Solo personal previamente habilitado en Supabase</p></div>
+            <button type="button" onClick={() => setIsReleaseOpen(false)}><X size={20}/></button>
+          </div>
+          <form onSubmit={handleRelease} className="p-7 space-y-5">
+            <p className="text-xs bg-amber-500/10 border border-amber-500/20 p-4 rounded-lg text-amber-300">
+              Confirma que dispones de autorización real de mantenimiento, documentación de liberación firmada y verificación de todas las restricciones. Este formulario NO emite una certificación técnica.
+            </p>
+            <div><label className="block mb-2 text-[10px] font-black uppercase">Referencia de liberación firmada *</label>
+              <input required className={inputCls} value={releaseForm.referencia} placeholder="NÚMERO DE REGISTRO / REFERENCIA"
+                onChange={e => setReleaseForm(p=>({...p,referencia:e.target.value}))}/></div>
+            <div><label className="block mb-2 text-[10px] font-black uppercase">Observaciones y revisión de restricciones *</label>
+              <textarea required rows={5} className={inputCls} value={releaseForm.observaciones}
+                onChange={e => setReleaseForm(p=>({...p,observaciones:e.target.value}))}/></div>
+            {errorMsg && <p className="text-red-400 text-xs">{errorMsg}</p>}
+            <div className="flex gap-3"><button type="button" className={`${btnCls} flex-1 border border-white/20`} onClick={() => setIsReleaseOpen(false)}>Cancelar</button>
+              <button disabled={isSaving} type="submit" className={`${btnCls} flex-1 bg-emerald-500 text-black`}>
+                {isSaving ? <Loader2 size={14} className="animate-spin"/> : <ShieldCheck size={14}/>} Registrar</button></div>
+          </form>
+        </div>
+      </div>}
     </div>
   );
 };
 
-// ─────────────────────────────────────────────────────────────
-// MÉTRICA
-// ─────────────────────────────────────────────────────────────
-
-const MetricCard = ({
-  label,
-  value,
-  icon: Icon,
-  color,
-}: any) => (
-  <div
-    className="
-      bg-white/[0.03]
-      p-6
-      rounded-3xl
-      border
-      border-white/10
-      flex
-      items-center
-      gap-4
-      shadow-lg
-    "
-  >
-
-    <Icon
-      className="h-6 w-6 shrink-0"
-      style={{ color }}
-    />
-
-    <div>
-
-      <p
-        className="
-          text-[8px]
-          text-slate-500
-          font-black
-          uppercase
-          tracking-widest
-          mb-1
-        "
-      >
-        {label}
-      </p>
-
-      <p
-        className="
-          text-2xl
-          text-white
-          font-black
-          italic
-        "
-      >
-        {value}
-      </p>
-
-    </div>
-
+// Componentes visuales auxiliares; no sustituyen fuentes de datos técnicas.
+const MetricCard = ({ label, value, icon: Icon }: { label: string; value: string; icon: LucideIcon }) => (
+  <div className="bg-white/[0.03] border border-white/10 rounded-3xl p-6 flex gap-4 items-center shadow-xl">
+    <Icon size={26} className="text-[#E1AD01]"/>
+    <div><p className="text-[9px] text-slate-500 uppercase font-black tracking-widest mb-2">{label}</p><p className="text-xl font-black break-words">{value}</p></div>
   </div>
 );
-
-// ─────────────────────────────────────────────────────────────
-// TELEMETRÍA
-// ─────────────────────────────────────────────────────────────
-
-const TelemetryDot = ({
-  label,
-  value,
-  tone,
-  pulse,
-}: any) => {
-  const color =
-    tone === 'ok'
-      ? 'text-emerald-400'
-      : 'text-red-400';
-
-  return (
-    <div>
-
-      <p
-        className="
-          text-[8px]
-          text-slate-500
-          uppercase
-          font-black
-          tracking-widest
-        "
-      >
-        {label}
-      </p>
-
-      <p
-        className={`
-          text-white
-          font-mono
-          font-black
-          text-lg
-          flex
-          items-center
-          gap-2
-          mt-1
-          ${color}
-        `}
-      >
-
-        <Signal
-          className={`
-            h-3 w-3
-            ${pulse ? 'animate-pulse' : ''}
-          `}
-        />
-
-        {value}
-
-      </p>
-
-    </div>
-  );
-};
-
-// ─────────────────────────────────────────────────────────────
-// FEEDBACK
-// ─────────────────────────────────────────────────────────────
-
-const FeedbackBanner = ({
-  tone,
-  text,
-  onClose,
-}: {
-  tone: 'error' | 'success';
-  text: string;
-  onClose?: () => void;
-}) => (
-  <div
-    className={`
-      flex
-      items-start
-      gap-3
-      rounded-xl
-      border
-      p-3
-      animate-in
-      fade-in
-      duration-200
-      ${
-        tone === 'error'
-          ? `
-            bg-red-500/10
-            border-red-500/30
-          `
-          : `
-            bg-emerald-500/10
-            border-emerald-500/30
-          `
-      }
-    `}
-  >
-
-    <AlertCircle
-      className={`
-        h-4
-        w-4
-        mt-0.5
-        ${
-          tone === 'error'
-            ? 'text-red-400'
-            : 'text-emerald-400'
-        }
-      `}
-    />
-
-    <p
-      className={`
-        text-[10px]
-        font-mono
-        flex-1
-        ${
-          tone === 'error'
-            ? 'text-red-400'
-            : 'text-emerald-400'
-        }
-      `}
-    >
-      {text}
-    </p>
-
-    {onClose && (
-      <button
-        type="button"
-        onClick={onClose}
-        className="
-          text-slate-500
-          hover:text-white
-          transition-colors
-          text-[10px]
-          font-black
-        "
-      >
-        ×
-      </button>
-    )}
-
+const TelemetryDot = ({ label, value }: { label: string; value: string }) => (
+  <div><p className="text-[9px] text-slate-500 font-black uppercase tracking-widest">{label}</p>
+    <p className="text-sm text-zinc-500 font-mono mt-2 flex gap-2 items-center"><Signal size={13}/>{value}</p>
   </div>
 );
-
+const FeedbackBanner = ({ tone, text, onClose }: { tone: 'error' | 'success'; text: string; onClose?: () => void }) => (
+  <div className={`p-4 border rounded-xl flex gap-3 items-center ${tone === 'error' ? 'bg-red-500/10 border-red-500/30 text-red-300' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'}`}>
+    <AlertCircle size={16}/><p className="text-xs flex-1">{text}</p>
+    {onClose && <button type="button" onClick={onClose}><X size={14}/></button>}
+  </div>
+);
 export default AircraftDetail;

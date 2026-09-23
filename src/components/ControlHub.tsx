@@ -1,7 +1,10 @@
 // src/components/ControlHub.tsx
-// VALKYRON OS v5.4 — Hardening: race condition fix, fecha_cierre, doble filtro, legacy sync
+// VALKYRON OS v5.6 — Fusión integral v5.4 + v5.5: sincronización MRO segura
 // ─────────────────────────────────────────────────────────────────────────────
-// CHANGELOG v5.4:
+// v5.6: conserva todos los formularios, tarjetas y funciones originales.
+// La orden se crea con trigger transaccional y se verifica estado MRO.
+// El cierre se realiza mediante fn_mro_cerrar_orden y NO libera aeronaves.
+// v5.4 PRESERVADO:
 //   [FIX] handleFinalCertification: query de OT adicionales excluye task.id actual
 //         con .neq('id', task.id) — elimina falso positivo por lag de replicación
 //   [FIX] fecha_cierre removido del update (no existe en tipo WorkOrder) — el
@@ -24,7 +27,7 @@
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 
 import React, { useState, useEffect } from 'react';
-import { SparePart } from '../Types/Maintenance';
+import type { SparePart } from '../Types/Maintenance';
 import { Card, CardHeader, CardContent } from './ui/card';
 import { supabase } from '../lib/supabaseClient';
 import {
@@ -77,13 +80,18 @@ const INPUT_CLS = `w-full bg-black border border-white/10 rounded-xl p-4 text-wh
   uppercase outline-none focus:border-[#E1AD01] transition-all
   placeholder:text-white/20 font-mono`;
 
+// Setter estable para que el efecto inicial no se repita indefinidamente
+// si ControlHub se utiliza sin las propiedades opcionales tasks/setTasks.
+const noopSetTasks: React.Dispatch<React.SetStateAction<any[]>> = () => {};
+const noopSetFleet: React.Dispatch<React.SetStateAction<any[]>> = () => {};
+
 // ─── COMPONENTE ───────────────────────────────────────────────────────────────
 
 export const ControlHub: React.FC<ControlHubProps> = ({
   tasks: externalTasks = [],
-  setTasks: setExternalTasks = () => {},
+  setTasks: setExternalTasks = noopSetTasks,
   fleet = [],
-  setFleet = () => {},
+  setFleet = noopSetFleet,
   inventory = [],
   onFleetChange,
 }) => {
@@ -115,7 +123,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     : newTask.razon;
 
   const targetAircraft = fleet.find(
-    ac => (ac.tailNumber ?? ac.matricula) === newTask.matricula.toUpperCase()
+    ac => String(ac.tailNumber ?? ac.matricula ?? '').trim().toUpperCase() === newTask.matricula.trim().toUpperCase()
   );
 
   // ─── CARGAR ÓRDENES ───────────────────────────────────────────────────────
@@ -206,6 +214,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
         )
       );
 
+      await onFleetChange?.();
       setIsEditOpen(false);
       setEditingTask(null);
       alert(
@@ -240,71 +249,63 @@ export const ControlHub: React.FC<ControlHubProps> = ({
   //   UPDATE flota_aviones SET estado='maintenance' WHERE matricula='YV-118';
 
   const handleConfirmAndSend = async () => {
-    if (!pendingTask) return;
+    if (!pendingTask || loading) return;
     setLoading(true);
-
-    const matriculaUpper = pendingTask.matricula.toUpperCase();
+    const matriculaUpper = pendingTask.matricula.trim().toUpperCase();
     const razon = pendingTask.razon === 'Otra (especificar)'
       ? pendingTask.razonCustom.trim()
       : pendingTask.razon;
-
-    const modeloDetectado =
-      fleet.find(ac =>
-        (ac.tailNumber ?? ac.matricula) === matriculaUpper
-      )?.model ??
-      fleet.find(ac =>
-        (ac.tailNumber ?? ac.matricula) === matriculaUpper
-      )?.modelo ??
-      'MODELO NO DETECTADO';
-
-    const dbEntry = {
-      matricula:         matriculaUpper,
-      modelo:            modeloDetectado,
-      descripcion_tarea: pendingTask.descripcion,
-      sede:              pendingTask.sede,
-      nombre_mecanico:   pendingTask.mecanico || 'POR ASIGNAR',
-      estado:            'In Progress',
-      observaciones:     `RAZÓN DE ENTRADA: ${razon.toUpperCase()} | VALKYRON TERMINAL`,
-    };
-
-    const { data, error } = await supabase
-      .from('ordenes_trabajo').insert([dbEntry]).select();
-
-    if (!error && data) {
-      // [v5.2] Actualizar flota_aviones siempre por matricula TEXT (no UUID)
-      const { error: fleetError } = await supabase
-        .from('flota_aviones')
-        .update({ estado: 'maintenance' })
-        .eq('matricula', matriculaUpper);
-
-      if (fleetError) {
-        console.error('[ControlHub] FALLA CAMBIO ESTATUS FLOTA:', fleetError.message);
-      } else {
-        // Actualizar estado local — matchea por tailNumber o matricula
-        setFleet((prev: any[]) =>
-          prev.map(ac =>
-            (ac.tailNumber === matriculaUpper || ac.matricula === matriculaUpper)
-              ? { ...ac, status: 'maintenance', estado: 'maintenance' }
-              : ac
-          )
-        );
+    try {
+      if (!matriculaUpper || !razon || !pendingTask.descripcion.trim()) {
+        throw new Error('Matrícula, razón y descripción son obligatorias.');
       }
+      const target = fleet.find(ac =>
+        String(ac.tailNumber ?? ac.matricula ?? '').trim().toUpperCase() === matriculaUpper
+      );
+      if (!target) throw new Error('Aeronave no encontrada en la flota.');
 
-      setExternalTasks([data[0], ...externalTasks]);
+      // El trigger DB cambia flota a maintenance en la MISMA transacción
+      // que inserta esta OT. No crear una actualización independiente.
+      const { data: nuevaOrden, error: ordenError } = await supabase
+        .from('ordenes_trabajo')
+        .insert({
+          matricula: matriculaUpper,
+          modelo: target.model ?? target.modelo ?? 'MODELO NO DETECTADO',
+          descripcion_tarea: pendingTask.descripcion.trim(),
+          sede: pendingTask.sede,
+          nombre_mecanico: pendingTask.mecanico.trim() || 'POR ASIGNAR',
+          estado: 'In Progress',
+          observaciones: `RAZÓN DE ENTRADA: ${razon.toUpperCase()} | VALKYRON TERMINAL`,
+        })
+        .select('*')
+        .single();
+      if (ordenError) throw ordenError;
+
+      const { data: avion, error: flotaError } = await supabase
+        .from('flota_aviones')
+        .select('id, matricula, estado')
+        .eq('id', target.id)
+        .single();
+      if (flotaError) throw flotaError;
+      if (avion.estado !== 'maintenance') {
+        // La orden ya se creó: conservar formulario, NO reenviar a ciegas.
+        throw new Error(`OT ${nuevaOrden.id} creada, pero flota sigue ${avion.estado}. ` +
+          'Verifica el trigger SQL antes de volver a registrar la orden.');
+      }
+      setFleet(prev => prev.map(ac => ac.id === avion.id
+        ? { ...ac, status: 'maintenance', estado: 'maintenance' } : ac));
+      setExternalTasks(prev => [nuevaOrden, ...prev.filter(t => t.id !== nuevaOrden.id)]);
+      await onFleetChange?.();
       setIsConfirmOpen(false);
       setPendingTask(null);
-      setNewTask({
-        matricula: '', descripcion: '', sede: 'Lara',
-        mecanico: '', razon: '', razonCustom: '',
-      });
-      // [v5.3] Re-fetch flota desde DB para reflejar cambio en FleetDashboard
-      await onFleetChange?.();
-    } else {
-      alert(`FALLA TÁCTICA: ${error?.message}`);
-      setIsConfirmOpen(false);
-      setIsFormOpen(true);
+      setNewTask({ matricula: '', descripcion: '', sede: 'Lara',
+        mecanico: '', razon: '', razonCustom: '' });
+      alert(`✓ Orden ${nuevaOrden.id} registrada.\n${matriculaUpper}: EN MANTENIMIENTO.`);
+    } catch (err: any) {
+      alert('No se pudo confirmar el ingreso: ' + (err?.message ?? 'Error desconocido'));
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const handleCancelConfirm = () => {
@@ -312,67 +313,44 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     setIsFormOpen(true);
   };
 
-  // ─── LIBERACIÓN DE AERONAVE v5.4 ─────────────────────────────────────────
-  // [FIX v5.4] Query de OT adicionales excluye task.id con .neq('id', task.id)
-  //            Elimina falso positivo por lag de replicación Supabase:
-  //            la OT recién cerrada podía aparecer aún como activa en la 2da query.
-  // [FIX v5.4] fecha_cierre removido del update — no existe en tipo WorkOrder.
-  //            El timestamp de cierre queda registrado en observaciones (AircraftDetail).
-  // [v5.2] Siempre actualiza por matricula TEXT. Verifica OT adicionales antes de liberar.
+  // ─── CIERRE DE ORDEN (NO ES LIBERACIÓN) ──────────────────────────────────
+  // Requiere la función SQL fn_mro_cerrar_orden instalada en Supabase.
 
+  // Cerrar una orden NO autoriza el retorno al servicio.
+  // Las aeronaves permanecen en maintenance hasta liberación autorizada.
   const handleFinalCertification = async (task: any) => {
+    if (loading) return;
+    const mecanico = String(task.nombre_mecanico ?? '').trim();
+    if (!mecanico || mecanico === 'POR ASIGNAR') {
+      alert('Asigna un mecánico a la orden antes de cerrarla.');
+      return;
+    }
+    const observaciones = window.prompt(
+      `Cierre de OT: ${task.matricula}\n` +
+      'Describe el trabajo efectuado, los repuestos instalados y las comprobaciones.\n' +
+      'Cerrar esta OT NO libera la aeronave.'
+    );
+    if (observaciones === null) return;
+    if (!observaciones.trim()) {
+      alert('Las observaciones de cierre son obligatorias.');
+      return;
+    }
+    setLoading(true);
     try {
-      // 1. Cerrar la orden de trabajo — sin fecha_cierre (no está en el tipo)
-      const { error: otError } = await supabase
-        .from('ordenes_trabajo')
-        .update({ estado: 'Completed' })
-        .eq('id', task.id);
-
-      if (otError) throw otError;
-
-      // 2. Verificar OT adicionales activas para la misma aeronave
-      //    [FIX v5.4] .neq('id', task.id) excluye la OT recién cerrada
-      //    para evitar falso positivo por replicación tardía en Supabase
-      const { data: otrasOT } = await supabase
-        .from('ordenes_trabajo')
-        .select('id')
-        .eq('matricula', task.matricula)
-        .neq('id', task.id)
-        .in('estado', ['In Progress', 'Pending Parts', 'On Hold']);
-
-      const tieneOtrasOT = (otrasOT ?? []).length > 0;
-
-      // 3. Solo liberar aeronave si no quedan OT activas
-      if (!tieneOtrasOT) {
-        const { error: fleetError } = await supabase
-          .from('flota_aviones')
-          .update({ estado: 'operational' })
-          .eq('matricula', task.matricula);
-
-        if (fleetError) throw fleetError;
-
-        setFleet((prev: any[]) =>
-          prev.map(ac =>
-            (ac.tailNumber === task.matricula || ac.matricula === task.matricula)
-              ? { ...ac, status: 'operational', estado: 'operational' }
-              : ac
-          )
-        );
-      }
-
-      // 4. Quitar la tarjeta del hub (estado local)
-      setExternalTasks((prev: any[]) => prev.filter(t => t.id !== task.id));
-
-      // [v5.3] Re-fetch flota desde DB para reflejar liberación en FleetDashboard
+      const { error } = await supabase.rpc('fn_mro_cerrar_orden', {
+        p_orden_id: task.id,
+        p_observaciones: observaciones.trim(),
+        p_mecanico: mecanico,
+        p_horas: null,
+      });
+      if (error) throw error;
+      setExternalTasks(prev => prev.filter(t => t.id !== task.id));
       await onFleetChange?.();
-
-      alert(
-        tieneOtrasOT
-          ? `[ORDEN CERRADA] ${task.matricula} — quedan otras órdenes activas. La aeronave permanece en mantenimiento.`
-          : `[CERTIFICADO] ${task.matricula} LIBERADA Y OPERATIVA.`
-      );
+      alert(`Orden cerrada: ${task.matricula}.\nLa aeronave sigue fuera de servicio hasta su liberación autorizada.`);
     } catch (err: any) {
-      alert(`ERROR: ${err.message}`);
+      alert('Error al cerrar la orden: ' + (err?.message ?? 'Desconocido'));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -404,7 +382,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
               Hangar Operations Hub
             </h2>
             <p className="text-[9px] text-slate-500 font-mono uppercase tracking-tighter italic">
-              MIA v5.4 // Race Condition Fix + Hardening Completo
+              VALKYRON v5.5 // MRO Sincronizado
             </p>
           </div>
         </div>
@@ -528,7 +506,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                   <option value="On Hold">EN ESPERA</option>
                 </select>
                 <p className="text-[8px] text-zinc-700 font-mono">
-                  Para cerrar la orden usa "Finalizar Misión" desde la tarjeta.
+                  Para cerrar la orden usa "Cerrar Orden" desde la tarjeta.
                 </p>
               </div>
 
@@ -868,7 +846,7 @@ export const ControlHub: React.FC<ControlHubProps> = ({
                     className="w-full bg-[#E1AD01] text-black font-black py-4 rounded-xl hover:bg-white
                                transition-all text-[10px] tracking-[0.2em]
                                flex items-center justify-center gap-2">
-                    <PackageCheck className="h-4 w-4" /> Finalizar Misión
+                    <PackageCheck className="h-4 w-4" /> Cerrar Orden
                   </button>
                 </div>
               </CardContent>

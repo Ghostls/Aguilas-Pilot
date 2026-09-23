@@ -1,5 +1,5 @@
 // src/components/FleetDashboard.tsx
-// VALKYRON OS v5.5 — HISTORIAL DE AERONAVE (MRO TRAZABILIDAD)
+// VALKYRON OS v5.6 — HISTORIAL + SINCRONIZACIÓN MRO
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v5.5 (sobre v5.4):
 //   [FIX] onOpenHistorial cableado al AircraftDetail: cierra el detalle y
@@ -31,12 +31,13 @@ import {
 const normalizeAircraftStatus = (
   rawStatus: string
 ): 'operational' | 'maintenance' | 'grounded' | 'flight' => {
-  if (!rawStatus) return 'operational';
+  if (!rawStatus) return 'grounded';
   const s = rawStatus.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   if (s.includes('mantenimiento') || s.includes('maintenance')) return 'maintenance';
   if (s.includes('vuelo') || s.includes('flight'))               return 'flight';
   if (s.includes('tierra') || s.includes('grounded') || s.includes('aog')) return 'grounded';
-  return 'operational';
+  if (s.includes('operational') || s.includes('operativa')) return 'operational';
+  return 'grounded';
 };
 
 const SELECT_CLS = `w-full bg-[#0d0d0d] border border-white/10 rounded-xl p-4 text-white text-[10px]
@@ -451,7 +452,8 @@ const FleetDashboard = ({
       const { data, error } = await supabase
         .from('ordenes_trabajo').select('*')
         .eq('matricula', ac.tailNumber ?? (ac as any).matricula)
-        .order('created_at', { ascending: false }).limit(1).single();
+        .in('estado', ['In Progress', 'Pending Parts', 'On Hold'])
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
 
       if (error || !data) {
         alert('No se encontró una orden de trabajo activa para esta aeronave.');
@@ -602,8 +604,9 @@ const FleetDashboard = ({
     return (
       <AircraftDetail
         aircraft={selectedAircraft}
-        onBack={() => setSelectedAircraft(null)}
+        onBack={() => { setSelectedAircraft(null); void onFleetChange?.(); }}
         onOpenHistorial={handleOpenHistorialFromDetail}
+        onFleetChange={onFleetChange}
       />
     );
   }
