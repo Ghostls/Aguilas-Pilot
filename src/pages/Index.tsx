@@ -1,4 +1,4 @@
-// src/pages/Index.tsx
+﻿// src/pages/Index.tsx
 // VALKYRON OS v4.21 — TAB PLANIFICACIÓN DE VUELO EN EL NAV
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v4.21:
