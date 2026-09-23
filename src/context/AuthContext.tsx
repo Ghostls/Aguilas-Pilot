@@ -1,23 +1,51 @@
-// src/context/AuthContext.tsx
-// VALKYRON OS v5.1 — CONTEXTO DE AUTENTICACIÓN (MRO / INVENTARIO)
-// ─────────────────────────────────────────────────────────────────────────────
-// [NEW v5.1] Extraído de App.tsx v5.0 → evita dependencia circular
-//            (App importa Index; Index necesita useAuth).
-// Lógica de resolución preservada de v4.8/v5.0:
-//   - getSession() + onAuthStateChange(INITIAL_SESSION) → doble mecanismo
-//   - timeout de seguridad 8s
-//   - rol: app_metadata (servidor) > user_metadata > perfiles_estudiantes.role
-//   - TOKEN_REFRESHED actualiza sesión sin re-render global ni loader
-//   - canPlan vía RPC fn_es_planificador (misma regla que la BD)
-// ─────────────────────────────────────────────────────────────────────────────
 
-import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+// src/context/AuthContext.tsx
+// VALKYRON OS v6.1 — AUTENTICACIÓN Y ROLES OPERATIVOS
+//
+// FUSIÓN v5.1 + v6.0
+//
+// - roles_operativos > app_metadata.
+// - user_metadata solo proporciona datos de presentación.
+// - Compatibilidad con perfiles_estudiantes.
+// - getSession() + onAuthStateChange().
+// - Timeout de seguridad de 8 segundos.
+// - TOKEN_REFRESHED actualiza la sesión sin recargar toda la aplicación.
+// - USER_UPDATED vuelve a resolver los permisos.
+// - fn_es_planificador verifica permisos adicionales.
+// - Protección frente a respuestas asíncronas de sesiones anteriores.
+// - Ningún rol desconocido obtiene permisos por defecto.
+//
+// IMPORTANTE:
+// Los permisos definitivos se aplican mediante políticas RLS
+// y funciones autorizadas de Supabase. Este contexto únicamente
+// controla la sesión y la presentación de la aplicación.
+
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+
+import type { Session } from '@supabase/supabase-js';
+
 import { supabase } from '@/lib/supabaseClient';
 
-// ─── TIPOS ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 1. TIPOS
+// ─────────────────────────────────────────────────────────────
 
 export type UserRole =
-  | 'CEO' | 'ADMIN' | 'DIRECTOR' | 'PILOTO' | 'MECANICO' | 'CAPITAN' | 'PLANIFICADOR';
+  | 'CEO'
+  | 'ADMIN'
+  | 'DIRECTOR'
+  | 'PILOTO'
+  | 'MECANICO'
+  | 'CAPITAN'
+  | 'PLANIFICADOR'
+  | 'OPERACIONES';
 
 export interface UserProfile {
   nombre_completo: string;
@@ -25,182 +53,600 @@ export interface UserProfile {
   rol: string;
 }
 
-export type AuthStatus = 'loading' | 'authenticated' | 'anonymous';
+export type AuthStatus =
+  | 'loading'
+  | 'authenticated'
+  | 'anonymous';
 
 export interface AuthState {
-  status:   AuthStatus;
-  session:  any | null;
-  role:     UserRole | null;
-  profile:  UserProfile | null;
-  canPlan:  boolean;
-  enriched: boolean;   // perfil + permiso de planificación ya resueltos
+  status: AuthStatus;
+  session: Session | null;
+  role: UserRole | null;
+  profile: UserProfile | null;
+  canPlan: boolean;
+  enriched: boolean;
 }
 
 export const INITIAL_AUTH: AuthState = {
-  status: 'loading', session: null, role: null, profile: null, canPlan: false, enriched: false,
+  status: 'loading',
+  session: null,
+  role: null,
+  profile: null,
+  canPlan: false,
+  enriched: false,
 };
 
-/** Roles que la BD reconoce como planificadores (espejo de fn_es_planificador) */
-export const PLANNER_ROLES: UserRole[] = ['CEO', 'ADMIN', 'DIRECTOR', 'PLANIFICADOR'];
+// Los roles con acceso previsto a planificación.
+// La autorización real debe coincidir con las políticas
+// y funciones de la base de datos.
+
+export const PLANNER_ROLES: UserRole[] = [
+  'CEO',
+  'ADMIN',
+  'DIRECTOR',
+  'PLANIFICADOR',
+];
 
 const AUTH_TIMEOUT_MS = 8000;
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 2. NORMALIZACIÓN DE ROLES
+// ─────────────────────────────────────────────────────────────
 
-export const normalizeRole = (raw: unknown): UserRole => {
-  const v = String(raw ?? '')
-    .toUpperCase()
+export const normalizeRole = (
+  raw: unknown
+): UserRole | null => {
+  const value = String(raw ?? '')
     .trim()
+    .toUpperCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
-  if (v === 'PLANIFICACION' || v === 'DESPACHO' || v === 'DISPATCHER') return 'PLANIFICADOR';
-  if (v === 'INSTRUCTOR') return 'CAPITAN';
-  const known: UserRole[] = ['CEO', 'ADMIN', 'DIRECTOR', 'PILOTO', 'MECANICO', 'CAPITAN', 'PLANIFICADOR'];
-  return (known.includes(v as UserRole) ? v : 'PILOTO') as UserRole;
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+
+  if (
+    [
+      'PLANIFICADOR_VUELO',
+      'PLANIFICADOR_DE_VUELO',
+      'PLANIFICACION',
+      'DESPACHO',
+      'DISPATCHER',
+    ].includes(value)
+  ) {
+    return 'PLANIFICADOR';
+  }
+
+  if (value === 'INSTRUCTOR') {
+    return 'CAPITAN';
+  }
+
+  const known: UserRole[] = [
+    'CEO',
+    'ADMIN',
+    'DIRECTOR',
+    'PILOTO',
+    'MECANICO',
+    'CAPITAN',
+    'PLANIFICADOR',
+    'OPERACIONES',
+  ];
+
+  return known.includes(value as UserRole)
+    ? (value as UserRole)
+    : null;
 };
 
-/** app_metadata primero: user_metadata lo puede editar el propio usuario */
-const extractRole = (sess: any): { role: UserRole; fromMetadata: boolean } => {
-  const u = sess?.user;
-  const raw = u?.app_metadata?.rol
-    ?? u?.app_metadata?.role
-    ?? u?.user_metadata?.rol
-    ?? u?.user_metadata?.role;
-  return { role: normalizeRole(raw), fromMetadata: raw != null };
+// app_metadata es administrado desde el servidor.
+// user_metadata no se utiliza para asignar permisos.
+
+const extractServerRole = (
+  session: Session
+): UserRole | null => {
+  const user = session.user;
+
+  return normalizeRole(
+    user.app_metadata?.rol ??
+    user.app_metadata?.role
+  );
 };
 
-// ─── CONTEXTO ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// 3. CONTEXTO
+// ─────────────────────────────────────────────────────────────
 
-const AuthContext = createContext<AuthState>(INITIAL_AUTH);
-export const useAuth = () => useContext(AuthContext);
+const AuthContext =
+  createContext<AuthState>(INITIAL_AUTH);
 
-export const AuthProvider: React.FC<{
+export const useAuth = (): AuthState =>
+  useContext(AuthContext);
+
+// ─────────────────────────────────────────────────────────────
+// 4. PROVIDER
+// ─────────────────────────────────────────────────────────────
+
+interface AuthProviderProps {
   children: React.ReactNode;
   onSignedOut?: () => void;
-}> = ({ children, onSignedOut }) => {
-  const [auth, setAuth] = useState<AuthState>(INITIAL_AUTH);
-  const userIdRef   = useRef<string | null>(null);
+}
+
+export const AuthProvider: React.FC<AuthProviderProps> = ({
+  children,
+  onSignedOut,
+}) => {
+  const [auth, setAuth] =
+    useState<AuthState>(INITIAL_AUTH);
+
+  // Identifica la sesión actualmente procesada.
+  const userIdRef = useRef<string | null>(null);
+
+  // Impide que getSession e INITIAL_SESSION produzcan
+  // resoluciones duplicadas para una misma sesión.
   const resolvedRef = useRef(false);
+
+  // Invalida peticiones antiguas cuando cambia la sesión.
+  const generationRef = useRef(0);
+
+  // Mantiene actualizada la función de cierre.
   const signedOutRef = useRef(onSignedOut);
   signedOutRef.current = onSignedOut;
 
-  /** Carga perfil y permiso de planificación sin bloquear el acceso general */
-  const enrich = useCallback(async (sess: any, baseRole: UserRole, fromMetadata: boolean) => {
-    const user = sess.user;
-    let profile: UserProfile = {
-      nombre_completo: user?.user_metadata?.nombre_completo
-        ?? user?.user_metadata?.full_name
-        ?? user?.email
-        ?? 'OPERADOR',
-      sede: user?.user_metadata?.sede ?? '',
-      rol:  baseRole,
-    };
-    let role = baseRole;
-    let canPlan = PLANNER_ROLES.includes(baseRole);
+  // ───────────────────────────────────────────────────────────
+  // 5. RESOLVER PERFIL Y PERMISOS
+  // ───────────────────────────────────────────────────────────
 
-    try {
-      const { data: perfil } = await supabase
-        .from('perfiles_estudiantes')
-        .select('nombre_completo, sede, role')
-        .eq('id', user.id)
-        .maybeSingle();
-      if (perfil) {
-        profile = {
-          nombre_completo: perfil.nombre_completo || profile.nombre_completo,
-          sede:            perfil.sede || profile.sede,
-          rol:             profile.rol,
-        };
-        if (!fromMetadata && perfil.role) {
-          role = normalizeRole(perfil.role);
-          profile.rol = role;
+  const enrich = useCallback(
+    async (
+      session: Session,
+      generation: number
+    ): Promise<void> => {
+      const user = session.user;
+
+      // Rol provisional procedente exclusivamente
+      // de metadatos administrados por el servidor.
+      let role: UserRole | null =
+        extractServerRole(session);
+
+      // Los metadatos editables solo se utilizan
+      // para información de presentación.
+      let profile: UserProfile = {
+        nombre_completo: String(
+          user.user_metadata?.nombre_completo ??
+          user.user_metadata?.full_name ??
+          user.email ??
+          'OPERADOR'
+        ),
+        sede: String(
+          user.user_metadata?.sede ?? ''
+        ),
+        rol: role ?? 'SIN ASIGNAR',
+      };
+
+      // ─────────────────────────────────────────────────────
+      // 5.1 ROL OPERATIVO AUTORIZADO
+      // ─────────────────────────────────────────────────────
+
+      try {
+        const {
+          data: assigned,
+          error: roleError,
+        } = await supabase
+          .from('roles_operativos')
+          .select('rol, nombre_completo, sede')
+          .eq('user_id', user.id)
+          .maybeSingle();
+
+        if (roleError) {
+          console.warn(
+            '[AUTH] roles_operativos:',
+            roleError.message
+          );
+        } else if (assigned) {
+          // Una fila de roles_operativos tiene prioridad
+          // sobre app_metadata, incluso si contiene
+          // un rol no reconocido.
+          role = normalizeRole(assigned.rol);
+
+          profile = {
+            nombre_completo:
+              assigned.nombre_completo ||
+              profile.nombre_completo,
+
+            sede:
+              assigned.sede ||
+              profile.sede,
+
+            rol: role ?? 'SIN ASIGNAR',
+          };
         }
+      } catch (error) {
+        console.warn(
+          '[AUTH] No se pudo consultar el rol operativo:',
+          error
+        );
       }
-    } catch (err) {
-      console.warn('[MIA v5.1] Perfil no disponible:', err);
-    }
 
-    try {
-      const { data: esPlan, error } = await supabase.rpc('fn_es_planificador');
-      if (!error) canPlan = !!esPlan || PLANNER_ROLES.includes(role);
-    } catch (err) {
-      console.warn('[MIA v5.1] fn_es_planificador no disponible:', err);
-    }
+      // ─────────────────────────────────────────────────────
+      // 5.2 DATOS DEL PERFIL EXISTENTE
+      // ─────────────────────────────────────────────────────
 
-    if (userIdRef.current !== user.id) return;   // la sesión cambió mientras cargaba
-    setAuth(prev => ({ ...prev, role, profile, canPlan, enriched: true }));
-  }, []);
+      try {
+        const {
+          data: existingProfile,
+          error: profileError,
+        } = await supabase
+          .from('perfiles_estudiantes')
+          .select('nombre_completo, sede')
+          .eq('id', user.id)
+          .maybeSingle();
 
-  const resolveSession = useCallback((sess: any) => {
-    const newUserId = sess?.user?.id ?? null;
+        if (profileError) {
+          console.warn(
+            '[AUTH] perfiles_estudiantes:',
+            profileError.message
+          );
+        } else if (existingProfile) {
+          // Compatibilidad con la versión anterior.
+          // Esta tabla no modifica el rol operativo.
+          profile = {
+            ...profile,
 
-    // Mismo usuario ya resuelto (p. ej. TOKEN_REFRESHED): solo refresca la sesión
-    if (resolvedRef.current && newUserId && newUserId === userIdRef.current) {
-      setAuth(prev => ({ ...prev, session: sess }));
-      return;
-    }
+            nombre_completo:
+              profile.nombre_completo ===
+              String(
+                user.user_metadata?.nombre_completo ??
+                user.user_metadata?.full_name ??
+                user.email ??
+                'OPERADOR'
+              )
+                ? (
+                    existingProfile.nombre_completo ||
+                    profile.nombre_completo
+                  )
+                : profile.nombre_completo,
 
-    resolvedRef.current = true;
-    userIdRef.current = newUserId;
+            sede:
+              profile.sede ===
+              String(user.user_metadata?.sede ?? '')
+                ? (
+                    existingProfile.sede ||
+                    profile.sede
+                  )
+                : profile.sede,
+          };
+        }
+      } catch (error) {
+        console.warn(
+          '[AUTH] Perfil no disponible:',
+          error
+        );
+      }
 
-    if (sess) {
-      const { role, fromMetadata } = extractRole(sess);
-      console.log('[MIA v5.1] Acceso concedido — rango:', role);
+      // ─────────────────────────────────────────────────────
+      // 5.3 PERMISO ADICIONAL DE PLANIFICACIÓN
+      // ─────────────────────────────────────────────────────
+
+      let rpcCanPlan = false;
+
+      try {
+        const {
+          data: permission,
+          error: rpcError,
+        } = await supabase.rpc(
+          'fn_es_planificador'
+        );
+
+        if (rpcError) {
+          console.warn(
+            '[AUTH] fn_es_planificador:',
+            rpcError.message
+          );
+        } else {
+          rpcCanPlan = permission === true;
+        }
+      } catch (error) {
+        console.warn(
+          '[AUTH] No se pudo verificar planificación:',
+          error
+        );
+      }
+
+      // ─────────────────────────────────────────────────────
+      // 5.4 EVITAR RESPUESTAS OBSOLETAS
+      // ─────────────────────────────────────────────────────
+
+      if (
+        generation !== generationRef.current ||
+        userIdRef.current !== user.id
+      ) {
+        return;
+      }
+
+      // El rol reconocido determina qué interfaz
+      // puede mostrarse.
+      //
+      // fn_es_planificador añade el permiso de
+      // planificación que concede la base de datos.
+
+      const canPlan =
+        rpcCanPlan ||
+        (
+          role !== null &&
+          PLANNER_ROLES.includes(role)
+        );
+
+      setAuth(prev => ({
+        ...prev,
+
+        status: 'authenticated',
+
+        role,
+
+        profile: {
+          ...profile,
+          rol: role ?? 'SIN ASIGNAR',
+        },
+
+        canPlan,
+
+        enriched: true,
+      }));
+    },
+    []
+  );
+
+  // ───────────────────────────────────────────────────────────
+  // 6. RESOLUCIÓN DE SESIONES
+  // ───────────────────────────────────────────────────────────
+
+  const resolveSession = useCallback(
+    (
+      session: Session | null,
+      force = false
+    ): void => {
+      const newUserId =
+        session?.user?.id ?? null;
+
+      // Si ya resolvimos la sesión del mismo usuario,
+      // actualizar únicamente el token.
+      //
+      // USER_UPDATED utiliza force=true para cargar
+      // de nuevo el perfil y los permisos.
+
+      if (
+        !force &&
+        resolvedRef.current &&
+        newUserId !== null &&
+        newUserId === userIdRef.current
+      ) {
+        setAuth(prev => ({
+          ...prev,
+          session,
+        }));
+
+        return;
+      }
+
+      // Invalidar operaciones pendientes.
+      generationRef.current += 1;
+
+      const generation =
+        generationRef.current;
+
+      resolvedRef.current = true;
+      userIdRef.current = newUserId;
+
+      // ─────────────────────────────────────────────────────
+      // 6.1 SESIÓN AUSENTE
+      // ─────────────────────────────────────────────────────
+
+      if (!session || !newUserId) {
+        setAuth({
+          ...INITIAL_AUTH,
+          status: 'anonymous',
+          enriched: true,
+        });
+
+        return;
+      }
+
+      // ─────────────────────────────────────────────────────
+      // 6.2 SESIÓN AUTENTICADA
+      // ─────────────────────────────────────────────────────
+
+      // No se conceden permisos hasta completar
+      // la resolución desde el servidor.
+
       setAuth({
-        status: 'authenticated', session: sess, role,
-        profile: null, canPlan: PLANNER_ROLES.includes(role), enriched: false,
+        status: 'authenticated',
+        session,
+        role: null,
+        profile: null,
+        canPlan: false,
+        enriched: false,
       });
-      enrich(sess, role, fromMetadata);
-    } else {
-      setAuth({ ...INITIAL_AUTH, status: 'anonymous', enriched: true });
-    }
-  }, [enrich]);
+
+      // Ejecutar fuera del callback de eventos de Auth
+      // para evitar bloquear la gestión de sesiones.
+
+      void enrich(
+        session,
+        generation
+      ).catch(error => {
+        console.error(
+          '[AUTH] Error al resolver permisos:',
+          error
+        );
+
+        if (
+          generation !== generationRef.current ||
+          userIdRef.current !== newUserId
+        ) {
+          return;
+        }
+
+        // Ante un error inesperado, no conceder
+        // un rol ni permisos adicionales.
+
+        setAuth(prev => ({
+          ...prev,
+          role: null,
+          profile: null,
+          canPlan: false,
+          enriched: true,
+        }));
+      });
+    },
+    [enrich]
+  );
+
+  // ───────────────────────────────────────────────────────────
+  // 7. CICLO DE VIDA DE AUTENTICACIÓN
+  // ───────────────────────────────────────────────────────────
 
   useEffect(() => {
-    // Timeout de seguridad: 8s máximo — si Supabase no responde, fuerza resolución
+    let alive = true;
+
+    // Timeout de seguridad para la carga inicial.
     const safetyTimer = setTimeout(() => {
-      if (!resolvedRef.current) {
-        console.warn('[MIA v5.1] Timeout de auth — forzando resolución sin sesión');
+      if (
+        alive &&
+        !resolvedRef.current
+      ) {
+        console.warn(
+          '[AUTH] Timeout de sesión.'
+        );
+
         resolveSession(null);
       }
     }, AUTH_TIMEOUT_MS);
 
-    // Mecanismo 1: getSession() directo
-    supabase.auth.getSession()
-      .then(({ data: { session } }) => resolveSession(session))
-      .catch((err) => {
-        console.error('[MIA v5.1] getSession error:', err);
-        resolveSession(null);
+    // ─────────────────────────────────────────────────────
+    // 7.1 OBTENER SESIÓN ACTUAL
+    // ─────────────────────────────────────────────────────
+
+    void supabase.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!alive) return;
+
+        if (error) {
+          console.error(
+            '[AUTH] getSession:',
+            error.message
+          );
+
+          if (!resolvedRef.current) {
+            resolveSession(null);
+          }
+
+          return;
+        }
+
+        if (!resolvedRef.current) {
+          resolveSession(
+            data.session
+          );
+        }
       })
-      .finally(() => clearTimeout(safetyTimer));
+      .catch(error => {
+        if (!alive) return;
 
-    // Mecanismo 2: onAuthStateChange
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, sess) => {
-      console.log('[MIA v5.1] Auth event:', event);
+        console.error(
+          '[AUTH] Error al obtener sesión:',
+          error
+        );
 
-      if (event === 'SIGNED_OUT') {
-        resolvedRef.current = false;
-        userIdRef.current = null;
-        setAuth({ ...INITIAL_AUTH, status: 'anonymous', enriched: true });
-        signedOutRef.current?.();
-        return;
+        if (!resolvedRef.current) {
+          resolveSession(null);
+        }
+      });
+
+    // ─────────────────────────────────────────────────────
+    // 7.2 ESCUCHAR CAMBIOS DE AUTENTICACIÓN
+    // ─────────────────────────────────────────────────────
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        if (!alive) return;
+
+        switch (event) {
+          case 'SIGNED_OUT': {
+            resolveSession(
+              null,
+              true
+            );
+
+            signedOutRef.current?.();
+
+            break;
+          }
+
+          case 'INITIAL_SESSION': {
+            if (!resolvedRef.current) {
+              resolveSession(session);
+            }
+
+            break;
+          }
+
+          case 'SIGNED_IN': {
+            resolveSession(session);
+
+            break;
+          }
+
+          case 'TOKEN_REFRESHED': {
+            // Mantener la interfaz y actualizar
+            // únicamente la sesión.
+            if (session) {
+              resolveSession(session);
+            }
+
+            break;
+          }
+
+          case 'USER_UPDATED': {
+            // Una actualización de usuario obliga
+            // a resolver nuevamente los permisos.
+            resolveSession(
+              session,
+              true
+            );
+
+            break;
+          }
+
+          default:
+            break;
+        }
       }
+    );
 
-      if (
-        event === 'INITIAL_SESSION' ||
-        event === 'SIGNED_IN' ||
-        event === 'TOKEN_REFRESHED' ||
-        event === 'USER_UPDATED'
-      ) {
-        resolveSession(sess);
-        clearTimeout(safetyTimer);
-      }
-    });
+    // ─────────────────────────────────────────────────────
+    // 7.3 LIMPIEZA
+    // ─────────────────────────────────────────────────────
 
     return () => {
+      alive = false;
+
+      clearTimeout(
+        safetyTimer
+      );
+
+      generationRef.current += 1;
+
       subscription.unsubscribe();
-      clearTimeout(safetyTimer);
     };
   }, [resolveSession]);
 
-  return <AuthContext.Provider value={auth}>{children}</AuthContext.Provider>;
+  // ───────────────────────────────────────────────────────────
+  // 8. PROVIDER
+  // ───────────────────────────────────────────────────────────
+
+  return (
+    <AuthContext.Provider value={auth}>
+      {children}
+    </AuthContext.Provider>
+  );
 };

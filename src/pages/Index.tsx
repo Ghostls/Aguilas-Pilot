@@ -1,5 +1,5 @@
 ﻿// src/pages/Index.tsx
-// VALKYRON OS v4.21 — TAB PLANIFICACIÓN DE VUELO EN EL NAV
+// VALKYRON OS v6.1 — FUSIÓN v4.21 + v6.0 / PLANIFICADOR CON HANGAR DE CONSULTA
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v4.21:
 //   [NEW] Tab 'planificacion' → FlightPlanningBoard dentro del mismo nav/header
@@ -13,7 +13,9 @@
 // v4.20 PRESERVADO: syncFleet como callback para ControlHub/FleetDashboard, canal
 //   realtime con timestamp, filtro de tabs por rol, OPERACIONES = MECANICO,
 //   toda la estructura intacta.
-// REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
+// Preserva módulos originales, navegación responsive, realtime y syncFleet.
+// Acceso planificador: Hangar de consulta y Planificación; autorización final por RLS.
+// REGLA DE ORO: CERO OMISIONES. SIEMPRE EVOLUCIÓN.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -22,7 +24,6 @@ import FleetDashboard from '@/components/FleetDashboard';
 import InventoryPanel from '@/components/InventoryPanel';
 import { ControlHub } from '@/components/ControlHub';
 import { InventoryCheckout } from '@/components/InventoryCheckout';
-import { MaintenanceHistory } from '@/components/MaintenanceHistory';
 import { VendorPanel } from '@/components/VendorPanel';
 import { HomeDashboard } from '@/components/HomeDashboard';
 import { FuelPanel } from '@/components/FuelPanel';
@@ -32,9 +33,11 @@ import { CaptainDashboard } from '@/components/CaptainDashboard';
 import { supabase } from '@/lib/supabaseClient';
 import FlightRegister from '@/components/flights/FlightRegister';
 import { FlightCalendar } from '@/components/FlightCalendar';
-import FlightPlanningBoard from '@/components/FlightPlanningboard';   // [NEW v4.21]
-import { useAuth, PLANNER_ROLES } from '@/context/AuthContext';       // [NEW v4.21]
-import { WorkOrder, Vendor, SparePart, Aircraft } from '@/Types/Maintenance';
+import FlightPlanningBoard from '@/components/FlightPlanningboard';
+import PlannerHangar from '@/components/PlannerHangar';
+import { useAuth } from '@/context/AuthContext';
+import type { WorkOrder, Vendor, SparePart, Aircraft } from '@/Types/Maintenance';
+import type { LucideIcon } from 'lucide-react';
 
 import {
   Plane, Package, LogOut, Wrench, ClipboardCheck,
@@ -45,16 +48,17 @@ import {
 type TabKey =
   | 'home' | 'captain-log' | 'fleet' | 'inventory'
   | 'control-hub' | 'checkout' | 'fuel' | 'finance' | 'vendors' | 'flights' | 'calendario'
-  | 'planificacion';
+  | 'planificacion' | 'hangar-consulta';
 
-const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+const tabs: { key: TabKey; label: string; icon: LucideIcon }[] = [
   { key: 'home',          label: 'Inicio',        icon: Home           },
   { key: 'captain-log',   label: 'Mi Bitácora',   icon: Award          },
   { key: 'fleet',         label: 'Flota',         icon: Plane          },
   { key: 'flights',       label: 'Vuelos',        icon: FileText       },
-  { key: 'planificacion', label: 'Planificación', icon: CalendarCheck  },   // [NEW v4.21]
+  { key: 'planificacion', label: 'Planificación', icon: CalendarCheck  },
+  { key: 'hangar-consulta', label: 'Hangar · Consulta', icon: Plane },
   { key: 'inventory',     label: 'Stock',         icon: Package        },
-  { key: 'control-hub',   label: 'Hangar',        icon: Wrench         },
+  { key: 'control-hub',   label: 'Hangar MRO',    icon: Wrench         },
   { key: 'checkout',      label: 'Salidas',       icon: ClipboardCheck },
   { key: 'fuel',          label: 'AVGAS',         icon: Fuel           },
   { key: 'finance',       label: 'Dinero',        icon: DollarSign     },
@@ -66,44 +70,34 @@ const tabs: { key: TabKey; label: string; icon: React.ComponentType<{ className?
 type AircraftStatus = 'operational' | 'maintenance' | 'grounded' | 'flight';
 
 const normalizeStatus = (raw: string): AircraftStatus => {
-  if (!raw) return 'operational';
+  if (!raw) return 'grounded';
   const s = raw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   if (s.includes('mantenimiento') || s.includes('maintenance')) return 'maintenance';
   if (s.includes('vuelo')         || s.includes('flight'))      return 'flight';
   if (s.includes('tierra')        || s.includes('grounded') || s.includes('aog')) return 'grounded';
-  return 'operational';
+  if (s.includes('operational') || s.includes('operativa')) return 'operational';
+  return 'grounded';
 };
 
-// ─── NORMALIZACIÓN DE ROL ─────────────────────────────────────────────────────
-const resolveRol = (
-  userRoleProp: string | undefined,
-  metaRol:      string | undefined,
-  perfilRol:    string | undefined,
-): string => {
-  const candidates = [userRoleProp, metaRol, perfilRol];
-  for (const c of candidates) {
-    if (c && c.trim() !== '') return c.trim().toUpperCase();
-  }
-  return 'MECANICO';
-};
-
-const normRol = (rol: string) => rol
-  .toUpperCase()
-  .trim()
-  .normalize('NFD')
-  .replace(/[\u0300-\u036f]/g, '');
+// Los roles se resuelven únicamente desde AuthContext (no desde metadata editable).
 
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
-const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
+// Props heredadas: se aceptan por compatibilidad, pero NO asignan permisos.
+const Index = (_props: { userRole?: string; fleet?: any[] }) => {
   const [activeTab,        setActiveTab]        = useState<TabKey>('home');
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [loading,          setLoading]          = useState(true);
   const [isRegisterOpen,   setIsRegisterOpen]   = useState(false);
-  const [userProfile,      setUserProfile]      = useState<{
-    rol: string; nombre_completo: string; sede: string;
-  } | null>(null);
   const navigate = useNavigate();
-  const { canPlan } = useAuth();   // [NEW v4.21] permiso real de planificación (BD)
+  const { canPlan, role, profile, enriched, status } = useAuth();
+  const isPlanner = role === 'PLANIFICADOR';
+  const userProfile = enriched && role ? {
+    rol: role,
+    nombre_completo: profile?.nombre_completo ?? 'OPERADOR',
+    sede: profile?.sede ?? '',
+  } : null;
+  // Solo estos cargos pueden acceder a Alta de Personal desde esta vista.
+  const canRegisterStaff = role === 'CEO' || role === 'ADMIN' || role === 'DIRECTOR';
 
   const [fleetData,        setFleetData]        = useState<Aircraft[]>([]);
   const [partsData,        setPartsData]        = useState<SparePart[]>([]);
@@ -134,44 +128,26 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 
   // ── INIT ─────────────────────────────────────────────────────────────────
   useEffect(() => {
+    if (!enriched || status !== 'authenticated' || !role) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
     const syncTerminalData = async () => {
       setLoading(true);
       try {
-        const { data: { user } } = await supabase.auth.getUser();
-
-        if (user) {
-          const metaRol  = user.user_metadata?.rol  as string | undefined;
-          const metaRole = user.user_metadata?.role as string | undefined;
-
-          const { data: profile } = await supabase
-            .from('perfiles')
-            .select('nombre_completo, sede, rol')
-            .eq('id', user.id)
-            .maybeSingle();
-
-          const rolResuelto = resolveRol(
-            userRole,
-            metaRol || metaRole,
-            profile?.rol,
-          );
-
-          setUserProfile({
-            rol:             rolResuelto,
-            nombre_completo: profile?.nombre_completo
-                             || user.user_metadata?.nombre_completo
-                             || user.email
-                             || 'Root',
-            sede:            profile?.sede || user.user_metadata?.sede || 'LARA',
-          });
-        }
-
+        // Los permisos y datos de identidad vienen de AuthContext.
+        // No se otorgan permisos en Index por userRole ni user_metadata.
+        if (!enriched || status !== 'authenticated') return;
         await syncFleet();
 
+          if (role === 'PLANIFICADOR') return; // No consultar inventario/proveedores para este perfil.
         const [{ data: spares }, { data: provData }] = await Promise.all([
           supabase.from('inventario_repuestos').select('*'),
           supabase.from('proveedores').select('*').order('nombre_empresa', { ascending: true }),
         ]);
 
+        if (cancelled) return;
         if (spares) {
           setPartsData(spares.map(p => ({
             id:         p.id,
@@ -203,7 +179,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
       } catch (err) {
         console.error('[ÁGUILAS OS] Error Crítico:', err);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
@@ -219,8 +195,8 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
       )
       .subscribe();
 
-    return () => { supabase.removeChannel(fleetChannel); };
-  }, [syncFleet, userRole]);
+    return () => { cancelled = true; void supabase.removeChannel(fleetChannel); };
+  }, [syncFleet, enriched, status, role, profile?.nombre_completo, profile?.sede]);
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
@@ -229,44 +205,32 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
 
   // ── FILTRO DE TABS POR ROL ───────────────────────────────────────────────
   const visibleTabs = tabs.filter(tab => {
-    if (!userProfile) return tab.key === 'home';
+     // Acceso exclusivo: consulta de hangar y planificación.
+     if (!enriched || status !== 'authenticated' || !role) return false;
+     if (isPlanner) return tab.key === 'hangar-consulta' || (tab.key === 'planificacion' && canPlan);
+     if (tab.key === 'hangar-consulta') return false;
+     if (tab.key === 'planificacion') return canPlan;
+     if (role === 'CEO') return true;
+     if (role === 'ADMIN' || role === 'DIRECTOR')
+       return ['home','inventory','fuel','finance','vendors','flights','fleet','calendario'].includes(tab.key);
+     if (role === 'MECANICO' || role === 'OPERACIONES')
+       return ['home','fleet','inventory','control-hub','checkout','fuel'].includes(tab.key);
+     if (role === 'PILOTO' || role === 'CAPITAN')
+       return ['home','captain-log','flights','fleet','calendario'].includes(tab.key);
+     return tab.key === 'home';
+   });
+   const safeTab: TabKey = visibleTabs.some(tab => tab.key === activeTab)
+     ? activeTab
+     : (visibleTabs[0]?.key ?? 'home');
 
-    const rol = normRol(userProfile.rol);
-
-    // [NEW v4.21] Planificación: por rango o por registro en planificadores_vuelo
-    if (tab.key === 'planificacion') {
-      return canPlan || (PLANNER_ROLES as string[]).includes(rol);
-    }
-
-    if (rol === 'CEO') return true;
-
-    if (rol === 'ADMIN' || rol.includes('ADMIN') || rol === 'DIRECTOR')
-      return ['home', 'inventory', 'fuel', 'finance', 'vendors', 'flights', 'fleet', 'calendario'].includes(tab.key);
-
-    // OPERACIONES comparte exactamente la misma vista que MECANICO
-    if (rol === 'MECANICO' || rol === 'OPERACIONES')
-      return ['home', 'fleet', 'inventory', 'control-hub', 'checkout', 'fuel'].includes(tab.key);
-
-    // [FIX v4.21] CAPITAN / INSTRUCTOR ahora con su vista operativa
-    if (rol === 'PILOTO' || rol === 'ESTUDIANTE' || rol === 'CAPITAN' || rol === 'INSTRUCTOR')
-      return ['home', 'captain-log', 'flights', 'fleet', 'calendario'].includes(tab.key);
-
-    // [NEW v4.21]
-    if (rol === 'PLANIFICADOR' || rol === 'PLANIFICACION' || rol === 'DESPACHO')
-      return ['home', 'fleet', 'calendario'].includes(tab.key);
-
-    return tab.key === 'home';
-  });
-
-  // [FIX v4.21] El tab activo siempre debe ser uno visible
   useEffect(() => {
-    if (userProfile && !visibleTabs.some(t => t.key === activeTab)) {
-      setActiveTab('home');
+    if (enriched && visibleTabs.length && !visibleTabs.some(t => t.key === activeTab)) {
+      setActiveTab(visibleTabs[0].key);
     }
-  }, [userProfile, canPlan, activeTab]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [enriched, role, canPlan, activeTab]); // visibleTabs is derived above from these dependencies
 
   // ── LOADING ──────────────────────────────────────────────────────────────
-  if (loading) {
+  if (loading || status === 'loading' || (status === 'authenticated' && !enriched)) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#020202]">
         <div className="flex flex-col items-center gap-6">
@@ -279,10 +243,23 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
     );
   }
 
+  if (status !== 'authenticated' || !role) {
+    return <div className="flex min-h-screen items-center justify-center bg-[#020202] p-8 text-center text-white">
+      <div><h2 className="text-xl font-black">ACCESO PENDIENTE</h2>
+        <p className="mt-3 text-sm text-slate-400">Tu rol debe ser asignado por administración.</p>
+        <button onClick={handleLogout} className="mt-6 rounded-lg bg-[#E1AD01] px-5 py-3 text-black">Cerrar sesión</button>
+      </div>
+    </div>;
+  }
+
   // ── RENDER ────────────────────────────────────────────────────────────────
   return (
     <div className="flex min-h-screen flex-col bg-[#020202] text-white font-sans text-left overflow-x-hidden">
-      <StatusBar onOpenRegister={() => setIsRegisterOpen(true)} />
+      {!isPlanner && (
+        <StatusBar onOpenRegister={() => {
+          if (canRegisterStaff) setIsRegisterOpen(true);
+        }} />
+      )}
 
       
       
@@ -325,7 +302,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
                       xl:px-2 xl:text-[9px]
                       2xl:gap-1.5 2xl:px-2.5
                       ${
-                        activeTab === tab.key
+                        safeTab === tab.key
                           ? 'border-[#E1AD01]/25 bg-white/5 text-[#E1AD01]'
                           : 'border-transparent text-slate-500 hover:bg-white/[0.04] hover:text-white'
                       }
@@ -333,7 +310,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
                   >
                     <Icon
                       className={`h-3 w-3 shrink-0 2xl:h-3.5 2xl:w-3.5 ${
-                        activeTab === tab.key ? '' : 'opacity-50'
+                        safeTab === tab.key ? '' : 'opacity-50'
                       }`}
                     />
 
@@ -376,7 +353,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
                         setIsMobileMenuOpen(false);
                       }}
                       className={`flex min-h-11 items-center gap-2 rounded-lg border px-3 py-2 text-left text-[10px] font-bold uppercase ${
-                        activeTab === tab.key
+                        safeTab === tab.key
                           ? 'border-[#E1AD01]/25 bg-white/5 text-[#E1AD01]'
                           : 'border-transparent text-slate-500'
                       }`}
@@ -408,13 +385,13 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
         <h2 className="text-2xl md:text-3xl font-black text-white tracking-tighter flex items-center gap-4 uppercase italic">
           <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_10px_30px_rgba(225,173,1,0.2)] flex-shrink-0 text-black">
             {(() => {
-              const currentTab = tabs.find(t => t.key === activeTab);
+              const currentTab = tabs.find(t => t.key === safeTab);
               const Icon = currentTab?.icon || Home;
               return <Icon className="h-6 w-6" />;
             })()}
           </div>
           <div className="flex flex-col">
-            <span className="leading-none">{tabs.find(t => t.key === activeTab)?.label}</span>
+            <span className="leading-none">{tabs.find(t => t.key === safeTab)?.label}</span>
             <span className="text-[8px] text-[#E1AD01] font-mono tracking-[0.6em] mt-2 opacity-70 uppercase">
               Terminal: {userProfile?.nombre_completo || 'Root'} — Rango: {userProfile?.rol || 'Unauthorized'}
             </span>
@@ -426,23 +403,27 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
       <main className="flex-1 px-4 md:px-8 pb-8 text-left">
         <div className="max-w-[1750px] mx-auto animate-in fade-in duration-500">
 
-          {activeTab === 'home' && (
+          {safeTab === 'home' && visibleTabs.some(t => t.key === 'home') && (
             <HomeDashboard
               fleet={fleetData}
               inventory={partsData}
               activeTasks={tasksData}
               vendors={vendorsData}
               financeData={aguilasFinance}
-              onNavigate={setActiveTab}
+              onNavigate={(key: string) => {
+                if (visibleTabs.some(t => t.key === key)) setActiveTab(key as TabKey);
+              }}
               userRole={userProfile?.rol}
             />
           )}
 
-          {activeTab === 'captain-log' && (
+          {safeTab === 'hangar-consulta' && isPlanner && <PlannerHangar />}
+
+          {safeTab === 'captain-log' && visibleTabs.some(t => t.key === 'captain-log') && (
             <CaptainDashboard userProfile={userProfile} />
           )}
 
-          {activeTab === 'fleet' && (
+          {safeTab === 'fleet' && visibleTabs.some(t => t.key === 'fleet') && (
             <FleetDashboard
               fleetData={fleetData}
               setFleetData={setFleetData}
@@ -450,7 +431,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {activeTab === 'inventory' && (
+          {safeTab === 'inventory' && visibleTabs.some(t => t.key === 'inventory') && (
             <InventoryPanel
               parts={partsData}
               setParts={setPartsData}
@@ -461,7 +442,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {activeTab === 'control-hub' && (
+          {safeTab === 'control-hub' && visibleTabs.some(t => t.key === 'control-hub') && (
             <ControlHub
               tasks={tasksData}
               setTasks={setTasksData}
@@ -473,7 +454,7 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {activeTab === 'checkout' && (
+          {safeTab === 'checkout' && visibleTabs.some(t => t.key === 'checkout') && (
             <InventoryCheckout
               onCheckoutSuccess={(pn, qty, _aircraftId) => {
                 setPartsData(prev =>
@@ -487,11 +468,11 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {activeTab === 'fuel' && (
+          {safeTab === 'fuel' && visibleTabs.some(t => t.key === 'fuel') && (
             <FuelPanel fleet={fleetData} vendors={vendorsData} />
           )}
 
-          {activeTab === 'finance' && (
+          {safeTab === 'finance' && visibleTabs.some(t => t.key === 'finance') && (
             <FinancePanel
               vendors={vendorsData}
               inventory={partsData}
@@ -500,11 +481,11 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
             />
           )}
 
-          {activeTab === 'vendors' && (
+          {safeTab === 'vendors' && visibleTabs.some(t => t.key === 'vendors') && (
             <VendorPanel vendors={vendorsData} setVendors={setVendorsData} />
           )}
 
-          {activeTab === 'calendario' && (
+          {safeTab === 'calendario' && visibleTabs.some(t => t.key === 'calendario') && (
             <FlightCalendar
               userRole={userProfile?.rol}
               userProfile={userProfile}
@@ -512,28 +493,30 @@ const Index = ({ userRole, fleet }: { userRole?: string; fleet?: any[] }) => {
           )}
 
           {/* [NEW v4.21] */}
-          {activeTab === 'planificacion' && (
+          {safeTab === 'planificacion' && visibleTabs.some(t => t.key === 'planificacion') && (
             <FlightPlanningBoard
               userRole={userProfile?.rol}
               userProfile={userProfile}
             />
           )}
 
-          {activeTab === 'flights' && (
+          {safeTab === 'flights' && visibleTabs.some(t => t.key === 'flights') && (
             <FlightRegister onFlightLogUpdate={() => {}} />
           )}
 
         </div>
       </main>
 
-      {isRegisterOpen && <Register onClose={() => setIsRegisterOpen(false)} />}
+      {isRegisterOpen && canRegisterStaff && (
+        <Register onClose={() => setIsRegisterOpen(false)} />
+      )}
 
       <footer className="border-t border-white/5 bg-black/80 px-8 py-6 flex justify-between items-center mt-auto">
         <div className="text-[8px] text-slate-600 font-mono tracking-[0.5em] uppercase">
           Águilas Pilot — Strategic Division 2026
         </div>
         <div className="text-[8px] text-[#E1AD01] font-black uppercase tracking-[0.3em] italic text-right">
-          Valkyron OS v4.21
+          Valkyron OS v6.1
         </div>
       </footer>
     </div>
