@@ -1,4 +1,11 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v16.5
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v16.6
+// CHANGELOG v16.6 vs v16.5:
+//   [FIX CRÍTICO] Resolución real de rol financiero: CEO / ADMIN / DIRECTOR se normalizan y se validan
+//         contra el perfil autenticado en Supabase. Evita “SIN RANGO” cuando el prop llega vacío/desactualizado.
+//   [FIX CRÍTICO] ADMIN conserva permisos completos para mover finanzas; aliases ADMINISTRADOR/ADMINISTRACION
+//         se normalizan a ADMIN. CEO en minúsculas, con espacios o desde BD se reconoce correctamente.
+//   [SEC] Frontend no sustituye RLS: la BD sigue siendo autoridad final mediante es_staff_finanzas().
+//   [DIAG] Si la lectura del rol del perfil falla, se conserva el rol recibido por prop y se registra warning.
 // CHANGELOG v16.5 vs v16.4:
 //   [NEW] Trazabilidad absoluta de QUIÉN PAGA: todo ingreso (cobro CxC, horas pagadas, ingreso directo, ingreso
 //         real en caja, préstamo recibido) exige pagador (tipo, nombre, cédula/RIF, contacto, alumno vinculado),
@@ -271,6 +278,26 @@ const optOff  = 'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zi
 const DEFAULT_TASA_BS       = 36.50;
 const DIRECTOR_FINANCE_CODE = '4827';
 const NOOP = () => {};
+
+// ▼ v16.6 — rol financiero canónico. El frontend acepta aliases, pero la BD/RLS sigue siendo autoridad final.
+const FINANCE_ROLES = ['CEO', 'ADMIN', 'DIRECTOR'] as const;
+type FinanceRole = typeof FINANCE_ROLES[number];
+
+const normalizeFinanceRole = (value: unknown): string => {
+  const raw = String(value ?? '')
+    .trim()
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+
+  if (raw === 'ADMINISTRADOR' || raw === 'ADMINISTRACION') return 'ADMIN';
+  if (raw === 'DIRECCION' || raw === 'DIRECTOR_FINANZAS' || raw === 'DIRECTOR_FINANCIERO') return 'DIRECTOR';
+  return raw;
+};
+
+const isFinanceRole = (value: unknown): value is FinanceRole =>
+  (FINANCE_ROLES as readonly string[]).includes(normalizeFinanceRole(value));
 
 const MONEDA_COLOR: Record<PaymentMethod, string> = {
   USDT: 'text-emerald-400', ZELLE: 'text-blue-400', CASH: 'text-yellow-400', BS: 'text-orange-400',
@@ -645,6 +672,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   /** [NEW v16.3] Diagnóstico cuando RLS oculta las cajas */
   const [diagRls, setDiagRls] = useState<{ uid: string; email: string; staff: boolean | null; error: string | null } | null>(null);
 
+  // ▼ v16.6 — rol efectivo: prioriza un rol financiero válido de BD; fallback al prop del contenedor.
+  const [resolvedRole, setResolvedRole] = useState<string>(() => normalizeFinanceRole(userRole));
+  const [roleSource, setRoleSource] = useState<'PROFILE' | 'PROP'>('PROP');
+
   // errores por módulo
   const [ledgerError,   setLedgerError]   = useState<string | null>(null);
   const [cajaError,     setCajaError]     = useState<string | null>(null);
@@ -753,6 +784,53 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   const [reqPriority, setReqPriority] = useState('MEDIA');
   const [reqAmount,   setReqAmount]   = useState('');
   const [physBalances, setPhysBalances] = useState<Record<PaymentMethod, string>>({ USDT: '', ZELLE: '', CASH: '', BS: '' });
+
+  // ▼ v16.6 — Resolver el rango desde la sesión real.
+  // Corrige casos donde el layout entrega "SIN RANGO"/vacío aunque el perfil autenticado sea CEO o ADMIN.
+  useEffect(() => {
+    let cancelled = false;
+
+    const resolveAuthenticatedRole = async () => {
+      const propRole = normalizeFinanceRole(userRole);
+
+      try {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+
+        const uid = sessionData.session?.user?.id;
+        if (!uid) {
+          if (!cancelled) { setResolvedRole(propRole); setRoleSource('PROP'); }
+          return;
+        }
+
+        const { data: perfil, error: profileError } = await supabase
+          .from('perfiles_estudiantes')
+          .select('role')
+          .eq('id', uid)
+          .maybeSingle();
+
+        if (profileError) throw profileError;
+
+        const dbRole = normalizeFinanceRole((perfil as { role?: unknown } | null)?.role);
+        const effectiveRole = isFinanceRole(dbRole)
+          ? dbRole
+          : isFinanceRole(propRole)
+            ? propRole
+            : (dbRole || propRole);
+
+        if (!cancelled) {
+          setResolvedRole(effectiveRole);
+          setRoleSource(isFinanceRole(dbRole) ? 'PROFILE' : 'PROP');
+        }
+      } catch (err) {
+        console.warn('[FinancePanel v16.6] No se pudo resolver role desde perfil; usando prop:', err);
+        if (!cancelled) { setResolvedRole(propRole); setRoleSource('PROP'); }
+      }
+    };
+
+    void resolveAuthenticatedRole();
+    return () => { cancelled = true; };
+  }, [userRole]);
 
   // ─── SYNC HISTÓRICO ───────────────────────────────────────────────────────
   // Omite cuentas gestionadas por el motor (asiento_origen_id o abonos) → evita doble ingreso.
@@ -1066,8 +1144,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
 
   // ─── SEGURIDAD ────────────────────────────────────────────────────────────
 
-  const rolUpper         = String(userRole).toUpperCase();   // [FIX v16.2.1] 'admin' de BD = 'ADMIN'
-  const canManageFinance = ['CEO', 'ADMIN', 'DIRECTOR'].includes(rolUpper);
+  // ▼ v16.6 — permisos financieros por rol efectivo resuelto.
+  const rolUpper         = normalizeFinanceRole(resolvedRole || userRole);
+  const canManageFinance = isFinanceRole(rolUpper);
+  const auditRole        = rolUpper || normalizeFinanceRole(userRole) || 'SIN_RANGO';
 
   const requireDirectorCode = useCallback((action: () => Promise<void>) => {
     if (!canManageFinance) { alert('Acceso denegado.'); return; }
@@ -1314,7 +1394,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         await postAsiento(buildFlujo({
           evento: esNomina ? 'NOMINA' : esIngreso ? 'INGRESO_DIRECTO' : 'GASTO_DIRECTO',
           dir: esIngreso ? 'IN' : 'OUT', ledgerType: ledger.type, moneda: ledger.currency, monto: num,
-          fechaISO, concepto, entityName, category, cajaId: cajaObj?.id ?? null, subcaja, registradoPor: userRole,
+          fechaISO, concepto, entityName, category, cajaId: cajaObj?.id ?? null, subcaja, registradoPor: auditRole,
           entityId: esIngreso ? ledgerPago.alumno_id || null : null,
           referenciaExterna: esIngreso ? ledgerPago.referencia_pago.trim().toUpperCase() || undefined : undefined,
           pago: esIngreso ? ledgerPago : null,
@@ -1378,7 +1458,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
             fechaISO: isoDe(movForm.fecha), concepto,
             entityName: esEntrada ? `INGRESO · ${movPago.pagador_nombre.trim().toUpperCase()}` : `${(cajaObj?.nombre ?? 'CAJA').toUpperCase()} · GASTO`,
             entityId: esEntrada ? movPago.alumno_id || null : null,
-            category: 'Caja', cajaId: cajaActiva, subcaja, registradoPor: userRole,
+            category: 'Caja', cajaId: cajaActiva, subcaja, registradoPor: auditRole,
             referenciaExterna: (esEntrada ? movPago.referencia_pago.trim().toUpperCase() : referencia) || undefined,
             pago: esEntrada ? movPago : null,
           }));
@@ -1390,7 +1470,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         const { error } = await supabase.from('movimientos_caja_chica').insert([{   // [PRESERVADO v15] solo custodia
           id: uuid4(), caja_id: cajaActiva, tipo: movForm.tipo, moneda: movForm.moneda, monto: num,
           concepto: `UBICACIÓN · ${concepto}`, referencia: referencia || null,
-          fecha: isoDe(movForm.fecha), registrado_por: userRole, subcaja,
+          fecha: isoDe(movForm.fecha), registrado_por: auditRole, subcaja,
         }]);
         if (error) { setCajaError(`Error: ${error.message}`); return; }
       }
@@ -1440,7 +1520,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
 
     if (efectivoDual && cajaEfectivoADM && cajaEfectivoCEO) {   // [NEW v16.4]
       const transferId = uuid4(), salidaId = uuid4();
-      const base = { moneda: 'CASH', monto, referencia: `ENTREGA-${genHash(transferId)}`, fecha, registrado_por: userRole, transfer_id: transferId };
+      const base = { moneda: 'CASH', monto, referencia: `ENTREGA-${genHash(transferId)}`, fecha, registrado_por: auditRole, transfer_id: transferId };
       try {
         const { error: e1 } = await supabase.from('movimientos_caja_chica').insert([{
           ...base, id: salidaId, caja_id: cajaEfectivoADM.id, tipo: 'SALIDA', transfer_role: 'SALIDA', transfer_peer_id: cajaEfectivoCEO.id,
@@ -1466,7 +1546,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     // [PRESERVADO v16.3] modelo legacy: una caja con subcajas
     if (!cajaEfectivo) { setSavingCaja(false); return; }
     const referencia = `ENTREGA-${genHash(entregaCEOForm.concepto + Date.now())}`;
-    const base = { caja_id: cajaEfectivo.id, moneda: 'CASH', monto, referencia, fecha, registrado_por: userRole };
+    const base = { caja_id: cajaEfectivo.id, moneda: 'CASH', monto, referencia, fecha, registrado_por: auditRole };
     try {
       const { error: e1 } = await supabase.from('movimientos_caja_chica').insert([{ ...base, id: uuid4(), tipo: 'SALIDA', subcaja: 'ADM', concepto: `ENTREGA A CEO ← ${concepto}` }]);
       if (e1) throw new Error(`ADM Salida: ${e1.message}`);
@@ -1512,13 +1592,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       const { error: eFx } = await supabase.from('fx_registros').insert([{
         id: p.fxId, fecha: p.fechaISO, moneda_origen: p.monedaOrigen, moneda_destino: p.monedaDestino,
         monto_origen: p.montoOrigen, monto_destino: p.montoDestino, tasa: p.tasa,
-        concepto: p.concepto, registrado_por: userRole,
+        concepto: p.concepto, registrado_por: auditRole,
         caja_id: p.cajaOrigenId, caja_origen_id: p.cajaOrigenId, caja_destino_id: p.cajaDestinoId,
         subcaja_origen: p.subcajaOrigen, subcaja_destino: p.subcajaDestino, referencia: p.referencia,
       }]);
       if (eFx) throw new Error(`Registro FX: ${eFx.message}`);
 
-      const base = { referencia: p.referencia, fecha: p.fechaISO, registrado_por: userRole, fx_id: p.fxId };
+      const base = { referencia: p.referencia, fecha: p.fechaISO, registrado_por: auditRole, fx_id: p.fxId };
       const movs: Record<string, unknown>[] = [];
       if (p.cajaOrigenId) movs.push({
         ...base, id: uuid4(), caja_id: p.cajaOrigenId, tipo: 'SALIDA', moneda: p.monedaOrigen, monto: p.montoOrigen,
@@ -1589,7 +1669,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         p_fx_id: payload.fxId, p_fecha: payload.fechaISO,
         p_moneda_origen: payload.monedaOrigen, p_moneda_destino: payload.monedaDestino,
         p_monto_origen: payload.montoOrigen, p_monto_destino: payload.montoDestino, p_tasa: payload.tasa,
-        p_concepto: payload.concepto, p_referencia: payload.referencia, p_registrado_por: userRole,
+        p_concepto: payload.concepto, p_referencia: payload.referencia, p_registrado_por: auditRole,
         p_caja_origen_id: payload.cajaOrigenId, p_caja_destino_id: payload.cajaDestinoId,
         p_subcaja_origen: payload.subcajaOrigen, p_subcaja_destino: payload.subcajaDestino,
       });
@@ -1667,7 +1747,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     if (cxp && !confirmarFondos(cobroForm.moneda, monto, cajaId, subcaja)) return;
 
     const comun = {
-      moneda: cobroForm.moneda, monto, fechaISO: isoDe(cobroForm.fecha), cajaId, subcaja, registradoPor: userRole,
+      moneda: cobroForm.moneda, monto, fechaISO: isoDe(cobroForm.fecha), cajaId, subcaja, registradoPor: auditRole,
       referenciaExterna: (cxc ? cobroPago.referencia_pago : cobroForm.referencia).toUpperCase().trim() || undefined,
     };
     const abono: AsientoAbonoInput = {
@@ -1756,7 +1836,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     try {
       const comun = {
         dir: (f.es_devolucion ? 'OUT' : 'IN') as 'IN' | 'OUT', moneda: f.moneda, monto, fechaISO, category: 'Financiamiento',
-        cajaId: f.caja_id, subcaja, registradoPor: userRole, esPrestamo: true, prestamista: f.prestamista,
+        cajaId: f.caja_id, subcaja, registradoPor: auditRole, esPrestamo: true, prestamista: f.prestamista,
       };
       try {
         await postAsiento(buildFlujo(f.es_devolucion
@@ -1778,7 +1858,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         const { error: eM } = await supabase.from('movimientos_caja_chica').insert([{
           id: uuid4(), caja_id: f.caja_id, tipo: f.es_devolucion ? 'SALIDA' : 'ENTRADA', moneda: f.moneda, monto,
           concepto: f.es_devolucion ? `DEVOLUCIÓN A ${f.prestamista} · ${concepto}` : `PRÉSTAMO DE ${f.prestamista} · ${concepto}`,
-          referencia: refPrestamo, fecha: fechaISO, registrado_por: userRole, es_prestamo: true, prestamista: f.prestamista,
+          referencia: refPrestamo, fecha: fechaISO, registrado_por: auditRole, es_prestamo: true, prestamista: f.prestamista,
         }]);
         if (eM) throw new Error(eM.message);
         if (!f.es_devolucion) {
@@ -1822,7 +1902,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     const transferId = uuid4(), salidaId = uuid4(), entradaId = uuid4();
     const referencia = `TRF-${genHash(transferId)}`;
     const concepto   = f.concepto.toUpperCase().trim();
-    const base = { moneda: f.moneda, monto, referencia, fecha: isoDe(f.fecha), registrado_por: userRole, transfer_id: transferId };
+    const base = { moneda: f.moneda, monto, referencia, fecha: isoDe(f.fecha), registrado_por: auditRole, transfer_id: transferId };
     try {
       const { error: e1 } = await supabase.from('movimientos_caja_chica').insert([{
         ...base, id: salidaId, caja_id: f.caja_origen_id, tipo: 'SALIDA', transfer_role: 'SALIDA', transfer_peer_id: f.caja_destino_id,
@@ -1890,7 +1970,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         if (sinU < cuenta.monto_total && !window.confirm(`⚠️ Solo hay ${fmtMonto(sinU, moneda)} sin ubicar en bóveda ${moneda}. ¿Reponer de todas formas?`)) return;
       }
       const referencia = `REP-${genHash(cuenta.id)}`;
-      const base = { moneda, monto: cuenta.monto_total, referencia, fecha: new Date().toISOString(), registrado_por: userRole };
+      const base = { moneda, monto: cuenta.monto_total, referencia, fecha: new Date().toISOString(), registrado_por: auditRole };
 
       const { error: eU } = await supabase.from('cuentas_generales').update({ estatus: 'PAGADO', monto_pendiente: 0 }).eq('id', cuenta.id);
       if (eU) throw new Error(`CxP reposición: ${eU.message}`);   // [FIX v16.1]
@@ -2002,7 +2082,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
               evento: 'HORAS_PAGADAS', dir: 'IN', ledgerType: 'INCOME', moneda: mp, monto: recibido,
               fechaISO: isoDe(f.fecha_emision), concepto: `HORAS PAGADAS · ${concepto}`,
               entityName: alumno.nombre, entityId: alumno.student_id, category: 'Academia',
-              cajaId, subcaja, registradoPor: userRole,
+              cajaId, subcaja, registradoPor: auditRole,
               nuevasCxc: [{
                 id: cxcId, student_id: alumno.student_id, alumno_id: alumno.student_id,
                 nombre_alumno: alumno.nombre, student_serial: alumno.serial,
@@ -2110,7 +2190,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         fecha_emision: new Date().toISOString(), estatus: 'PENDIENTE', notas: `OC-${genHash('APPROVE' + reqId)} · Req ${reqId}`,
       }]);
       if (eCxp) throw new Error(`CxP: ${eCxp.message}`);
-      const { error: eReq } = await supabase.from('solicitudes_compra').update({ estatus: 'APROBADO', aprobado_por: userRole }).eq('id', reqId);
+      const { error: eReq } = await supabase.from('solicitudes_compra').update({ estatus: 'APROBADO', aprobado_por: auditRole }).eq('id', reqId);
       if (eReq) throw new Error(`Requisición: ${eReq.message}`);
       await refresh();
     } catch (err) { setReqError(errMsg(err, 'Error al aprobar.')); }
@@ -2121,7 +2201,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     if (savingAction) return;
     setSavingAction(reqId);
     try {
-      const { error } = await supabase.from('solicitudes_compra').update({ estatus: 'RECHAZADO', aprobado_por: userRole }).eq('id', reqId);
+      const { error } = await supabase.from('solicitudes_compra').update({ estatus: 'RECHAZADO', aprobado_por: auditRole }).eq('id', reqId);
       if (error) throw new Error(error.message);
       await refresh();
     } catch (err) { setReqError(errMsg(err, 'Error al rechazar.')); }
@@ -2630,6 +2710,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
               <p className="text-zinc-400">Usuario autenticado: <span className="text-white">{diagRls.email}</span></p>
               <p className="text-zinc-400 break-all">auth.uid(): <span className="text-white">{diagRls.uid}</span></p>
               <p className="text-zinc-400">es_staff_finanzas(): <span className={diagRls.staff ? 'text-emerald-400' : 'text-red-400'}>{diagRls.error ? 'ERROR' : String(diagRls.staff)}</span></p>
+              <p className="text-zinc-400">Rol efectivo UI: <span className={canManageFinance ? 'text-emerald-400' : 'text-red-400'}>{rolUpper || 'SIN_RANGO'}</span> · fuente: <span className="text-white">{roleSource}</span></p>
               {diagRls.error && <p className="text-red-400 break-words">{diagRls.error}</p>}
               <p className="text-zinc-500 pt-2 border-t border-white/5">
                 {diagRls.error
@@ -3171,7 +3252,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
               {requests.map(req => {
                 let item: any = {};
                 try { item = JSON.parse(req.items || '{}'); } catch { item = {}; }
-                const puedeAprobar = req.estatus === 'PENDIENTE_REVISION' && ['CEO', 'ADMIN'].includes(rolUpper);   // [FIX v16.2.1] case-insensitive
+                const puedeAprobar = req.estatus === 'PENDIENTE_REVISION' && ['CEO', 'ADMIN'].includes(rolUpper);   // ▼ v16.6 rol canónico
                 return (
                   <div key={req.id} className="bg-white/[0.02] border border-white/[0.05] p-5 rounded-2xl">
                     <div className="flex justify-between items-start mb-3">
