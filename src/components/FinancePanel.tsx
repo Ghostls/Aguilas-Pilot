@@ -1,4 +1,12 @@
-// VALKYRON FINANCIAL INTELLIGENCE CENTER v16.6
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v16.7
+// CHANGELOG v16.7 vs v16.6:
+//   [FIX CRÍTICO] Selectores de caja ya no desaparecen cuando la moneda no coincide con monedas_permitidas.
+//         Todas las cajas visibles se muestran; las incompatibles quedan identificadas/deshabilitadas.
+//   [FIX] OPERATIVA y CUSTODIA_TERCERO se tratan como cajas multimoneda (USDT/ZELLE/CASH/BS), coherente
+//         con MATURÍN, BARQUISIMETO, ROBERTO y BECQUER. Cajas dedicadas (EFECTIVO/BS) siguen estrictas.
+//   [DIAG] Si RLS devuelve 0 cajas, los formularios muestran “SIN CAJAS VISIBLES · REVISE RLS” en vez
+//         de aparentar que “SOLO BÓVEDA” es la única opción disponible.
+//   [PRESERVADO] Roles CEO/ADMIN/DIRECTOR v16.6, motor contable v16, trazabilidad v16.5 y anti-duplicado.
 // CHANGELOG v16.6 vs v16.5:
 //   [FIX CRÍTICO] Resolución real de rol financiero: CEO / ADMIN / DIRECTOR se normalizan y se validan
 //         contra el perfil autenticado en Supabase. Evita “SIN RANGO” cuando el prop llega vacío/desactualizado.
@@ -1078,7 +1086,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
 
   const cajaById        = useCallback((id?: string | null) => (id ? cajas.find(c => c.id === id) ?? null : null), [cajas]);
   const cajaEsEfectivo  = (id?: string | null) => { const c = cajaById(id); return !!c && getCajaConfig(c).esCajaEfectivo; };
-  const cajasQueAceptan = useCallback((m: PaymentMethod) => cajas.filter(c => getCajaConfig(c).monedasPermitidas.includes(m)), [cajas]);
+
+  // ▼ v16.7 — Regla única de compatibilidad de moneda.
+  // Las sedes/cajas OPERATIVAS y custodias de terceros son multimoneda por diseño.
+  // Las cajas dedicadas (EFECTIVO ADMIN/CEO, EFECTIVO legacy y BANCO/CAJA BS) respetan su moneda.
+  const cajaAceptaMoneda = useCallback((c: CajaChica, m: PaymentMethod): boolean => {
+    const conf = getCajaConfig(c);
+    if (conf.tipo === 'OPERATIVA' || conf.tipo === 'CUSTODIA_TERCERO') return true;
+    return conf.monedasPermitidas.includes(m);
+  }, []);
+
+  const cajasQueAceptan = useCallback((m: PaymentMethod) => cajas.filter(c => cajaAceptaMoneda(c, m)), [cajas, cajaAceptaMoneda]);
   const cajaNombre      = (id?: string | null) => (id ? cajaById(id)?.nombre ?? 'CAJA ELIMINADA' : 'SOLO BÓVEDA');
 
   /** Caja por defecto de una moneda: CASH → EFECTIVO ADMIN (stand-by) [CHG v16.4]; resto → caja exclusiva (BS→CAJA BS) o '' */
@@ -1096,7 +1114,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   /** Mantiene la caja si opera la moneda; si no, la caja por defecto de esa moneda */
   const ajustarCaja = (cajaId: string, m: PaymentMethod) => {
     const c = cajaById(cajaId);
-    return c && getCajaConfig(c).monedasPermitidas.includes(m) ? cajaId : defaultCajaFor(m);
+    return c && cajaAceptaMoneda(c, m) ? cajaId : defaultCajaFor(m);
   };
 
   /** Conciliación: Bóveda (consolidado) vs Σ Cajas (custodia física) */
@@ -1127,7 +1145,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     const c = cajas.find(x => x.id === cajaId);
     if (!c) return 'Caja no encontrada.';
     const conf = getCajaConfig(c);
-    return conf.monedasPermitidas.includes(moneda) ? null : `${c.nombre} solo acepta: ${conf.monedasPermitidas.join(', ')}`;
+    return cajaAceptaMoneda(c, moneda) ? null : `${c.nombre} no admite ${moneda}. Monedas configuradas: ${conf.monedasPermitidas.join(', ')}`;
   }, [cajas]);
 
   /** Advertencia de fondos (bóveda y caja) antes de una salida */
@@ -2493,7 +2511,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                 <Lbl cls="text-zinc-600">{ledger.type === 'INCOME' ? 'Caja donde entra el dinero' : 'Caja de donde sale el dinero'}</Lbl>
                 <select value={ledger.caja_id} onChange={e => setLedger(p => ({ ...p, caja_id: e.target.value }))} className={inp} disabled={savingLedger}>
                   <option value="">SOLO BÓVEDA · queda sin ubicar</option>
-                  {cajasQueAceptan(ledger.currency).map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+                  {cajas.length === 0 && <option value="" disabled>SIN CAJAS VISIBLES · REVISE RLS</option>}
+                  {cajas.map(c => {
+                    const compatible = cajaAceptaMoneda(c, ledger.currency);
+                    return <option key={c.id} value={c.id} disabled={!compatible}>{c.nombre}{compatible ? '' : ` · NO ACEPTA ${ledger.currency}`}</option>;
+                  })}
                 </select>
               </div>
               {ledgerCajaEfe && <SubcajaToggle value={ledger.subcaja} onChange={sc => setLedger(p => ({ ...p, subcaja: sc }))} />}
@@ -2950,7 +2972,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                         <Lbl>Caja que recibió el pago</Lbl>
                         <select value={cuentaForm.caja_id} onChange={e => setCuentaForm(p => ({ ...p, caja_id: e.target.value }))} className={inp}>
                           <option value="">SOLO BÓVEDA · queda sin ubicar</option>
-                          {cajasQueAceptan(mpForm).map(c => <option key={c.id} value={c.id}>{c.nombre}{getCajaConfig(c).tipo === 'CUSTODIA_TERCERO' ? ' · custodia' : ''}</option>)}
+                          {cajas.length === 0 && <option value="" disabled>SIN CAJAS VISIBLES · REVISE RLS</option>}
+                          {cajas.map(c => {
+                            const compatible = cajaAceptaMoneda(c, mpForm);
+                            const custodia = getCajaConfig(c).tipo === 'CUSTODIA_TERCERO' ? ' · custodia' : '';
+                            return <option key={c.id} value={c.id} disabled={!compatible}>{c.nombre}{custodia}{compatible ? '' : ` · NO ACEPTA ${mpForm}`}</option>;
+                          })}
                         </select>
                       </div>
                       {mpForm === 'BS' ? (
@@ -3393,9 +3420,16 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                 <Lbl>{esCxC ? 'Caja que recibe' : 'Caja de donde sale'}</Lbl>
                 <select value={cobroForm.caja_id} onChange={e => setCobroForm(p => ({ ...p, caja_id: e.target.value }))} className={inp}>
                   <option value="">SOLO BÓVEDA · sin caja</option>
-                  {cajasQueAceptan(cobroForm.moneda).map(c => (
-                    <option key={c.id} value={c.id}>{c.nombre}{getCajaConfig(c).tipo === 'CUSTODIA_TERCERO' ? ' · custodia' : ''} · {fmtMonto(getCajaBalance(c.id, cobroForm.moneda), cobroForm.moneda)}</option>
-                  ))}
+                  {cajas.length === 0 && <option value="" disabled>SIN CAJAS VISIBLES · REVISE RLS</option>}
+                  {cajas.map(c => {
+                    const compatible = cajaAceptaMoneda(c, cobroForm.moneda);
+                    const custodia = getCajaConfig(c).tipo === 'CUSTODIA_TERCERO' ? ' · custodia' : '';
+                    return (
+                      <option key={c.id} value={c.id} disabled={!compatible}>
+                        {c.nombre}{custodia}{compatible ? ` · ${fmtMonto(getCajaBalance(c.id, cobroForm.moneda), cobroForm.moneda)}` : ` · NO ACEPTA ${cobroForm.moneda}`}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
               {esEfe && <SubcajaToggle value={cobroForm.subcaja} onChange={sc => setCobroForm(p => ({ ...p, subcaja: sc }))} />}
