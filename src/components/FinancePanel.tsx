@@ -1,3 +1,9 @@
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v16.8
+// CHANGELOG v16.8: anticipos sin matrícula registrados por RPC ATÓMICA,
+// vínculo documental sin doble ingreso ni acreditación de horas, paginación financiera,
+// deshabilitado sync histórico automático y alertas de integridad.
+// REQUISITO: migracion_finance_v16_8_pagos_provisionales.sql en Supabase.
+// ADVERTENCIA: los cierres aún NO constituyen cierres contables firmados.
 // VALKYRON FINANCIAL INTELLIGENCE CENTER v16.7
 // CHANGELOG v16.7 vs v16.6:
 //   [FIX CRÍTICO] Selectores de caja ya no desaparecen cuando la moneda no coincide con monedas_permitidas.
@@ -78,7 +84,7 @@ import {
 export type PaymentMethod   = 'USDT' | 'ZELLE' | 'CASH' | 'BS';
 /** FINANCING_IN / FINANCING_OUT: préstamos (mueven caja, no son ingreso/egreso operativo) */
 export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE' | 'RECEIVABLE' | 'FX_EXCHANGE' | 'FINANCING_IN' | 'FINANCING_OUT';
-export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING';
+export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING' | 'PROVISIONALES';
 export type SubcajaEfectivo = 'ADM' | 'CEO';
 export type Prestamista     = 'BECQUER' | 'ROBERTO';
 export type FxLeg           = 'IN' | 'OUT';
@@ -162,6 +168,18 @@ interface CuentaPorCobrar {
   asiento_origen_id?: string | null;
 }
 interface AlumnoCxC { student_id: string; nombre: string; serial: string; sede: string; }
+/** v16.8 — Subledger de pagos con beneficiario sin cuenta estudiantil.
+ * Un VÍNCULO no equivale a APLICACIÓN contable ni a horas acreditadas.
+ */
+interface PagoProvisional {
+  id: string; asiento_id: string; beneficiario_nombre: string; beneficiario_documento: string;
+  beneficiario_contacto: string | null; sede: string | null; concepto: string;
+  moneda: PaymentMethod; monto: number; referencia_pago: string; caja_id: string;
+  fecha_pago: string; creado_en: string; creado_por: string;
+  estado: 'PENDIENTE' | 'VINCULADO' | 'ANULADO'; student_id: string | null;
+  vinculado_por: string | null; vinculado_en: string | null;
+}
+
 type FinanceTotals = { CASH: number; ZELLE: number; USDT: number; BS: number };
 interface FinancePanelProps {
   vendors: Vendor[]; inventory: any[]; userRole?: string;
@@ -558,8 +576,8 @@ const SubcajaToggle: React.FC<{ value: SubcajaEfectivo; onChange: (s: SubcajaEfe
 /** [NEW v16.5] Captura de quién pagó, cómo y quién recibió */
 const PagadorFields: React.FC<{
   value: PagoForm; onChange: (p: PagoForm) => void; moneda: PaymentMethod;
-  alumnos?: AlumnoCxC[]; bloqueado?: boolean; className?: string;
-}> = ({ value: v, onChange, moneda, alumnos = [], bloqueado, className = '' }) => {
+  alumnos?: AlumnoCxC[]; bloqueado?: boolean; className?: string; sinPerfil?: boolean;
+}> = ({ value: v, onChange, moneda, alumnos = [], bloqueado, className = '', sinPerfil = false }) => {
   const set = (k: keyof PagoForm, val: string) => onChange({ ...v, [k]: val });
   const origen = ORIGEN_LABEL[moneda];
   return (
@@ -567,11 +585,11 @@ const PagadorFields: React.FC<{
       <p className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest flex items-center gap-2"><UserCheck size={12} /> Quién pagó · {moneda}</p>
       {!bloqueado && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5">
-          {PAGADOR_TIPOS.map(t => (
+          {PAGADOR_TIPOS.filter(t => !sinPerfil || t.k !== 'ALUMNO').map(t => (
             <button key={t.k} type="button"
               onClick={() => onChange({ ...v, pagador_tipo: t.k, alumno_id: t.k === 'ALUMNO' ? v.alumno_id : '', pagador_nombre: t.k === 'ALUMNO' || v.pagador_tipo === 'ALUMNO' ? '' : v.pagador_nombre })}
               className={`py-2 rounded-xl text-[9px] font-black uppercase border transition-all ${v.pagador_tipo === t.k ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`}>
-              {t.l}
+              {sinPerfil && t.k === 'TERCERO' ? 'Aspirante (sin matrícula)' : t.l}
             </button>
           ))}
         </div>
@@ -655,7 +673,7 @@ const ModalActions: React.FC<{
 
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 
-export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 'CEO', setGlobalFinance = NOOP }) => {
+export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 'SIN_RANGO', setGlobalFinance = NOOP }) => {
   const [activeTab, setActiveTab] = useState<TabType>('LEDGER');
   const [tasaBCV,   setTasaBCV]   = useState(DEFAULT_TASA_BS);
 
@@ -674,7 +692,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   const [selectedVault, setSelectedVault] = useState<PaymentMethod>('USDT');
   const [cajaActiva,    setCajaActiva]    = useState<string | null>(null);
   const fetchLockRef = useRef(false);
-  const syncDoneRef  = useRef(false);   // sync histórico corre 1 vez por montaje
+  // v16.8: ningún efecto de lectura puede crear transacciones históricas.
   const [sinSesion,   setSinSesion]   = useState(false);          // [NEW v16.2]
   const [fetchErrors, setFetchErrors] = useState<string[]>([]);   // [NEW v16.2]
   /** [NEW v16.3] Diagnóstico cuando RLS oculta las cajas */
@@ -780,6 +798,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
 
   // [NEW v16.5] trazabilidad de pagadores
   const [pagos,        setPagos]        = useState<PagoTraza[]>([]);
+  const [provisionales, setProvisionales] = useState<PagoProvisional[]>([]);
+  const [provisionalError, setProvisionalError] = useState<string | null>(null);
+  const [savingProvisional, setSavingProvisional] = useState(false);
+  const [provisionalLinkId, setProvisionalLinkId] = useState<string | null>(null);
+  const [provisionalStudentId, setProvisionalStudentId] = useState('');
+  const [savingProvisionalLink, setSavingProvisionalLink] = useState(false);
+  const [historicosRevisar, setHistoricosRevisar] = useState(0);
+  const [provisionalForm, setProvisionalForm] = useState({
+    beneficiario_nombre: '', beneficiario_documento: '', beneficiario_contacto: '', sede: '',
+    concepto: 'ANTICIPO DE FORMACIÓN', monto: '', moneda: 'ZELLE' as PaymentMethod,
+    caja_id: '', subcaja: 'ADM' as SubcajaEfectivo, fecha: hoyISO(),
+  });
+  // La v16.5 requiere alumno_id para tipo ALUMNO: aspirantes sin perfil usan TERCERO en
+  // la traza de dinero y este subledger registra explícitamente al BENEFICIARIO.
+  const [provisionalPago, setProvisionalPago] = useState<PagoForm>(() =>
+    pagoVacio('', { pagador_tipo: 'TERCERO' }));
   const [recibidoPor,  setRecibidoPor]  = useState<string>(() => { try { return localStorage.getItem('valkyron:recibido_por') ?? ''; } catch { return ''; } });
   const [ledgerPago,   setLedgerPago]   = useState<PagoForm>(() => pagoVacio());
   const [movPago,      setMovPago]      = useState<PagoForm>(() => pagoVacio());
@@ -840,27 +874,32 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     return () => { cancelled = true; };
   }, [userRole]);
 
-  // ─── SYNC HISTÓRICO ───────────────────────────────────────────────────────
-  // Omite cuentas gestionadas por el motor (asiento_origen_id o abonos) → evita doble ingreso.
-
-  const syncPaidAccountsToLedger = useCallback(async (accounts: CuentaPorCobrar[], abonosList: AbonoCuenta[]) => {
-    const conMotor = new Set(abonosList.filter(a => a.cuenta_tipo === 'CXC').map(a => a.cuenta_id));
-    const paid = accounts.filter(c => c.estatus === 'COBRADO' && Number(c.monto_total) > 0 && !c.asiento_origen_id && !conMotor.has(String(c.id)));
-    for (const c of paid) {
-      const { data: exists } = await supabase.from('transacciones_finanzas').select('id').in('invoice_number', [`HORA-${c.id}`, `CXC-${c.id}`]).limit(1);
-      if (exists?.length) continue;
-      await supabase.from('transacciones_finanzas').insert([{
-        id: uuid4(), type: 'INCOME', entity_id: c.student_id, entity_name: c.nombre_alumno || 'ALUMNO',
-        amount: round2(Number(c.monto_total) || 0),
-        invoice_number: `${c.horas_compradas > 0 ? 'HORA' : 'CXC'}-${c.id}`,
-        description: `${c.concepto || 'COBRO'} · SINCRONIZACIÓN HISTÓRICA`,
-        status: 'PAID', category: 'Academia', payment_method: normalizePaymentMethod(c.moneda),
-        issue_date: c.fecha_emision ? isoDe(c.fecha_emision) : new Date().toISOString(),
-      }]);
-    }
-  }, []);
+  // ─── CONTROL HISTÓRICO v16.8 ─────────────────────────────────────────────
+  // Eliminada la escritura automática de transacciones desde fetchAll.
+  // Las anomalías históricas se REPORTAN y se regularizan de forma revisada,
+  // nunca con inserciones implícitas al entrar a la pantalla.
 
   // ─── FETCH ────────────────────────────────────────────────────────────────
+
+  /** Supabase/PostgREST limita la cantidad de filas por solicitud (habitualmente 1000).
+   * Pagina las fuentes que determinan saldos para NO calcular totales incompletos.
+   * Ordena por PK, estable incluso si varios movimientos comparten fecha.
+   */
+  const leerTablaCompleta = async (tabla: string): Promise<{
+    data: any[] | null; error: { message: string; code?: string } | null;
+  }> => {
+    const PAGE = 500;
+    const maxRows = 100_000; // fallo visible: nunca representar parciales como totales.
+    const filas: any[] = [];
+    for (let inicio = 0; inicio < maxRows; inicio += PAGE) {
+      const { data, error } = await supabase.from(tabla).select('*')
+        .order('id', { ascending: true }).range(inicio, inicio + PAGE - 1);
+      if (error) return { data: null, error };
+      filas.push(...(data ?? []));
+      if ((data ?? []).length < PAGE) return { data: filas, error: null };
+    }
+    return { data: null, error: { message: `Límite de auditoría (${maxRows}) alcanzado en ${tabla}. No se calculan saldos parciales.` } };
+  };
 
   const fetchAll = useCallback(async (silent = false) => {
     if (fetchLockRef.current && !silent) return;
@@ -871,18 +910,19 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       const { data: sesData } = await supabase.auth.getSession();
       setSinSesion(!sesData.session);
 
-      const [txRes, reqRes, cajasRes, movRes, cuentasRes, capRes, alumnosRes, cxcRes, fxRes, abRes, pagRes] = await Promise.all([
-        supabase.from('transacciones_finanzas').select('*').order('issue_date', { ascending: false }),
+      const [txRes, reqRes, cajasRes, movRes, cuentasRes, capRes, alumnosRes, cxcRes, fxRes, abRes, pagRes, provRes] = await Promise.all([
+        leerTablaCompleta('transacciones_finanzas'),
         supabase.from('solicitudes_compra').select('*').order('created_at', { ascending: false }),
         supabase.from('cajas_chicas').select('*').order('nombre'),
-        supabase.from('movimientos_caja_chica').select('*').order('fecha', { ascending: false }),
-        supabase.from('cuentas_generales').select('*').eq('tipo', 'CXP').order('fecha_emision', { ascending: false }),
+        leerTablaCompleta('movimientos_caja_chica'),
+        leerTablaCompleta('cuentas_generales'),
         supabase.from('capitanes').select('*').order('nombre'),
         supabase.from('perfiles_estudiantes').select('id, nombre_completo, student_serial, sede').eq('role', 'student').order('nombre_completo'),
-        supabase.from('cuentas_por_cobrar').select('*').order('fecha_emision', { ascending: false }),
+        leerTablaCompleta('cuentas_por_cobrar'),
         supabase.from('fx_registros').select('*').order('fecha', { ascending: false }).limit(200),
-        supabase.from('abonos_cuentas').select('*').order('created_at', { ascending: false }),
-        supabase.from('pagos_trazabilidad').select('*').order('fecha', { ascending: false }),   // [NEW v16.5]
+        leerTablaCompleta('abonos_cuentas'),
+        leerTablaCompleta('pagos_trazabilidad'), // [v16.8] historial completo
+        leerTablaCompleta('pagos_provisionales'),
       ]);
 
       // [NEW v16.2] errores por tabla visibles (antes se ignoraban y la sección quedaba vacía)
@@ -890,9 +930,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         ['transacciones_finanzas', txRes], ['solicitudes_compra', reqRes], ['cajas_chicas', cajasRes],
         ['movimientos_caja_chica', movRes], ['cuentas_generales', cuentasRes], ['capitanes', capRes],
         ['perfiles_estudiantes', alumnosRes], ['cuentas_por_cobrar', cxcRes], ['fx_registros', fxRes], ['abonos_cuentas', abRes],
-        ['pagos_trazabilidad', pagRes],
+        ['pagos_trazabilidad', pagRes], ['pagos_provisionales', provRes],
       ];
       const errs = consultas.filter(([, r]) => r.error).map(([t, r]) => `${t}: ${r.error?.message ?? 'error'}${r.error?.code ? ` (${r.error.code})` : ''}`);
+      const errMonedas = (txRes.data ?? []).filter(t => {
+        const m = String(t.payment_method ?? '').toUpperCase().trim();
+        return m !== 'USD' && !(ALL_METHODS as string[]).includes(m);
+      }).length;
+      if (errMonedas) errs.push(`${errMonedas} asientos con método de pago no reconocido; revisar antes de conciliar.`);
       setFetchErrors(errs);
       if (errs.length) console.warn('[FinancePanel v16.5] consultas con error:', errs);
 
@@ -929,7 +974,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         subcaja: m.subcaja ?? null, prestamista: m.prestamista ?? null, es_prestamo: m.es_prestamo ?? false,
         fx_id: m.fx_id ?? null, fx_role: m.fx_role ?? null, asiento_id: m.asiento_id ?? null,
       })));
-      if (cuentasRes.data) setCuentas(cuentasRes.data.map((c: any) => ({
+      if (cuentasRes.data) setCuentas(cuentasRes.data.filter((c: any) => c.tipo === 'CXP').map((c: any) => ({
         ...c, moneda: normalizePaymentMethod(c.moneda),
         monto_total: round2(Number(c.monto_total) || 0), monto_pendiente: round2(Number(c.monto_pendiente) || 0),
         transfer_id: c.transfer_id ?? null, categoria_interna: c.categoria_interna ?? null,
@@ -952,6 +997,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       }));
       setAbonos(abonosNorm);
 
+      if (provRes.data) setProvisionales(provRes.data.map((p: any): PagoProvisional => ({
+        ...p, monto: round2(Number(p.monto) || 0), moneda: normalizePaymentMethod(p.moneda),
+      })).sort((a: PagoProvisional, b: PagoProvisional) => b.creado_en.localeCompare(a.creado_en)));
+
       if (pagRes.data) setPagos(pagRes.data.map((x: any): PagoTraza => ({   // [NEW v16.5]
         ...x, metodo: normalizePaymentMethod(x.metodo), monto: round2(Number(x.monto) || 0), anulado: !!x.anulado,
       })));
@@ -966,7 +1015,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           moneda: normalizePaymentMethod(c.moneda), asiento_origen_id: c.asiento_origen_id ?? null,
         }));
         setCuentasCxC(norm);
-        if (!syncDoneRef.current) { syncDoneRef.current = true; await syncPaidAccountsToLedger(norm, abonosNorm); }
+        const cuentasConAbonos = new Set(abonosNorm.filter(a => a.cuenta_tipo === 'CXC').map(a => a.cuenta_id));
+        setHistoricosRevisar(norm.filter(c => c.estatus === 'COBRADO' && c.monto_total > 0 &&
+          !c.asiento_origen_id && !cuentasConAbonos.has(String(c.id))).length);
       }
 
       if (fxRes.data) setFxRegistros(fxRes.data.map((f: any) => ({
@@ -983,7 +1034,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       setLoading(false);
       fetchLockRef.current = false;
     }
-  }, [syncPaidAccountsToLedger]);
+  }, []);
 
   /** Recarga silenciosa post-escritura */
   const refresh = useCallback(async () => { fetchLockRef.current = false; await fetchAll(true); }, [fetchAll]);
@@ -997,7 +1048,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   useEffect(() => {
     fetchAll();
     const tablas = ['transacciones_finanzas', 'solicitudes_compra', 'cajas_chicas', 'movimientos_caja_chica',
-      'cuentas_generales', 'cuentas_por_cobrar', 'fx_registros', 'abonos_cuentas', 'asientos_contables', 'pagos_trazabilidad'];
+      'cuentas_generales', 'cuentas_por_cobrar', 'fx_registros', 'abonos_cuentas', 'asientos_contables', 'pagos_trazabilidad', 'pagos_provisionales'];
     const ch = tablas.reduce((c, table) => c.on('postgres_changes', { event: '*', schema: 'public', table }, handleRealtimeChange),
       supabase.channel('finance-v16')).subscribe();
     return () => {
@@ -1020,7 +1071,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     if (!recibidoPor) return;
     try { localStorage.setItem('valkyron:recibido_por', recibidoPor); } catch { /* almacenamiento no disponible */ }
     const fill = (p: PagoForm) => (p.recibido_por ? p : { ...p, recibido_por: recibidoPor });
-    setLedgerPago(fill); setMovPago(fill); setCuentaPago(fill); setPrestamoPago(fill);
+    setLedgerPago(fill); setMovPago(fill); setCuentaPago(fill); setPrestamoPago(fill); setProvisionalPago(fill);
   }, [recibidoPor]);
 
   /** [NEW v16.5] Recuerda quién recibió y devuelve un formulario limpio */
@@ -1031,6 +1082,39 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
 
   /** [NEW v16.5] Pagador por asiento (solo vigentes) */
   const pagoPorAsiento = useMemo(() => new Map(pagos.filter(x => !x.anulado).map(x => [x.asiento_id, x])), [pagos]);
+
+  /** [v16.8] alertas informativas: no se ajustan saldos automáticamente. */
+  const alertasIntegridad = useMemo(() => {
+    const alertas: string[] = [];
+    const porAsiento = new Map(pagos.filter(p => !p.anulado).map(p => [p.asiento_id, p]));
+    for (const t of transactions) {
+      if (t.status !== 'PAID' || !t.asiento_id || isFxTx(t) || signedLedgerAmount(t) <= 0) continue;
+      const p = porAsiento.get(t.asiento_id);
+      if (!p) { alertas.push(`Ingreso ${t.invoiceNumber}: sin traza activa de pagador (puede ser histórico).`); continue; }
+      if (Math.abs(t.amount - p.monto) > 0.01 || t.payment_method !== p.metodo) {
+        alertas.push(`Asiento ${t.invoiceNumber}: monto o método distinto entre Ledger y trazabilidad.`);
+      }
+    }
+    for (const p of provisionales) {
+      if (p.estado === 'ANULADO') continue;
+      const ledger = transactions.filter(t => t.asiento_id === p.asiento_id && t.status === 'PAID');
+      if (ledger.length !== 1 || Math.abs((ledger[0]?.amount ?? 0) - p.monto) > 0.01 || ledger[0]?.payment_method !== p.moneda) {
+        alertas.push(`Anticipo ${p.referencia_pago}: inconsistencia con su asiento financiero.`);
+      }
+      if (!porAsiento.has(p.asiento_id)) alertas.push(`Anticipo ${p.referencia_pago}: no se encuentra el pagador vigente.`);
+    }
+    const grupos = new Map<string, MovimientoCaja[]>();
+    for (const m of movCajas) if (m.transfer_id) grupos.set(m.transfer_id, [...(grupos.get(m.transfer_id) ?? []), m]);
+    for (const [id, legs] of grupos) {
+      const sal = legs.filter(m => m.transfer_role === 'SALIDA');
+      const ent = legs.filter(m => m.transfer_role === 'ENTRADA');
+      if (sal.length !== 1 || ent.length !== 1 || sal[0]?.moneda !== ent[0]?.moneda ||
+          Math.abs((sal[0]?.monto ?? 0) - (ent[0]?.monto ?? 0)) > 0.01) {
+        alertas.push(`Transferencia ${id.slice(0, 8)}: faltan patas, difieren los importes o la moneda.`);
+      }
+    }
+    return alertas;
+  }, [transactions, pagos, provisionales, movCajas]);
 
   /** [NEW v16.2] Limpia la sesión corrupta (refresh token inválido) y vuelve al login */
   const reiniciarSesion = async () => {
@@ -1157,7 +1241,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       const s = saldoCustodia(cajaId, moneda, subcaja);
       if (s < monto) avisos.push(`${cajas.find(x => x.id === cajaId)?.nombre ?? 'Caja'}${subcaja ? ` (${subcaja})` : ''}: ${fmtMonto(s, moneda)} disponible`);
     }
-    return !avisos.length || window.confirm(`⚠️ Fondos insuficientes para ${fmtMonto(monto, moneda)}\n\n${avisos.join('\n')}\n\n¿Registrar de todas formas?`);
+    if (avisos.length) {
+      alert(`Fondos insuficientes: operación bloqueada.\n${avisos.join('\n')}`);
+      return false;
+    }
+    return true;
   }, [cajas, getVaultBalance, saldoCustodia]);
 
   // ─── SEGURIDAD ────────────────────────────────────────────────────────────
@@ -1298,8 +1386,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     const monto = round2(parseFloat(editMovForm.monto));
     if (!Number.isFinite(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
     if (!editMovForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
-    const conf = getCajaConfig(cajaById(editingMov.caja_id) ?? '');
-    if (!conf.monedasPermitidas.includes(editMovForm.moneda)) { setCajaError(`Esta caja solo acepta: ${conf.monedasPermitidas.join(', ')}`); return; }
+    const cajaEditar = cajaById(editingMov.caja_id);
+    if (!cajaEditar || !cajaAceptaMoneda(cajaEditar, editMovForm.moneda)) { setCajaError('La caja no acepta esa moneda.'); return; }
     setSavingAction(editingMov.id);
     try {
       const { error } = await supabase.from('movimientos_caja_chica').update({
@@ -1446,7 +1534,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     if (!movForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
     const cajaObj  = cajaById(cajaActiva);
     const cajaConf = getCajaConfig(cajaObj ?? '');
-    if (!cajaConf.monedasPermitidas.includes(movForm.moneda)) { setCajaError(`Esta caja solo acepta: ${cajaConf.monedasPermitidas.join(', ')}`); return; }
+    if (!cajaObj || !cajaAceptaMoneda(cajaObj, movForm.moneda)) { setCajaError('Caja inexistente o incompatible con la moneda.'); return; }
     const subcaja = cajaConf.esCajaEfectivo ? movForm.subcaja : null;
     const ingresoReal = movForm.clase === 'OPERATIVO' && movForm.tipo === 'ENTRADA';   // [NEW v16.5]
     if (ingresoReal) {
@@ -1460,7 +1548,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     }
     if (movForm.tipo === 'SALIDA') {
       const saldo = saldoCustodia(cajaActiva, movForm.moneda, subcaja);
-      if (saldo < num && !window.confirm(`⚠️ ${cajaObj?.nombre ?? 'Caja'} tiene ${fmtMonto(saldo, movForm.moneda)}. ¿Registrar salida de ${fmtMonto(num, movForm.moneda)}?`)) return;
+      if (saldo < num) { setCajaError(`Saldo insuficiente en caja. Disponible: ${fmtMonto(saldo, movForm.moneda)}. Operación bloqueada.`); return; }
     }
 
     setSavingCaja(true);
@@ -1530,7 +1618,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     const monto = round2(parseFloat(entregaCEOForm.monto));
     if (isNaN(monto) || monto <= 0) { setCajaError('Monto inválido.'); return; }
     if (!entregaCEOForm.concepto.trim()) { setCajaError('Concepto obligatorio.'); return; }
-    if (monto > saldoEfectivoADM && !window.confirm(`⚠️ ADM solo tiene ${fmtMonto(saldoEfectivoADM, 'CASH')} disponible.\n¿Registrar de todas formas?`)) return;
+    if (monto > saldoEfectivoADM) { setCajaError('Saldo de Efectivo Administración insuficiente. Entrega bloqueada.'); return; }
 
     setSavingCaja(true);
     const concepto = entregaCEOForm.concepto.toUpperCase().trim();
@@ -1801,6 +1889,82 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     finally { setSavingCobro(false); }
   };
 
+  // ─── PAGOS SIN MATRÍCULA v16.8 ───────────────────────────────────────────
+  // La RPC invoca el motor v16.5 y escribe el subledger en UNA transacción de BD.
+  const handlePagoProvisional = async (e: React.FormEvent) => {
+    e.preventDefault(); setProvisionalError(null);
+    if (sinSesion || !canManageFinance) { setProvisionalError('Sesión o rol financiero no autorizado.'); return; }
+    if (fetchErrors.length) { setProvisionalError('Hay consultas financieras con error. Corrija esas alertas antes de registrar cobros.'); return; }
+    const f = provisionalForm;
+    const monto = round2(Number(f.monto));
+    if (!Number.isFinite(monto) || monto <= 0) { setProvisionalError('Importe mayor que cero requerido.'); return; }
+    if (f.beneficiario_nombre.trim().length < 3 || f.beneficiario_documento.trim().length < 4) {
+      setProvisionalError('Identifique al aspirante con nombre completo y documento.'); return;
+    }
+    if (f.concepto.trim().length < 3) { setProvisionalError('Especifique el concepto del anticipo.'); return; }
+    if (!f.caja_id) { setProvisionalError('Identifique la caja de custodia. No se permiten anticipos sin ubicar.'); return; }
+    const cajaErr = validarCajaMoneda(f.caja_id, f.moneda);
+    if (cajaErr) { setProvisionalError(cajaErr); return; }
+    const pagoError = validarPago(provisionalPago, f.moneda);
+    if (pagoError) { setProvisionalError(pagoError); return; }
+    if (provisionalPago.pagador_tipo === 'ALUMNO' || provisionalPago.alumno_id) {
+      setProvisionalError('Este procedimiento es para personas sin matrícula. Use tipo aspirante o representante.'); return;
+    }
+    if (provisionalPago.referencia_pago.trim().length < 3) {
+      setProvisionalError('La referencia de pago o el número de recibo es obligatorio, incluso para efectivo.'); return;
+    }
+    const datosPagador = { ...provisionalPago, pagador_tipo: provisionalPago.pagador_tipo,
+      alumno_id: '', referencia_pago: provisionalPago.referencia_pago.toUpperCase().trim() };
+    const concepto = `ANTICIPO SIN MATRÍCULA · ${f.concepto.trim().toUpperCase()}`;
+    const asiento = buildFlujo({
+      evento: 'INGRESO_DIRECTO', dir: 'IN', ledgerType: 'INCOME',
+      moneda: f.moneda, monto, fechaISO: isoDe(f.fecha), concepto,
+      entityName: f.beneficiario_nombre.trim().toUpperCase(),
+      category: 'Anticipos sin matrícula', cajaId: f.caja_id,
+      subcaja: cajaEsEfectivo(f.caja_id) ? f.subcaja : null,
+      registradoPor: auditRole, pago: datosPagador,
+      referenciaExterna: datosPagador.referencia_pago,
+      meta: { origen: 'ANTICIPO_SIN_MATRICULA',
+        documento_beneficiario: f.beneficiario_documento.trim().toUpperCase(),
+        concepto_original: f.concepto.trim().toUpperCase() },
+    });
+    setSavingProvisional(true);
+    try {
+      const { error } = await supabase.rpc('fn_registrar_pago_provisional', {
+        p_asiento: asiento,
+        p_beneficiario: {
+          nombre: f.beneficiario_nombre.trim().toUpperCase(),
+          documento: f.beneficiario_documento.trim().toUpperCase(),
+          contacto: f.beneficiario_contacto.trim(), sede: f.sede.trim(),
+          concepto: f.concepto.trim().toUpperCase(),
+        },
+      });
+      if (error) throw new Error(traducirErrorMotor(error.message));
+      setProvisionalForm(p => ({ ...p, beneficiario_nombre: '', beneficiario_documento: '',
+        beneficiario_contacto: '', concepto: 'ANTICIPO DE FORMACIÓN', monto: '' }));
+      setProvisionalPago(pagoRegistrado(datosPagador, { pagador_tipo: 'TERCERO' }));
+      await refresh();
+    } catch (err) { setProvisionalError(errMsg(err, 'No se pudo registrar el anticipo.')); }
+    finally { setSavingProvisional(false); }
+  };
+
+  const vincularProvisional = async () => {
+    const p = provisionales.find(x => x.id === provisionalLinkId);
+    const a = alumnos.find(x => x.student_id === provisionalStudentId);
+    if (!p || !a || p.estado !== 'PENDIENTE') { setProvisionalError('Seleccione un pago pendiente y un estudiante válido.'); return; }
+    if (!window.confirm(`Vincular el anticipo de ${p.beneficiario_nombre} (${p.beneficiario_documento}) a ${a.nombre} (${a.serial})?\n\nSolo documenta la identidad. NO acredita horas, NO aplica la CxC y NO vuelve a recibir dinero.`)) return;
+    setSavingProvisionalLink(true); setProvisionalError(null);
+    try {
+      const { error } = await supabase.rpc('fn_vincular_pago_provisional', {
+        p_pago_id: p.id, p_student_id: a.student_id,
+      });
+      if (error) throw new Error(error.message);
+      setProvisionalLinkId(null); setProvisionalStudentId('');
+      await refresh();
+    } catch (err) { setProvisionalError(errMsg(err, 'No se pudo vincular el pago.')); }
+    finally { setSavingProvisionalLink(false); }
+  };
+
   // ─── PRÉSTAMO EXTERNO ─────────────────────────────────────────────────────
   // Recibido = FINANCING_IN + caja ENTRADA + CxP nueva. Devolución = FINANCING_OUT + caja SALIDA + abonos FIFO.
 
@@ -1914,7 +2078,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     const errMon = validarCajaMoneda(cajaOrigen.id, f.moneda) ?? validarCajaMoneda(cajaDestino.id, f.moneda);
     if (errMon) { setTransferError(`${errMon} · Para cambiar de moneda use FX Desk.`); return; }
     const saldoOrigen = getCajaBalance(f.caja_origen_id, f.moneda);
-    if (saldoOrigen < monto && !window.confirm(`⚠️ Saldo insuficiente en ${cajaOrigen.nombre}\n\nDisponible: ${fmtMonto(saldoOrigen, f.moneda)}\nTransferir: ${fmtMonto(monto, f.moneda)}\n\n¿Continuar?`)) return;
+    if (saldoOrigen < monto) { setTransferError(`Saldo insuficiente en ${cajaOrigen.nombre}: ${fmtMonto(saldoOrigen, f.moneda)}. Transferencia bloqueada.`); return; }
 
     setSavingTransfer(true);
     const transferId = uuid4(), salidaId = uuid4(), entradaId = uuid4();
@@ -2238,6 +2402,30 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       `"${pg.cuenta_origen ?? '—'}"`, `"${pg.recibido_por}"`, pg.registrado_por_email ?? '—'] : PAGO_COLS.map(() => '—');
   };
 
+  /** [v16.8] CSV independiente de anticipos. Escapa valores y fórmulas peligrosas. */
+  const exportProvisionalesCSV = () => {
+    const csvSafe = (v: unknown) => {
+      let x = String(v ?? '');
+      if (/^[=+@-]/.test(x.trimStart())) x = `\'${x}`;
+      return `"${x.replace(/"/g, '""')}"`;
+    };
+    const rows = [
+      ['Código', 'Asiento', 'Beneficiario', 'Documento beneficiario', 'Contacto', 'Sede',
+       'Concepto', 'Monto', 'Método', 'Referencia externa', 'Caja', 'Fecha pago',
+       'Estado', 'Perfil vinculado', 'Pagador real', 'Documento pagador', 'Recibido por',
+       'Registrado por', 'Fecha de captura', 'Fecha de vinculación'],
+      ...provisionales.map(p => {
+        const pg = pagoPorAsiento.get(p.asiento_id);
+        return [p.id, p.asiento_id, p.beneficiario_nombre, p.beneficiario_documento,
+          p.beneficiario_contacto, p.sede, p.concepto, p.monto.toFixed(2), p.moneda,
+          p.referencia_pago, cajaNombre(p.caja_id), p.fecha_pago, p.estado,
+          p.student_id, pg?.pagador_nombre, pg?.pagador_documento, pg?.recibido_por,
+          pg?.registrado_por_email, p.creado_en, p.vinculado_en];
+      }),
+    ];
+    downloadCSV(rows.map(r => r.map(csvSafe)), `AnticiposSinMatricula_${hoyISO()}.csv`);
+  };
+
   const handleExportCSV = () => downloadCSV([
     ['Fecha', 'Ref', 'Entidad', 'Metodo', 'Monto', 'Tipo', 'Estatus', 'Pata FX', 'Asiento', 'Monto con signo', ...PAGO_COLS],
     ...transactions.map(t => [
@@ -2272,7 +2460,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   if (loading) return (
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v16.5...</p>
+      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v16.8...</p>
     </div>
   );
 
@@ -2346,6 +2534,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   const TABS: { key: TabType; label: string; icon: LucideIcon }[] = [
     { key: 'LEDGER', label: 'Diario', icon: Landmark }, { key: 'BÓVEDAS', label: 'Bóvedas', icon: Coins },
     { key: 'CAJAS', label: 'Cajas', icon: Banknote }, { key: 'CUENTAS', label: 'CxC/CxP', icon: ReceiptText },
+    { key: 'PROVISIONALES', label: 'Sin matrícula', icon: Users },
     { key: 'REQUISITIONS', label: 'Reqs', icon: FileSignature }, { key: 'CLOSING', label: 'Cierre', icon: Lock },
   ];
 
@@ -2356,6 +2545,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     { label: 'Reposiciones Internas', value: `$${fmtNum(totalReposiciones)}`, sub: `${cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').length} entre cajas`, icon: ArrowLeftRight, card: 'bg-purple-500/5 border-purple-500/10', txt: 'text-purple-400', ico: 'text-purple-400/20' },
   ];
 
+  const provisionPendientes = provisionales.filter(p => p.estado === 'PENDIENTE' || p.estado === 'VINCULADO');
+  const resumenProvisional = ALL_METHODS.map(m => ({
+    moneda: m, saldo: round2(provisionPendientes.filter(p => p.moneda === m).reduce((a,p) => a+p.monto, 0)),
+  }));
+
   // ─── RENDER ───────────────────────────────────────────────────────────────
 
   return (
@@ -2365,7 +2559,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
           <div>
-            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v16.5</p>
+            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v16.8</p>
             <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Motor de asientos · Bóveda ↔ Caja ↔ CxC/CxP en una sola operación</p>
           </div>
           <button onClick={() => refresh()} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors"><RefreshCw size={12} /></button>
@@ -2402,10 +2596,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         </div>
       )}
 
+      {fetchErrors.length > 0 && (
+        <div className="p-4 border border-red-500/40 rounded-xl bg-red-500/10 text-red-300 text-[10px] font-black">
+          DATOS FINANCIEROS NO VERIFICADOS: existe al menos una consulta fallida. No certifique saldos ni realice cierres.
+        </div>
+      )}
+      {/* [v16.8] Integridad visible, nunca conciliación silenciosa */}
+      {(alertasIntegridad.length > 0 || historicosRevisar > 0) && (
+        <div className="p-5 rounded-2xl bg-orange-500/5 border border-orange-500/25 space-y-2">
+          <p className="text-[10px] text-orange-400 font-black uppercase flex items-center gap-2"><AlertTriangle size={15} /> Revisión de integridad pendiente</p>
+          {historicosRevisar > 0 && <p className="text-[9px] text-orange-200">{historicosRevisar} CxC históricas cobradas sin vínculo al motor de asientos/abonos. No se ha creado ningún movimiento automático.</p>}
+          <p className="text-[9px] text-orange-200">{alertasIntegridad.length} posibles anomalías en trazabilidad, asientos o transferencias. No implica fraude ni confirma descuadre.</p>
+          {alertasIntegridad.slice(0, 8).map((a, i) => <p key={i} className="text-[8px] text-orange-300/80 font-mono">• {a}</p>)}
+          {alertasIntegridad.length > 8 && <p className="text-[8px] text-orange-300">+ {alertasIntegridad.length - 8} hallazgos adicionales. Revisión manual requerida.</p>}
+        </div>
+      )}
+
       {/* KPI BÓVEDAS — operativos vs no operativos (FX + financiamiento) */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {ALL_METHODS.map(m => {
-          const paid  = transactions.filter(t => t.payment_method === m && t.status === 'PAID' && !isNonOperativeTx(t));
+          const paid  = transactions.filter(t => t.payment_method === m && t.status === 'PAID' && !isNonOperativeTx(t) && t.category !== 'Anticipos sin matrícula');
           const ing   = paid.filter(t => signedLedgerAmount(t) > 0).reduce((a, t) => round2(a + t.amount), 0);
           const egr   = paid.filter(t => signedLedgerAmount(t) < 0).reduce((a, t) => round2(a + t.amount), 0);
           const saldo = getVaultBalance(m);
@@ -2419,7 +2629,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
               </div>
               <div className="grid grid-cols-3 gap-2 text-center">
                 {([['Ingresado', fmt(ing), 'text-emerald-400'], ['Egresado', fmt(egr), 'text-red-400'],
-                   ['FX / Financ.', `${fxNet >= 0 ? '+' : '−'}${fmt(Math.abs(fxNet))}`, fxNet >= 0 ? 'text-teal-400' : 'text-teal-600']] as const).map(([l, v, c]) => (
+                   ['FX / Financ. / Anticipos', `${fxNet >= 0 ? '+' : '−'}${fmt(Math.abs(fxNet))}`, fxNet >= 0 ? 'text-teal-400' : 'text-teal-600']] as const).map(([l, v, c]) => (
                   <div key={l}><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">{l}</p><p className={`font-black text-[11px] italic ${c}`}>{v}</p></div>
                 ))}
               </div>
@@ -2474,6 +2684,94 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           </div>
         ))}
       </div>
+
+      {/* ══ TAB: ANTICIPOS SIN MATRÍCULA v16.8 ════════════════════════════════ */}
+      {activeTab === 'PROVISIONALES' && (
+        <div className="space-y-5">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {resumenProvisional.map(({ moneda, saldo }) => (
+              <div key={moneda} className={`${glass} rounded-2xl p-4`}>
+                <p className={`text-[9px] font-black ${MONEDA_COLOR[moneda]}`}>{moneda} · POR APLICAR</p>
+                <p className="text-xl font-black mt-2">{fmtMonto(saldo, moneda)}</p>
+              </div>
+            ))}
+          </div>
+          <div className="border border-orange-500/20 bg-orange-500/5 rounded-xl p-4 text-[9px] text-orange-200">
+            Anticipos cobrados, NO ingresos académicos devengados. Vincular un estudiante NO acredita horas ni aplica cuentas por cobrar. No registre nuevamente este dinero al matricularlo.
+          </div>
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
+            <form onSubmit={handlePagoProvisional} className={`${glass} xl:col-span-5 rounded-3xl p-6 space-y-4`}>
+              <h2 className="text-[11px] font-black text-[#E1AD01] flex items-center gap-2"><UserCheck size={16} /> Recibir anticipo · Sin matrícula</h2>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div><Lbl>Nombre completo del aspirante *</Lbl><input required value={provisionalForm.beneficiario_nombre} onChange={e => setProvisionalForm(p=>({...p, beneficiario_nombre:e.target.value}))} className={inp} placeholder="BENEFICIARIO" /></div>
+                <div><Lbl>Cédula / documento del aspirante *</Lbl><input required value={provisionalForm.beneficiario_documento} onChange={e => setProvisionalForm(p=>({...p, beneficiario_documento:e.target.value}))} className={inp} placeholder="CÉDULA / PASAPORTE" /></div>
+                <div><Lbl>Contacto del aspirante</Lbl><input value={provisionalForm.beneficiario_contacto} onChange={e => setProvisionalForm(p=>({...p, beneficiario_contacto:e.target.value}))} className={inp} placeholder="TELÉFONO O CORREO" style={noUpper} /></div>
+                <div><Lbl>Sede</Lbl><input value={provisionalForm.sede} onChange={e => setProvisionalForm(p=>({...p, sede:e.target.value}))} className={inp} placeholder="BARQUISIMETO / MATURÍN" /></div>
+              </div>
+              <div><Lbl>Concepto del anticipo *</Lbl><input required value={provisionalForm.concepto} onChange={e => setProvisionalForm(p=>({...p, concepto:e.target.value}))} className={inp} /></div>
+              <div><Lbl>Moneda / medio de pago</Lbl><MonedaPicker value={provisionalForm.moneda} onChange={m=>setProvisionalForm(p=>({...p, moneda:m, caja_id:ajustarCaja(p.caja_id,m)}))} /></div>
+              <div><Lbl>Monto recibido *</Lbl><AmountInput value={provisionalForm.monto} onChange={v=>setProvisionalForm(p=>({...p,monto:v}))} moneda={provisionalForm.moneda} size="lg" disabled={savingProvisional} /></div>
+              <div><Lbl>Caja donde se custodia *</Lbl>
+                <select required value={provisionalForm.caja_id} onChange={e=>setProvisionalForm(p=>({...p,caja_id:e.target.value}))} className={inp}>
+                  <option value="">— SELECCIONE CAJA —</option>
+                  {cajas.map(c=><option key={c.id} value={c.id} disabled={!cajaAceptaMoneda(c,provisionalForm.moneda)}>{c.nombre}{cajaAceptaMoneda(c,provisionalForm.moneda)?'':` · NO ADMITE ${provisionalForm.moneda}`}</option>)}
+                </select>
+              </div>
+              {cajaEsEfectivo(provisionalForm.caja_id) && <SubcajaToggle value={provisionalForm.subcaja} onChange={sc=>setProvisionalForm(p=>({...p,subcaja:sc}))} />}
+              <div><Lbl>Fecha del pago</Lbl><input type="date" required value={provisionalForm.fecha} onChange={e=>setProvisionalForm(p=>({...p,fecha:e.target.value}))} className={inp} style={noUpper} /></div>
+              <PagadorFields value={provisionalPago} onChange={setProvisionalPago} moneda={provisionalForm.moneda} sinPerfil />
+              <p className="text-[8px] text-yellow-400">Referencia / número de recibo obligatorio también para efectivo. Una referencia no puede registrarse dos veces.</p>
+              <ErrorBanner msg={provisionalError} onClose={()=>setProvisionalError(null)} />
+              <button type="submit" disabled={savingProvisional || sinSesion || !canManageFinance || fetchErrors.length>0}
+                className="w-full py-4 bg-[#E1AD01] text-black rounded-xl font-black text-[10px] uppercase disabled:opacity-40">
+                {savingProvisional?'Registrando anticipo...':'Registrar pago y generar trazabilidad'}
+              </button>
+            </form>
+            <div className={`${glass} xl:col-span-7 rounded-3xl p-6 space-y-4`}>
+              <div className="flex justify-between items-center gap-2 flex-wrap">
+                <h2 className="text-[11px] font-black uppercase">Registro de anticipos · {provisionales.length} operaciones</h2>
+                <button type="button" onClick={exportProvisionalesCSV} disabled={provisionales.length===0} className="px-3 py-2 rounded-xl text-[9px] border border-white/20 text-[#E1AD01] disabled:opacity-30 flex gap-2 items-center"><Download size={12}/> Exportar CSV</button>
+              </div>
+              <div className="max-h-[680px] overflow-y-auto space-y-2">
+                {provisionales.length===0 && <EmptyState text="Sin anticipos registrados" />}
+                {provisionales.map(p=>{
+                  const pagador = pagoPorAsiento.get(p.asiento_id);
+                  const alumno = p.student_id ? alumnos.find(a=>a.student_id===p.student_id) : null;
+                  return <div key={p.id} className="border border-white/10 bg-black/30 rounded-2xl p-4 space-y-2">
+                    <div className="flex flex-wrap gap-2 items-center justify-between">
+                      <p className="text-[10px] font-black">{p.beneficiario_nombre}</p>
+                      <Badge tone={p.estado==='ANULADO'?TONE.red:p.estado==='VINCULADO'?TONE.blue:TONE.yellow}>{p.estado==='VINCULADO'?'Vinculado · NO aplicado':p.estado}</Badge>
+                    </div>
+                    <p className="text-[9px] text-zinc-400">{p.beneficiario_documento} · {p.sede||'Sede no definida'} · {fmtDate(p.fecha_pago)}</p>
+                    <p className="text-[12px] font-black text-emerald-400">{fmtMonto(p.monto,p.moneda)} · REF {p.referencia_pago}</p>
+                    <p className="text-[8px] text-zinc-500">{p.concepto}</p>
+                    <p className="text-[8px] text-yellow-300">Pagó: {pagador?.pagador_nombre??'REVISAR TRAZABILIDAD'} · Recibió: {pagador?.recibido_por??'REVISAR'} · Caja: {cajaNombre(p.caja_id)}</p>
+                    <p className="text-[8px] text-zinc-600 break-all">Asiento: {p.asiento_id} · Registro: {p.creado_en}</p>
+                    {alumno && <p className="text-[9px] text-blue-400">Perfil vinculado: {alumno.nombre} · {alumno.serial}. Sin aplicación de CxC/horas.</p>}
+                    {p.estado==='PENDIENTE' && (
+                      <button type="button" onClick={()=>{setProvisionalLinkId(p.id);setProvisionalStudentId('');setProvisionalError(null);}}
+                        className="border border-blue-500/30 text-blue-300 rounded-xl px-3 py-2 text-[9px] font-black">Vincular a estudiante matriculado</button>
+                    )}
+                  </div>;
+                })}
+              </div>
+            </div>
+          </div>
+          {provisionalLinkId && (
+            <ModalShell accent="border-t-blue-500">
+              <ModalHeader icon={Link2} tone={TONE.blue} title="Vincular identidad" subtitle="No mueve dinero ni acredita horas" onClose={()=>setProvisionalLinkId(null)} />
+              <p className="text-[9px] text-zinc-400 mb-4">Verifique el documento del aspirante y su perfil. Esta acción se audita y no permite reutilizar el cobro como uno nuevo.</p>
+              <select value={provisionalStudentId} onChange={e=>setProvisionalStudentId(e.target.value)} className={inp}>
+                <option value="">— SELECCIONE PERFIL MATRICULADO —</option>
+                {alumnos.map(a=><option key={a.student_id} value={a.student_id}>{a.nombre} · {a.serial} · {a.sede}</option>)}
+              </select>
+              <div className="mt-4"><ErrorBanner msg={provisionalError} onClose={()=>setProvisionalError(null)} /></div>
+              <div className="mt-5"><ModalActions onCancel={()=>setProvisionalLinkId(null)} submitCls="bg-blue-500 text-black" busy={savingProvisionalLink}
+                disabled={!provisionalStudentId} onSubmit={vincularProvisional} label="Confirmar vínculo documental" /></div>
+            </ModalShell>
+          )}
+        </div>
+      )}
 
       {/* ══ TAB: DIARIO ══════════════════════════════════════════════════════ */}
       {activeTab === 'LEDGER' && (
@@ -3318,12 +3616,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           { m: 'CASH', label: 'Efectivo (USD)' }, { m: 'BS', label: 'Bolívares' },
         ];
         const handleCierre = () => {
+          if (METODOS.some(({ m }) => physBalances[m].trim() === '' || !Number.isFinite(Number(physBalances[m])) || Number(physBalances[m]) < 0)) {
+            alert('Ingrese los cuatro conteos físicos válidos antes de comprobar el cuadre.'); return;
+          }
+          if (fetchErrors.length || alertasIntegridad.length) {
+            alert('No se puede certificar: hay datos no disponibles o alertas de integridad.'); return;
+          }
           const disc = METODOS.map(({ m, label }) => {
             const diff = round2(Math.abs(getVaultBalance(m) - round2(parseFloat(physBalances[m]) || 0)));
             return diff > 0.01 ? `${label}: ${prefijo(m)} ${diff.toFixed(2)} de diferencia` : null;
           }).filter(Boolean);
           if (disc.length) alert('⚠️ DISCREPANCIAS:\n\n' + disc.join('\n'));
-          else { alert('✓ CIERRE CERTIFICADO — Todos los métodos cuadran.'); setPhysBalances({ USDT: '', ZELLE: '', CASH: '', BS: '' }); }
+          else { alert('✓ COMPROBACIÓN DE CUADRE COMPLETADA. Esto NO es un cierre contable firmado ni persistido.'); }
         };
         return (
           <div className="space-y-6">
@@ -3375,7 +3679,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                 })}
               </div>
               <button onClick={handleCierre} className="w-full py-5 bg-red-600 rounded-2xl font-black uppercase text-[10px] tracking-widest flex items-center justify-center gap-2 hover:bg-red-500 transition-all mt-5">
-                <Lock className="h-4 w-4" /> Certificar Cierre Multi-Moneda
+                <Lock className="h-4 w-4" /> Comprobar Cuadre Multi-Moneda
               </button>
             </div>
           </div>
