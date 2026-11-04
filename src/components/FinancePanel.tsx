@@ -86,7 +86,7 @@ export type PaymentMethod   = 'USDT' | 'ZELLE' | 'CASH' | 'BS';
 export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE' | 'RECEIVABLE' | 'FX_EXCHANGE' | 'FINANCING_IN' | 'FINANCING_OUT';
 export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING' | 'PROVISIONALES';
 export type SubcajaEfectivo = 'ADM' | 'CEO';
-export type Prestamista     = 'BECQUER' | 'ROBERTO';
+export type Prestamista     = 'Barquisimeto' | 'ROBERTO';
 export type FxLeg           = 'IN' | 'OUT';
 export type TipoCaja        = 'OPERATIVA' | 'BANCO' | 'EFECTIVO' | 'EFECTIVO_ADM' | 'EFECTIVO_CEO' | 'CUSTODIA_TERCERO';   // [CHG v16.4] + efectivo dual
 /** Eventos contables que el motor sabe asentar */
@@ -249,7 +249,7 @@ interface FlujoSpec {
 interface CajaConf { monedasPermitidas: PaymentMethod[]; esCajaEfectivo: boolean; tipo: TipoCaja; prestamista?: Prestamista; efectivoRol?: SubcajaEfectivo; }
 
 const ALL_METHODS: PaymentMethod[] = ['USDT', 'ZELLE', 'CASH', 'BS'];
-const PRESTAMISTAS: Prestamista[]  = ['BECQUER', 'ROBERTO'];
+const PRESTAMISTAS: Prestamista[]  = ['Barquisimeto', 'ROBERTO'];
 
 /** Fallback por nombre (la BD manda). [CHG v16.4] claves específicas primero: el orden de inserción decide. */
 const CAJA_CONFIG: Record<string, CajaConf> = {
@@ -259,7 +259,7 @@ const CAJA_CONFIG: Record<string, CajaConf> = {
   'caja bs':        { monedasPermitidas: ['BS'],   esCajaEfectivo: false, tipo: 'BANCO' },
   bancamiga:        { monedasPermitidas: ['BS'],   esCajaEfectivo: false, tipo: 'BANCO' },
   efectivo:         { monedasPermitidas: ['CASH'], esCajaEfectivo: true,  tipo: 'EFECTIVO' },   // legacy: 1 caja con subcajas
-  becquer:          { monedasPermitidas: ALL_METHODS, esCajaEfectivo: false, tipo: 'CUSTODIA_TERCERO', prestamista: 'BECQUER' },
+  Barquisimeto:          { monedasPermitidas: ALL_METHODS, esCajaEfectivo: false, tipo: 'CUSTODIA_TERCERO', prestamista: 'Barquisimeto' },
   roberto:          { monedasPermitidas: ALL_METHODS, esCajaEfectivo: false, tipo: 'CUSTODIA_TERCERO', prestamista: 'ROBERTO' },
 };
 
@@ -273,7 +273,7 @@ const normalizePaymentMethod = (value: unknown): PaymentMethod => {
   const v = String(value ?? '').toUpperCase().trim();
   return v === 'USD' ? 'USDT' : (ALL_METHODS as string[]).includes(v) ? v as PaymentMethod : 'USDT';
 };
-const parsePrestamista = (v: unknown): Prestamista | null => (v === 'BECQUER' || v === 'ROBERTO' ? v : null);
+const parsePrestamista = (v: unknown): Prestamista | null => (v === 'Barquisimeto' || v === 'ROBERTO' ? v : null);
 
 /** Config de una caja: acepta el objeto (usa columnas BD) o solo el nombre (fallback legacy). */
 const getCajaConfig = (ref: string | CajaChica | null | undefined): CajaConf => {
@@ -766,7 +766,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   // préstamo externo
   const [prestamoModal, setPrestamoModal] = useState(false);
   const [prestamoForm, setPrestamoForm] = useState({
-    prestamista: 'BECQUER' as Prestamista, caja_id: '', moneda: 'USDT' as PaymentMethod,
+    prestamista: 'Barquisimeto' as Prestamista, caja_id: '', moneda: 'USDT' as PaymentMethod,
     monto: '', concepto: '', fecha: hoyISO(), es_devolucion: false,
     subcaja: 'ADM' as SubcajaEfectivo, cuenta_id: '',   // cuenta_id '' = FIFO automático
   });
@@ -3316,7 +3316,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                     <input type="date" required value={cuentaForm.fecha_emision} onChange={e => setCuentaForm(p => ({ ...p, fecha_emision: e.target.value }))} className={inp} style={noUpper} />
                     <input type="date" value={cuentaForm.fecha_vencimiento} onChange={e => setCuentaForm(p => ({ ...p, fecha_vencimiento: e.target.value }))} className={inp} style={noUpper} />
                     <input value={cuentaForm.notas} onChange={e => setCuentaForm(p => ({ ...p, notas: e.target.value }))} placeholder="NOTAS (opcional)" className={inp} />
-                    <p className="md:col-span-3 text-[8px] text-zinc-600 font-mono">Los préstamos de Becquer/Roberto se registran en Cajas → Préstamo Externo (crean su CxP y la entrada de dinero en un solo asiento).</p>
+                    <p className="md:col-span-3 text-[8px] text-zinc-600 font-mono">Los préstamos de Barquisimeto/Roberto se registran en Cajas → Préstamo Externo (crean su CxP y la entrada de dinero en un solo asiento).</p>
                   </>)}
 
                   <div className="md:col-span-3"><ErrorBanner msg={cuentaError} onClose={() => setCuentaError(null)} /></div>
@@ -3892,7 +3892,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         const dev    = prestamoForm.es_devolucion;
         return (
           <ModalShell accent="border-t-violet-500">
-            <ModalHeader icon={HandCoins} tone={TONE.fin} title="Préstamo Externo" subtitle="Becquer / Roberto ↔ Águilas · financiamiento, no ingreso" onClose={() => setPrestamoModal(false)} />
+            <ModalHeader icon={HandCoins} tone={TONE.fin} title="Préstamo Externo" subtitle="Barquisimeto / Roberto ↔ Águilas · financiamiento, no ingreso" onClose={() => setPrestamoModal(false)} />
             <form onSubmit={handlePrestamo} className="space-y-4">
               <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10">
                 {([[false, '+ Préstamo a Águilas', 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'], [true, '- Devolución', 'bg-red-500/20 text-red-400 border border-red-500/30']] as const).map(([v, l, on]) => (
