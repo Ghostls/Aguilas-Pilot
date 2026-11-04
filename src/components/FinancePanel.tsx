@@ -9,7 +9,7 @@
 //   [FIX CRÍTICO] Selectores de caja ya no desaparecen cuando la moneda no coincide con monedas_permitidas.
 //         Todas las cajas visibles se muestran; las incompatibles quedan identificadas/deshabilitadas.
 //   [FIX] OPERATIVA y CUSTODIA_TERCERO se tratan como cajas multimoneda (USDT/ZELLE/CASH/BS), coherente
-//         con MATURÍN, BARQUISIMETO, ROBERTO y BECQUER. Cajas dedicadas (EFECTIVO/BS) siguen estrictas.
+//         con MATURÍN, BARQUISIMETO, ROBERTO. Cajas dedicadas (EFECTIVO/BS) siguen estrictas.
 //   [DIAG] Si RLS devuelve 0 cajas, los formularios muestran “SIN CAJAS VISIBLES · REVISE RLS” en vez
 //         de aparentar que “SOLO BÓVEDA” es la única opción disponible.
 //   [PRESERVADO] Roles CEO/ADMIN/DIRECTOR v16.6, motor contable v16, trazabilidad v16.5 y anti-duplicado.
@@ -33,7 +33,7 @@
 // REQUISITO ADICIONAL: migracion_finance_v16_5_pagadores.sql
 // CHANGELOG v16.4 vs v16.3:
 //   [NEW] Mapa de 7 cajas Águilas: EFECTIVO ADMIN (stand-by), EFECTIVO CEO (custodia), CAJA BS, ROBERTO,
-//         BECQUER (custodia de terceros), MATURÍN y BARQUISIMETO (sedes). Todas conectadas a las 4 bóvedas
+//          (custodia de terceros), MATURÍN y BARQUISIMETO (sedes). Todas conectadas a las 4 bóvedas
 //         por el motor de asientos: cada evento escribe bóveda + caja UNA sola vez (sin montos repetidos).
 //   [NEW] Efectivo dual: tipos EFECTIVO_ADM / EFECTIVO_CEO como cajas propias. "Entregar a CEO" = transferencia
 //         de custodia ADM → CEO (la bóveda CASH no cambia). Modelo legacy de una caja con subcajas preservado.

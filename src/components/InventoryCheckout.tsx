@@ -1,5 +1,5 @@
 // src/components/InventoryCheckout.tsx
-// VALKYRON OS v2.0 — Grado Militar
+// VALKYRON OS v2.1 — Histórico completo, impresión y paginación segura
 // NUEVO: Flota desde Supabase (todas) · Firma digital del técnico · Historial agrupado por aeronave
 
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
@@ -9,7 +9,7 @@ import { supabase } from '../lib/supabaseClient';
 import {
   PlusCircle, X, ArrowRightLeft, AlertTriangle,
   Database, Search, Loader2, RefreshCw, Plane,
-  ChevronDown, ChevronUp, Pen, CheckCircle2, Eraser
+  ChevronDown, ChevronUp, Pen, CheckCircle2, Eraser, Printer, ChevronLeft, ChevronRight
 } from 'lucide-react';
 
 // ── Tipos ─────────────────────────────────────────────────────────────────────
@@ -33,6 +33,74 @@ interface AeronaveRow {
 interface InventoryCheckoutProps {
   onCheckoutSuccess?: (partNumber: string, quantity: number, aircraftId: string) => void;
   selectedAircraft?: string;
+}
+
+// Supabase/PostgREST normalmente limita las respuestas a 1000 registros.
+// Consultamos por lotes con orden estable, y fallamos si se supera el límite
+// de seguridad, en lugar de presentar un histórico parcialmente cargado.
+const BATCH_SIZE = 500;
+const MAX_ROWS = 100000;
+const HISTORY_GROUPS_PER_PAGE = 12;
+
+const printable = (v: unknown): string => String(v ?? '—')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+async function readAllInventory(): Promise<InventarioRow[]> {
+  const result: InventarioRow[] = [];
+  for (let start = 0; start < MAX_ROWS; start += BATCH_SIZE) {
+    const { data, error } = await supabase.from('inventario_repuestos')
+      .select('id,numero_parte,nombre,cantidad,stock_minimo,ubicacion_hangar')
+      .order('nombre', { ascending: true }).order('id', { ascending: true })
+      .range(start, start + BATCH_SIZE - 1);
+    if (error) throw error;
+    const batch = (data ?? []) as InventarioRow[];
+    result.push(...batch);
+    if (batch.length < BATCH_SIZE) return result;
+  }
+  throw new Error(`Inventario mayor de ${MAX_ROWS} registros: requiere paginación en servidor.`);
+}
+
+async function readAllOutbound(): Promise<InventoryLog[]> {
+  const result: InventoryLog[] = [];
+  for (let start = 0; start < MAX_ROWS; start += BATCH_SIZE) {
+    const { data, error } = await supabase.from('transacciones_inventario')
+      .select('*').eq('tipo_movimiento', 'OUTBOUND')
+      .order('fecha', { ascending: false }).order('id', { ascending: false })
+      .range(start, start + BATCH_SIZE - 1);
+    if (error) throw error;
+    const batch = data ?? [];
+    result.push(...batch.map((t: any) => ({
+      id: t.id, partNumber: t.item_id, description: t.item_name,
+      quantity: t.cantidad, dispatchedBy: t.tecnico,
+      assignedAircraft: typeof t.notas === 'string'
+        ? (t.notas.match(/Despacho para Aeronave:\s*(.*?)\.\s*Firma:/i)?.[1]?.trim() || 'S/N')
+        : 'S/N',
+      timestamp: new Date(t.fecha), location: t.ubicacion as HangarLocation,
+      serialNumberOut: t.item_id?.slice(0, 8) || 'N/A',
+    })));
+    if (batch.length < BATCH_SIZE) return result;
+  }
+  throw new Error(`Histórico mayor de ${MAX_ROWS} movimientos: requiere paginación en servidor.`);
+}
+
+function printDocument(title: string, headers: string[], rows: Array<Array<unknown>>) {
+  const win = window.open('', '_blank', 'width=1200,height=900');
+  if (!win) throw new Error('El navegador bloqueó la ventana de impresión.');
+  const head = headers.map(h => `<th>${printable(h)}</th>`).join('');
+  const body = rows.map(r => `<tr>${r.map(v => `<td>${printable(v)}</td>`).join('')}</tr>`).join('');
+  win.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+    <title>${printable(title)}</title><style>
+    @page{size:A4 landscape;margin:12mm}body{font-family:Arial,sans-serif;color:#111;padding:12px}
+    h1{font-size:18px;border-bottom:3px solid #d6a900;padding-bottom:12px}p{font-size:10px;color:#555}
+    table{width:100%;border-collapse:collapse;font-size:9px}td,th{padding:6px;text-align:left;border:1px solid #bbb;overflow-wrap:anywhere}
+    th{background:#eee}thead{display:table-header-group}tr{break-inside:avoid}
+    </style></head><body><h1>${printable(title)}</h1><p>Generado: ${printable(new Date().toLocaleString('es-VE'))} · Registros: ${rows.length}</p>
+    <p>Reporte administrativo. No sustituye la verificación física ni documentación técnica firmada.</p>
+    <table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></body></html>`);
+  win.document.close();
+  win.focus();
+  win.print();
 }
 
 // ── Helpers CSS ───────────────────────────────────────────────────────────────
@@ -177,6 +245,8 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
 
   // Historial — grupos expandibles
   const [expandedAircraft, setExpandedAircraft] = useState<Set<string>>(new Set());
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyLoading, setHistoryLoading] = useState(true);
 
   const [formData, setFormData] = useState({
     partNumber:       '',
@@ -189,18 +259,22 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
   // ── Fetch inventario ───────────────────────────────────────────────────────
   const fetchInventory = useCallback(async () => {
     setInventoryLoading(true);
+    try { setInventory(await readAllInventory()); }
+    catch (err: unknown) {
+      setInventory([]);
+      setError(`ERROR CARGANDO INVENTARIO: ${err instanceof Error ? err.message : String(err)}`);
+    } finally { setInventoryLoading(false); }
+  }, []);
+
+  const fetchHistory = useCallback(async () => {
+    setHistoryLoading(true);
     try {
-      const { data, error: e } = await supabase
-        .from('inventario_repuestos')
-        .select('id,numero_parte,nombre,cantidad,stock_minimo,ubicacion_hangar')
-        .order('nombre', { ascending: true });
-      if (e) throw e;
-      setInventory(data ?? []);
-    } catch (err: any) {
-      setError(`ERROR CARGANDO INVENTARIO: ${err.message}`);
-    } finally {
-      setInventoryLoading(false);
-    }
+      setHistory(await readAllOutbound());
+      setHistoryPage(1);
+    } catch (err: unknown) {
+      setHistory([]);
+      setError(`ERROR CARGANDO HISTÓRICO: ${err instanceof Error ? err.message : String(err)}`);
+    } finally { setHistoryLoading(false); }
   }, []);
 
   // ── Fetch flota desde Supabase ─────────────────────────────────────────────
@@ -232,32 +306,12 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
           .single();
         if (prof) setCurrentUser(prof.nombre_completo);
       }
-      const { data, error: histError } = await supabase
-        .from('transacciones_inventario')
-        .select('*')
-        .eq('tipo_movimiento', 'OUTBOUND')
-        .order('fecha', { ascending: false })
-        .limit(50);
-      if (!histError && data) {
-        setHistory(
-          data.map((t: any) => ({
-            id:               t.id,
-            partNumber:       t.item_id,
-            description:      t.item_name,
-            quantity:         t.cantidad,
-            assignedAircraft: t.notas?.includes(': ') ? t.notas.split(': ')[1].split('.')[0] : 'S/N',
-            dispatchedBy:     t.tecnico,
-            timestamp:        new Date(t.fecha),
-            location:         t.ubicacion as HangarLocation,
-            serialNumberOut:  t.item_id?.slice(0, 8) || 'N/A',
-          }))
-        );
-      }
+      await fetchHistory();
     };
     init();
     fetchInventory();
     fetchFlota();
-  }, [fetchInventory, fetchFlota]);
+  }, [fetchInventory, fetchFlota, fetchHistory]);
 
   // ── Autocomplete ───────────────────────────────────────────────────────────
   const sugerencias = useMemo(() => {
@@ -386,6 +440,30 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
     );
   }, [history]);
 
+  const historyPages = Math.max(1, Math.ceil(historialPorAeronave.length / HISTORY_GROUPS_PER_PAGE));
+  const paginatedHistory = historialPorAeronave.slice(
+    (Math.min(historyPage, historyPages) - 1) * HISTORY_GROUPS_PER_PAGE,
+    Math.min(historyPage, historyPages) * HISTORY_GROUPS_PER_PAGE,
+  );
+
+  const printStock = () => {
+    if (inventoryLoading || error) return;
+    try {
+      printDocument('ÁGUILAS PILOT — EXISTENCIAS DE INVENTARIO',
+        ['P/N', 'Descripción', 'Existencias', 'Stock mínimo', 'Ubicación'],
+        inventory.map(i => [i.numero_parte, i.nombre, i.cantidad, i.stock_minimo, i.ubicacion_hangar]));
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+  const printHistory = () => {
+    if (historyLoading || error) return;
+    try {
+      printDocument('ÁGUILAS PILOT — HISTÓRICO DE DESPACHOS',
+        ['Fecha', 'Aeronave', 'P/N', 'Descripción', 'Cantidad', 'Técnico', 'Sede'],
+        history.map(h => [new Date(h.timestamp).toLocaleString('es-VE'), h.assignedAircraft,
+          h.partNumber, h.description, h.quantity, h.dispatchedBy, h.location]));
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+  };
+
   const toggleAircraft = (matricula: string) => {
     setExpandedAircraft(prev => {
       const next = new Set(prev);
@@ -439,11 +517,15 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
           <Database className="h-4 w-4 text-[#E1AD01]" /> Logística de Despacho Técnico
         </h2>
         <div className="flex items-center gap-3">
-          <button onClick={() => { fetchInventory(); fetchFlota(); }}
+          <button onClick={() => { void fetchInventory(); void fetchFlota(); void fetchHistory(); }}
             className="border border-white/10 text-slate-400 px-4 py-3 rounded-xl
                        hover:border-[#E1AD01]/40 hover:text-[#E1AD01] transition-all"
             title="Recargar">
             <RefreshCw className={`h-4 w-4 ${inventoryLoading || flotaLoading ? 'animate-spin' : ''}`} />
+          </button>
+          <button type="button" onClick={printStock} disabled={inventoryLoading || !!error}
+            className="flex items-center gap-2 border border-[#E1AD01]/30 text-[#E1AD01] px-4 py-3 rounded-xl text-[9px] font-black uppercase disabled:opacity-40">
+            <Printer size={14} /> Imprimir Stock
           </button>
           <button onClick={() => setIsAdding(true)}
             className="bg-[#E1AD01] text-black px-6 py-3 rounded-xl font-black text-[10px]
@@ -615,6 +697,10 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
             <ArrowRightLeft className="h-4 w-4 text-[#E1AD01]" />
             Auditoría por Aeronave
           </h2>
+          <button type="button" onClick={printHistory} disabled={historyLoading || !!error}
+            className="flex items-center gap-2 border border-white/15 text-slate-300 px-4 py-2 rounded-xl text-[9px] uppercase font-bold disabled:opacity-40">
+            <Printer size={13} /> Imprimir histórico ({history.length})
+          </button>
           {historialPorAeronave.length > 0 && (
             <button
               onClick={() => {
@@ -629,7 +715,9 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
           )}
         </div>
 
-        {historialPorAeronave.length === 0 ? (
+        {historyLoading ? (
+          <div className="p-12 text-slate-400 flex items-center justify-center gap-3"><Loader2 className="animate-spin" size={16}/> Cargando histórico completo...</div>
+        ) : historialPorAeronave.length === 0 ? (
           <div className="p-20 text-center border-2 border-dashed border-white/5 rounded-[2rem]">
             <p className="text-slate-700 font-mono text-[10px] font-black uppercase tracking-[0.5em]">
               Esperando Transacciones...
@@ -637,7 +725,7 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
           </div>
         ) : (
           <div className="space-y-3">
-            {historialPorAeronave.map(([matricula, entries]) => {
+            {paginatedHistory.map(([matricula, entries]) => {
               const info      = getAeronaveInfo(matricula);
               const expanded  = expandedAircraft.has(matricula);
               const totalPiezas = entries.reduce((s, e) => s + e.quantity, 0);
@@ -719,7 +807,7 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
                             <span className="text-[7px] border border-green-500/20 bg-green-500/5
                                              px-2 py-0.5 rounded-full text-green-500 font-black
                                              uppercase tracking-widest">
-                              VERIFICADO
+                              REGISTRADO
                             </span>
                           </div>
                         </div>
@@ -729,6 +817,17 @@ export const InventoryCheckout: React.FC<InventoryCheckoutProps> = ({
                 </div>
               );
             })}
+          </div>
+        )}
+        {historialPorAeronave.length > HISTORY_GROUPS_PER_PAGE && (
+          <div className="flex items-center justify-between text-xs text-slate-400 p-3">
+            <span>Grupos: {historialPorAeronave.length} · Página {historyPage} de {historyPages}</span>
+            <div className="flex gap-2">
+              <button type="button" disabled={historyPage <= 1} onClick={() => setHistoryPage(p => Math.max(1,p-1))}
+                className="border border-white/10 p-2 rounded-lg disabled:opacity-30" aria-label="Anterior"><ChevronLeft size={15}/></button>
+              <button type="button" disabled={historyPage >= historyPages} onClick={() => setHistoryPage(p => Math.min(historyPages,p+1))}
+                className="border border-white/10 p-2 rounded-lg disabled:opacity-30" aria-label="Siguiente"><ChevronRight size={15}/></button>
+            </div>
           </div>
         )}
       </div>

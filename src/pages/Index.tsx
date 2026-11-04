@@ -1,5 +1,5 @@
 ﻿// src/pages/Index.tsx
-// VALKYRON OS v7.1 — CARGA NO BLOQUEANTE + RECUPERACIÓN DE SESIÓN
+// VALKYRON OS v7.2 — Archivo OMA + Stock completo + Impresión
 // FUSIÓN v6.1 + v7.0
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v7.1 (sobre v7.0):
@@ -45,7 +45,7 @@
 // REGLA DE ORO: CERO OMISIONES. SIEMPRE EVOLUCIÓN.
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import StatusBar from '@/components/StatusBar';
 import FleetDashboard from '@/components/FleetDashboard';
 import InventoryPanel from '@/components/InventoryPanel';
@@ -70,7 +70,7 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Plane, Package, LogOut, Wrench, ClipboardCheck,
   Truck, Home, Fuel, X, DollarSign, Menu, FileText, Award, CalendarDays,
-  CalendarCheck, AlertTriangle, Loader2, RefreshCw,
+  CalendarCheck, AlertTriangle, Loader2, RefreshCw, Archive, Printer,
 } from 'lucide-react';
 
 type TabKey =
@@ -177,6 +177,8 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
   const [isRegisterOpen,   setIsRegisterOpen]   = useState(false);
   const [reloadKey,        setReloadKey]        = useState(0);
   const navigate = useNavigate();
+  const location = useLocation();
+  const requestedTab = (location.state as { openTab?: unknown } | null)?.openTab;
   const {
     canPlan, role, profile, enriched, status, issue, retry, signOut, session,
   } = useAuth();
@@ -243,17 +245,31 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
   // Callback estable para módulos hijos (ControlHub, FleetDashboard)
   const refreshFleet = useCallback(() => syncFleet(), [syncFleet]);
 
+  // PostgREST impone límites por respuesta: lectura completa en lotes estables.
+  const readAllParts = useCallback(async (signal: AbortSignal) => {
+    const all: any[] = [];
+    const BATCH = 500;
+    const MAX = 100000;
+    for (let start = 0; start < MAX; start += BATCH) {
+      if (signal.aborted) throw new Error('Consulta cancelada');
+      const { data, error } = await supabase.from('inventario_repuestos')
+        .select('*').order('id', { ascending: true })
+        .range(start, start + BATCH - 1).abortSignal(signal);
+      if (error) throw error;
+      all.push(...(data ?? []));
+      if ((data ?? []).length < BATCH) return all;
+    }
+    throw new Error(`Inventario superior a ${MAX} filas; se requiere paginación en servidor.`);
+  }, []);
+
   // ── INVENTARIO ────────────────────────────────────────────────────────────
   const loadParts = useCallback(async (signal: AbortSignal) => {
     setPartsState({ status: 'loading', error: null });
     try {
-      const { data: spares, error } = await supabase
-        .from('inventario_repuestos')
-        .select('*')
-        .abortSignal(signal);
+      const spares = await readAllParts(signal);
       if (abortedByCleanup(signal)) return;
-      if (error || signal.aborted) {
-        setPartsState({ status: 'error', error: loadErrorMessage(signal, error?.message ?? 'Error', 'el inventario') });
+      if (signal.aborted) {
+        setPartsState({ status: 'error', error: 'Tiempo de espera agotado al consultar el inventario.' });
         return;
       }
       setPartsData((spares ?? []).map((p: any) => ({
@@ -263,7 +279,7 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
         quantity:   p.cantidad,
         minStock:   p.stock_minimo    || 0,
         unitPrice:  p.precio_unitario || 0,
-        location:   p.ubicacion       || 'LARA',
+        location:   p.ubicacion_hangar || p.ubicacion || 'LARA',
         category:   p.categoria       || 'General',
       })));
       setPartsState({ status: 'ready', error: null });
@@ -271,7 +287,7 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
       if (abortedByCleanup(signal)) return;
       setPartsState({ status: 'error', error: err instanceof Error ? err.message : 'Error de conexión' });
     }
-  }, []);
+  }, [readAllParts]);
 
   // ── PROVEEDORES ───────────────────────────────────────────────────────────
   const loadVendors = useCallback(async (signal: AbortSignal) => {
@@ -316,8 +332,18 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
     setAguilasFinance({ CASH: 0, ZELLE: 0, USDT: 0, BS: 0 });
     setIsRegisterOpen(false);
     const stored = readStoredTab(userId);
-    setActiveTab(stored ?? 'home');
+    setActiveTab(requestedTab === 'fleet' || requestedTab === 'inventory' ? requestedTab : stored ?? 'home');
   }, [userId, authReady]);
+
+  // Navegación desde los archivos históricos: abre la pestaña solicitada.
+  useEffect(() => {
+    if (!authReady) return;
+    if (requestedTab !== 'fleet' && requestedTab !== 'inventory') return;
+    const permitted = requestedTab === 'fleet' ? loadsFleet : loadsStock;
+    if (permitted) setActiveTab(requestedTab);
+    // Consumir state para que una recarga posterior no reproduzca la navegación.
+    navigate('/', { replace: true, state: null });
+  }, [authReady, requestedTab, loadsFleet, loadsStock, navigate]);
 
   // ── CARGA INICIAL (no bloqueante, cancelable, con límite de tiempo) ───────
   useEffect(() => {
@@ -364,6 +390,26 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
       void supabase.removeChannel(fleetChannel);
     };
   }, [loadsFleet, syncFleet]);
+
+  const printInventory = () => {
+    // Sólo el módulo de stock validado puede imprimir los datos cargados.
+    if (!role || !STOCK_DATA_ROLES.includes(role) || partsState.status !== 'ready') return;
+    const escape = (v: unknown) => String(v ?? '—')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const w = window.open('', '_blank', 'width=1200,height=900');
+    if (!w) { window.alert('Habilita las ventanas emergentes para imprimir.'); return; }
+    const rows = partsData.map(p => `<tr><td>${escape(p.partNumber)}</td><td>${escape(p.name)}</td><td>${escape(p.quantity)}</td><td>${escape(p.minStock)}</td><td>${escape(p.location)}</td><td>${escape(p.category)}</td><td>${escape(p.unitPrice)}</td></tr>`).join('');
+    w.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Águilas Pilot — Inventario</title><style>
+      @page{size:A4 landscape;margin:12mm}body{font-family:Arial,sans-serif;padding:18px;color:#111}
+      h1{font-size:20px;border-bottom:3px solid #d6a900;padding-bottom:12px}p{font-size:10px;color:#666}
+      table{width:100%;border-collapse:collapse;font-size:9px}td,th{border:1px solid #bbb;padding:6px;text-align:left;overflow-wrap:anywhere}
+      th{background:#eee}thead{display:table-header-group}tr{break-inside:avoid}</style></head><body>
+      <h1>ÁGUILAS PILOT — INVENTARIO GENERAL</h1><p>Fecha: ${escape(new Date().toLocaleString('es-VE'))} · Referencias: ${partsData.length}</p>
+      <p>Existencias registradas en Supabase. Requieren conciliación física para certificar inventario.</p>
+      <table><thead><tr><th>P/N</th><th>Descripción</th><th>Cantidad</th><th>Mínimo</th><th>Ubicación</th><th>Categoría</th><th>Precio unitario</th></tr></thead><tbody>${rows}</tbody></table></body></html>`);
+    w.document.close(); w.focus(); w.print();
+  };
 
   const retryData = () => setReloadKey(k => k + 1);
 
@@ -658,6 +704,15 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
             <CaptainDashboard userProfile={userProfile} />
           )}
 
+          {safeTab === 'fleet' && isVisible('fleet') && role && ['CEO','ADMIN','DIRECTOR','MECANICO','OPERACIONES'].includes(role) && (
+            <div className="mb-4 flex justify-end">
+              <button type="button" onClick={() => navigate('/aircraft-archive')}
+                className="flex gap-2 items-center rounded-xl border border-[#E1AD01]/30 bg-[#E1AD01]/10 px-5 py-3 text-[#E1AD01] text-[10px] font-black uppercase">
+                <Archive size={15}/> Archivo Histórico OMA
+              </button>
+            </div>
+          )}
+
           {safeTab === 'fleet' && isVisible('fleet') && guard(
             [{ state: fleetState, recurso: 'la flota' }],
             fleetData.length > 0,
@@ -666,6 +721,21 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
               setFleetData={setFleetData}
               onFleetChange={refreshFleet}
             />,
+          )}
+
+          {safeTab === 'inventory' && isVisible('inventory') && (
+            <div className="mb-4 flex flex-wrap justify-end gap-2">
+              <button type="button" disabled={partsState.status !== 'ready'} onClick={printInventory}
+                className="flex gap-2 items-center rounded-xl border border-white/15 px-5 py-3 text-slate-300 text-[10px] font-black uppercase disabled:opacity-40">
+                <Printer size={15}/> Imprimir Inventario Completo
+              </button>
+              {role && ['CEO','MECANICO','OPERACIONES'].includes(role) && (
+                <button type="button" onClick={() => navigate('/inventory-archive')}
+                  className="flex gap-2 items-center rounded-xl border border-[#E1AD01]/30 bg-[#E1AD01]/10 px-5 py-3 text-[#E1AD01] text-[10px] font-black uppercase">
+                  <Archive size={15}/> Archivo de Inventario
+                </button>
+              )}
+            </div>
           )}
 
           {safeTab === 'inventory' && isVisible('inventory') && guard(

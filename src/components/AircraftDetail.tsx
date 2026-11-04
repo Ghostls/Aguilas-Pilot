@@ -8,9 +8,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import type { Aircraft } from '../Types/Maintenance';
+import AircraftArchive from './AircraftArchive';
 import {
   ArrowLeft, Plane, Wrench, Loader2, AlertTriangle, Clock, Cpu, HardDrive, Signal,
-  Save, AlertCircle, CheckCircle2, History, X, Printer, ShieldCheck, RefreshCw, type LucideIcon,
+  Save, AlertCircle, CheckCircle2, History, X, Printer, ShieldCheck, RefreshCw, PackagePlus, PackageCheck, Square, type LucideIcon,
 } from 'lucide-react';
 
 interface AircraftDetailProps {
@@ -25,6 +26,17 @@ type OrderRecord = {
   nombre_mecanico: string;
   estado: string;
   observaciones: string;
+  created_at: string;
+};
+type PartRequirement = {
+  id: string;
+  orden_id: string;
+  numero_parte: string;
+  descripcion: string;
+  cantidad: number;
+  recibido: boolean;
+  recibido_at: string | null;
+  recibido_por: string | null;
   created_at: string;
 };
 type FleetRecord = {
@@ -55,6 +67,12 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
   const [successMsg, setSuccessMsg] = useState(false);
   const [isCompleteOpen, setIsCompleteOpen] = useState(false);
   const [isReleaseOpen, setIsReleaseOpen] = useState(false);
+  const [isArchiveOpen, setIsArchiveOpen] = useState(false);
+  const [requiredParts, setRequiredParts] = useState<PartRequirement[]>([]);
+  const [partsLoading, setPartsLoading] = useState(false);
+  const [partsSaving, setPartsSaving] = useState(false);
+  const [partsError, setPartsError] = useState<string | null>(null);
+  const [partDraft, setPartDraft] = useState({ numero_parte: '', descripcion: '', cantidad: '1' });
   const [releaseForm, setReleaseForm] = useState({ referencia: '', observaciones: '' });
   const [completeForm, setCompleteForm] = useState({
     observacionesFinales: '', horasActuales: '', mecanicoCierre: '',
@@ -98,6 +116,89 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
   }, [aircraft.id, matricula]);
 
   useEffect(() => { void fetchLatestOrder(); }, [fetchLatestOrder]);
+
+  // El checklist pertenece a la orden de trabajo, NO a la matrícula.
+  // Recibido no equivale a instalado, inspeccionado ni liberado al servicio.
+  const loadRequiredParts = useCallback(async (orderId: string) => {
+    setPartsLoading(true);
+    setPartsError(null);
+    try {
+      const { data, error } = await supabase
+        .from('oma_repuestos_requeridos')
+        .select('id, orden_id, numero_parte, descripcion, cantidad, recibido, recibido_at, recibido_por, created_at')
+        .eq('orden_id', orderId)
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+      setRequiredParts((data ?? []) as PartRequirement[]);
+    } catch (err: unknown) {
+      setRequiredParts([]);
+      setPartsError(err instanceof Error ? err.message : 'No se pudo cargar la lista de repuestos.');
+    } finally {
+      setPartsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setRequiredParts([]);
+    setPartsError(null);
+    if (orderRecord?.id) void loadRequiredParts(orderRecord.id);
+  }, [orderRecord?.id, loadRequiredParts]);
+
+  const addRequiredPart = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!orderRecord || partsSaving) return;
+    const partNumber = partDraft.numero_parte.trim().toUpperCase();
+    const description = partDraft.descripcion.trim();
+    const quantity = Number(partDraft.cantidad);
+    if (!partNumber || !description || !Number.isSafeInteger(quantity) || quantity <= 0) {
+      setPartsError('Indica número de parte, descripción y una cantidad entera mayor que cero.');
+      return;
+    }
+    setPartsSaving(true);
+    setPartsError(null);
+    try {
+      const { error } = await supabase.from('oma_repuestos_requeridos').insert({
+        orden_id: orderRecord.id,
+        numero_parte: partNumber,
+        descripcion: description,
+        cantidad: quantity,
+      });
+      if (error) throw error;
+      setPartDraft({ numero_parte: '', descripcion: '', cantidad: '1' });
+      await loadRequiredParts(orderRecord.id);
+    } catch (err: unknown) {
+      setPartsError(err instanceof Error ? err.message : 'No se pudo agregar el repuesto.');
+    } finally {
+      setPartsSaving(false);
+    }
+  };
+
+  const togglePartReceived = async (part: PartRequirement) => {
+    if (!orderRecord || partsSaving || partsLoading) return;
+    setPartsSaving(true);
+    setPartsError(null);
+    try {
+      // La identidad real del usuario y la auditoría se registran en PostgreSQL.
+      const { data, error } = await supabase
+        .from('oma_repuestos_requeridos')
+        .update({ recibido: !part.recibido })
+        .eq('id', part.id)
+        .eq('orden_id', orderRecord.id)
+        .eq('recibido', part.recibido)
+        .select('id');
+      if (error) throw error;
+      if (!data?.length) throw new Error('El repuesto fue actualizado por otra sesión. Recarga la lista.');
+      await loadRequiredParts(orderRecord.id);
+    } catch (err: unknown) {
+      setPartsError(err instanceof Error ? err.message : 'No se pudo actualizar el checklist.');
+      await loadRequiredParts(orderRecord.id);
+    } finally {
+      setPartsSaving(false);
+    }
+  };
+
+  const pendingParts = requiredParts.filter(part => !part.recibido);
+
   useEffect(() => {
     if (!isCompleteOpen || !orderRecord) return;
     setCompleteForm(prev => ({
@@ -135,6 +236,11 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
     }
     if (!completeForm.observacionesFinales.trim() || !completeForm.mecanicoCierre.trim()) {
       setErrorMsg('Mecánico y observaciones finales son obligatorios.'); return;
+    }
+    // Barrera visual de consistencia; la restricción definitiva debe vivir en el RPC.
+    if (partsLoading || partsError || pendingParts.length) {
+      setErrorMsg('No es posible cerrar desde esta pantalla mientras exista una lista de repuestos pendiente o sin verificar.');
+      return;
     }
     setIsSaving(true); setErrorMsg(null);
     try {
@@ -1147,9 +1253,9 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
         <div className="flex flex-wrap gap-2 items-center">
           <button type="button" onClick={() => void fetchLatestOrder()} disabled={isFetching || isSaving}
             className={`${btnCls} border border-white/15 hover:bg-white/10`}><RefreshCw size={14}/> Actualizar</button>
-          {onOpenHistorial && <button type="button" onClick={() => onOpenHistorial(aircraft)}
+          <button type="button" onClick={() => onOpenHistorial ? onOpenHistorial(aircraft) : setIsArchiveOpen(true)}
             className={`${btnCls} bg-[#E1AD01]/10 border border-[#E1AD01]/30 text-[#E1AD01] hover:bg-[#E1AD01] hover:text-black`}>
-            <History size={14}/> Ver Historial</button>}
+            <History size={14}/> Expediente histórico OMA</button>
           <button type="button" onClick={() => void handlePrintHistory()}
             className={`${btnCls} bg-white/[0.04] border border-white/15 hover:bg-white hover:text-black`}>
             <Printer size={14}/> Imprimir Historial</button>
@@ -1228,7 +1334,7 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
                 <button type="submit" disabled={isSaving} className={`${btnCls} flex-1 bg-[#E1AD01] text-black hover:bg-white`}>
                   {isSaving ? <Loader2 className="animate-spin" size={14}/> : <Save size={14}/>} Guardar progreso
                 </button>
-                <button type="button" onClick={() => setIsCompleteOpen(true)} disabled={isSaving}
+                <button type="button" onClick={() => setIsCompleteOpen(true)} disabled={isSaving || partsLoading || !!partsError || pendingParts.length > 0}
                   className={`${btnCls} flex-1 bg-emerald-500 text-black hover:bg-emerald-400`}>
                   <CheckCircle2 size={14}/> Completar Orden
                 </button>
@@ -1241,6 +1347,85 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
               className={`${btnCls} bg-emerald-500 text-black hover:bg-emerald-400`}><ShieldCheck size={14}/> Registrar liberación autorizada</button>
           </div>}
       </section>}
+
+      {isArchiveOpen && <div className="fixed inset-0 z-[80] bg-black/95 overflow-y-auto" role="dialog" aria-modal="true" aria-label="Expediente histórico OMA">
+        <div className="mx-auto max-w-6xl py-8 px-4">
+          <div className="flex justify-end"><button type="button" className={`${btnCls} border border-white/20`} onClick={() => setIsArchiveOpen(false)}><X size={16}/> Cerrar expediente</button></div>
+          <AircraftArchive initialMatricula={matricula} onBack={() => setIsArchiveOpen(false)}/>
+        </div>
+      </div>}
+
+      {/* Checklist persistente de materiales requeridos en la OT activa */}
+      {orderRecord && (
+        <section className="rounded-3xl border border-[#E1AD01]/25 bg-[#0a0a0a] p-6 md:p-8 space-y-5 shadow-xl">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="flex items-center gap-2 text-[11px] font-black uppercase tracking-widest text-[#E1AD01]">
+                <PackageCheck size={17} /> Checklist de repuestos requeridos
+              </h3>
+              <p className="mt-2 text-xs text-slate-400">Orden {orderRecord.id.slice(0, 8)} · {matricula}</p>
+              <p className="mt-1 text-[10px] text-slate-500">
+                Marcar recibido confirma disponibilidad documental; no registra instalación ni descuenta stock.
+              </p>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-black px-4 py-3 text-right text-xs">
+              <strong className={pendingParts.length ? 'text-amber-400' : 'text-emerald-400'}>
+                {requiredParts.length - pendingParts.length}/{requiredParts.length}
+              </strong>
+              <span className="ml-2 text-slate-500">recibidos</span>
+            </div>
+          </div>
+          {partsError && <div role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">{partsError}</div>}
+          {partsLoading ? (
+            <p className="flex items-center gap-2 text-xs text-slate-400"><Loader2 size={15} className="animate-spin" /> Cargando materiales...</p>
+          ) : requiredParts.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-white/10 p-4 text-xs text-slate-500">Sin repuestos requeridos registrados para esta orden.</p>
+          ) : (
+            <div className="space-y-2">
+              {requiredParts.map(part => (
+                <label key={part.id} className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4 cursor-pointer">
+                  <input type="checkbox" checked={part.recibido} disabled={partsSaving || partsLoading}
+                    onChange={() => void togglePartReceived(part)}
+                    className="mt-1 h-4 w-4 accent-[#E1AD01]" />
+                  <div className="min-w-0 flex-1">
+                    <p className={part.recibido ? 'text-xs font-bold text-emerald-400' : 'text-xs font-bold text-white'}>
+                      {part.numero_parte} · {part.descripcion}
+                    </p>
+                    <p className="mt-1 text-[10px] text-slate-500">Cantidad requerida: {part.cantidad} · {part.recibido ? 'RECIBIDO' : 'PENDIENTE'}</p>
+                    {part.recibido_at && <p className="mt-1 text-[9px] text-slate-600">Actualizado: {formatDate(part.recibido_at)}</p>}
+                  </div>
+                  {part.recibido ? <CheckCircle2 size={17} className="text-emerald-400" /> : <Square size={17} className="text-amber-400" />}
+                </label>
+              ))}
+            </div>
+          )}
+          <form onSubmit={addRequiredPart} className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_2fr_100px_auto] md:items-end">
+            <div>
+              <label className="mb-2 block text-[9px] font-black uppercase text-slate-500">Número de parte</label>
+              <input required maxLength={100} className={inputCls} placeholder="P/N" value={partDraft.numero_parte}
+                onChange={event => setPartDraft(prev => ({ ...prev, numero_parte: event.target.value }))} />
+            </div>
+            <div>
+              <label className="mb-2 block text-[9px] font-black uppercase text-slate-500">Descripción</label>
+              <input required maxLength={300} className={inputCls} placeholder="Repuesto requerido" value={partDraft.descripcion}
+                onChange={event => setPartDraft(prev => ({ ...prev, descripcion: event.target.value }))} />
+            </div>
+            <div>
+              <label className="mb-2 block text-[9px] font-black uppercase text-slate-500">Cantidad</label>
+              <input required min="1" step="1" type="number" className={inputCls} value={partDraft.cantidad}
+                onChange={event => setPartDraft(prev => ({ ...prev, cantidad: event.target.value }))} />
+            </div>
+            <button type="submit" disabled={partsSaving || partsLoading}
+              className={`${btnCls} bg-[#E1AD01] text-black hover:bg-white`}>
+              {partsSaving ? <Loader2 size={14} className="animate-spin"/> : <PackagePlus size={14}/>} Agregar
+            </button>
+          </form>
+          <button type="button" onClick={() => void loadRequiredParts(orderRecord.id)} disabled={partsSaving || partsLoading}
+            className="text-[10px] uppercase text-slate-500 hover:text-[#E1AD01] flex gap-2 items-center">
+            <RefreshCw size={13}/> Actualizar checklist
+          </button>
+        </section>
+      )}
 
       {/* Modal de cierre: no libera automáticamente la aeronave */}
       {isCompleteOpen && orderRecord && <div className="fixed inset-0 z-[90] bg-black/95 flex items-center justify-center p-4 overflow-y-auto">

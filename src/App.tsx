@@ -106,6 +106,8 @@ function lazyWithRetry<T extends React.ComponentType<any>>(
 // Módulos pesados bajo demanda (rutas con mayúsculas EXACTAS del disco)
 const ControlHub = lazyWithRetry(() =>
   import("./components/ControlHub").then(m => ({ default: m.ControlHub })), 'ControlHub');
+const AircraftArchive = lazyWithRetry(() => import('./components/AircraftArchive'), 'AircraftArchive');
+const InventoryArchive = lazyWithRetry(() => import('./components/InventoryArchive'), 'InventoryArchive');
 const InventoryCheckout = lazyWithRetry(() =>
   import("./components/InventoryCheckout").then(m => ({ default: m.InventoryCheckout })), 'InventoryCheckout');
 const FlightRegister = lazyWithRetry(() => import("./components/flights/FlightRegister"), 'FlightRegister');
@@ -119,9 +121,11 @@ const queryClient = new QueryClient({
 
 // ─── MATRIZ DE ACCESO POR RUTA (coherente con los tabs de Index) ─────────────
 
-const ROUTE_ROLES: Record<'controlHub' | 'inventoryCheckout' | 'flightRegister', UserRole[]> = {
+const ROUTE_ROLES: Record<'controlHub' | 'inventoryCheckout' | 'inventoryArchive' | 'aircraftArchive' | 'flightRegister', UserRole[]> = {
   controlHub:        ['CEO', 'MECANICO', 'OPERACIONES'],
   inventoryCheckout: ['CEO', 'MECANICO', 'OPERACIONES'],
+  inventoryArchive: ['CEO', 'MECANICO', 'OPERACIONES'],
+  aircraftArchive: ['CEO', 'ADMIN', 'DIRECTOR', 'MECANICO', 'OPERACIONES'],
   flightRegister:    ['CEO', 'ADMIN', 'DIRECTOR', 'PILOTO', 'CAPITAN'],
 };
 
@@ -406,6 +410,22 @@ const AppRoutes = () => {
           element={
             <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryCheckout} modulo="Inventario">
               <InventoryCheckout />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/aircraft-archive"
+          element={
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.aircraftArchive} modulo="Archivo Histórico OMA">
+              <AircraftArchive />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/inventory-archive"
+          element={
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryArchive} modulo="Archivo de Inventario">
+              <InventoryArchive />
             </ProtectedRoute>
           }
         />

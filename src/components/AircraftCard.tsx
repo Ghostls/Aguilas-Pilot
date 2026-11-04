@@ -1,4 +1,3 @@
-
 // src/components/AircraftCard.tsx
 // VALKYRON OS v1.2 — FUSIÓN COMPLETA
 //
@@ -31,6 +30,7 @@ import {
   CheckCircle,
   AlertTriangle,
   Shield,
+  History,
 } from 'lucide-react';
 
 import type { Aircraft } from '@/Types/Maintenance';
@@ -44,6 +44,7 @@ import FatigueBar from './FatigueBar';
 interface AircraftCardProps {
   aircraft: Aircraft;
   onSelect: (aircraft: Aircraft) => void;
+  onOpenHistorial?: (aircraft: Aircraft) => void;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -149,6 +150,7 @@ const mapStatusToKey = (
 const AircraftCard: React.FC<AircraftCardProps> = ({
   aircraft,
   onSelect,
+  onOpenHistorial,
 }) => {
   // Estado normalizado de la aeronave.
   const statusKey = mapStatusToKey(
@@ -181,6 +183,8 @@ const AircraftCard: React.FC<AircraftCardProps> = ({
         text-left
       "
       onClick={() => onSelect(aircraft)}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(aircraft); } }}
+      role="button" tabIndex={0} aria-label={`Ver aeronave ${aircraft.tailNumber}`}
     >
       {/* ─────────────────────────────────────────────── */}
       {/* ENCABEZADO Y ESTADO                         */}
@@ -419,7 +423,12 @@ const AircraftCard: React.FC<AircraftCardProps> = ({
           )}
 
         </div>
-
+        {onOpenHistorial && (
+          <button type="button" onClick={event => { event.stopPropagation(); onOpenHistorial(aircraft); }}
+            className="w-full flex items-center justify-center gap-2 rounded-xl border border-[#E1AD01]/30 bg-[#E1AD01]/10 px-4 py-3 text-[10px] uppercase font-black tracking-widest text-[#E1AD01] hover:bg-[#E1AD01] hover:text-black transition-colors">
+            <History size={14}/> Expediente histórico OMA
+          </button>
+        )}
       </div>
     </div>
   );

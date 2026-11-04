@@ -1,18 +1,18 @@
 // src/components/InventoryPanel.tsx
-// VALKYRON OS v2.1 — Almacenes por Sede
+// VALKYRON OS v2.4 — Inventario completo, paginación, impresión y sincronización
 // CAMBIO v2.1:
 //   - Filtro jerárquico: Sede (Lara / Maturín) → Almacén (OMA / OPERACIONES)
 //   - HangarLocation: 'Lara-OMA' | 'Lara-OPERACIONES' | 'Maturín-OMA' | 'Maturín-OPERACIONES'
 //   - Selects de ubicación muestran sede + almacén agrupados con <optgroup>
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { SparePart, Vendor, HangarLocation } from '../Types/Maintenance';
 import { supabase } from '../lib/supabaseClient';
 import {
   Package, ArrowDownCircle, ArrowUpCircle, ScanLine, Plus,
   X, MapPin, ClipboardList, ShieldCheck, Loader2, Pencil, Trash2,
   Box, AlertCircle, Search, FileText, CheckCircle2, Clock, XCircle,
-  RefreshCw, Warehouse,
+  RefreshCw, Warehouse, Printer, Download, ChevronLeft, ChevronRight,
 } from 'lucide-react';
 
 // ── Tipos ─────────────────────────────────────────────────────────────────────
@@ -61,10 +61,18 @@ type LocationFilter = 'all' | Sede | HangarLocation;
 
 function matchesFilter(partLocation: HangarLocation, filter: LocationFilter): boolean {
   if (filter === 'all') return true;
-  if (filter === 'Lara')    return partLocation.startsWith('Lara');
-  if (filter === 'Maturín') return partLocation.startsWith('Maturín');
+  if (filter === 'Lara') return String(partLocation ?? '').toLowerCase().startsWith('lara');
+  if (filter === 'Maturín') return String(partLocation ?? '').toLowerCase().startsWith('matur');
   return partLocation === filter;
 }
+
+// Lecturas por lotes: no depender de max_rows (normalmente 1000) de PostgREST.
+const FETCH_BATCH = 500;
+const PAGE_SIZES = [25, 50, 100] as const;
+const escapeHtml = (value: unknown) => String(value ?? '—')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+const csvCell = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`;
 
 // ── Helpers CSS ────────────────────────────────────────────────────────────────
 
@@ -139,6 +147,59 @@ export const InventoryPanel = ({
   const [locationFilter, setLocationFilter] = useState<LocationFilter>('all');
   const [searchQuery, setSearchQuery]     = useState('');
   const [loading, setLoading]             = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(25);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [lastSynced, setLastSynced] = useState<Date | null>(null);
+  const fetchVersion = useRef(0);
+
+  // Lee todos los repuestos visibles para el usuario y SOLO reemplaza el estado
+  // después de completar todos los lotes; evita mostrar inventarios parciales.
+  const refreshAllParts = useCallback(async () => {
+    const version = ++fetchVersion.current;
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      const all: SparePart[] = [];
+      for (let from = 0; ; from += FETCH_BATCH) {
+        const { data, error } = await supabase.from('inventario_repuestos')
+          .select('id,numero_parte,nombre,cantidad,stock_minimo,ubicacion_hangar,precio_unitario,certificado_numero')
+          .order('id', { ascending: true })
+          .range(from, from + FETCH_BATCH - 1);
+        if (error) throw error;
+        if (version !== fetchVersion.current) return;
+        const batch = data ?? [];
+        all.push(...batch.map((p: any) => ({
+          id: p.id,
+          partNumber: p.numero_parte ?? '',
+          name: p.nombre ?? '',
+          quantity: Number(p.cantidad ?? 0),
+          minStock: Number(p.stock_minimo ?? 0),
+          unitPrice: Number(p.precio_unitario ?? 0),
+          location: (p.ubicacion_hangar ?? 'Lara-OMA') as HangarLocation,
+          category: 'Repuestos',
+          certificateNumber: p.certificado_numero ?? '',
+        })));
+        if (batch.length < FETCH_BATCH) break;
+      }
+      if (version !== fetchVersion.current) return;
+      setParts(all);
+      setLastSynced(new Date());
+    } catch (err: unknown) {
+      if (version === fetchVersion.current) {
+        setSyncError(err instanceof Error ? err.message : 'No se pudo sincronizar el inventario.');
+      }
+    } finally {
+      if (version === fetchVersion.current) setSyncing(false);
+    }
+  }, [setParts]);
+
+  useEffect(() => {
+    void refreshAllParts();
+    return () => { fetchVersion.current += 1; };
+  }, [refreshAllParts]);
+
 
   // ── Modales ────────────────────────────────────────────────────────────────
   const [isAddOpen, setIsAddOpen]         = useState(false);
@@ -173,21 +234,63 @@ export const InventoryPanel = ({
     if (searchQuery.trim()) {
       const q = searchQuery.toUpperCase().trim();
       list = list.filter(p =>
-        p.name.toUpperCase().includes(q) || p.partNumber.toUpperCase().includes(q)
+        String(p.name ?? '').toUpperCase().includes(q) || String(p.partNumber ?? '').toUpperCase().includes(q)
       );
     }
-    return list;
+    return [...list].sort((a, b) =>
+      String(a.name).localeCompare(String(b.name), 'es', { sensitivity: 'base' }) ||
+      String(a.partNumber).localeCompare(String(b.partNumber), 'es', { sensitivity: 'base' })
+    );
   }, [parts, locationFilter, searchQuery]);
 
-  const filteredTransactions = parts
-    .filter(p => matchesFilter(p.location, locationFilter))
-    .flatMap(p => transactions.filter(t => t.location === p.location));
+  const totalPages = Math.max(1, Math.ceil(filteredParts.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const visibleParts = useMemo(() => filteredParts.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [filteredParts, safePage, pageSize]);
+  useEffect(() => { setPage(1); }, [searchQuery, locationFilter, pageSize]);
+  const lowStockCount = filteredParts.filter(p => Number(p.quantity) > 0 && Number(p.quantity) <= Number(p.minStock ?? 5)).length;
+  const zeroStockCount = filteredParts.filter(p => Number(p.quantity) <= 0).length;
+  const totalUnits = filteredParts.reduce((sum, p) => sum + Number(p.quantity || 0), 0);
+  const inventoryValue = filteredParts.reduce((sum, p) => sum + Number(p.quantity || 0) * Number(p.unitPrice || 0), 0);
+
+  const printParts = () => {
+    if (syncing || syncError) return;
+    const win = window.open('', '_blank', 'width=1100,height=850');
+    if (!win) { alert('Permite ventanas emergentes para imprimir.'); return; }
+    const rows = filteredParts.map((part, i) => `<tr><td>${i + 1}</td><td>${escapeHtml(part.partNumber)}</td><td>${escapeHtml(part.name)}</td><td>${escapeHtml(part.location)}</td><td style="text-align:right">${Number(part.quantity)}</td><td style="text-align:right">${Number(part.minStock || 0)}</td><td style="text-align:right">${Number(part.unitPrice || 0).toFixed(2)}</td></tr>`).join('');
+    win.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Existencias OMA</title><style>
+      body{font:12px Arial,sans-serif;color:#111;margin:24px}h1{margin:0}p{color:#555}
+      table{width:100%;border-collapse:collapse;margin-top:20px}td,th{border:1px solid #ccc;padding:7px;text-align:left}
+      th{background:#f3f3f3}tr{break-inside:avoid}@page{size:A4 landscape;margin:12mm}
+      </style></head><body><h1>ÁGUILAS PILOT · INVENTARIO</h1>
+      <p>Generado: ${escapeHtml(new Date().toLocaleString('es-VE'))} · Filtro: ${escapeHtml(locationFilter)} · Registros: ${filteredParts.length}</p>
+      <p>Unidades: ${totalUnits} · Valor estimado: $${inventoryValue.toFixed(2)} · Documento de consulta, no certificado aeronáutico.</p>
+      <table><thead><tr><th>#</th><th>P/N</th><th>Descripción</th><th>Almacén</th><th>Cantidad</th><th>Mínimo</th><th>Costo USD</th></tr></thead><tbody>${rows}</tbody></table></body></html>`);
+    win.document.close();
+    win.focus();
+    win.print();
+  };
+
+  const exportCsv = () => {
+    if (syncing || syncError) return;
+    const header = ['P/N', 'Descripción', 'Almacén', 'Stock', 'Stock mínimo', 'Costo unitario USD'];
+    const lines = [header, ...filteredParts.map(p => [p.partNumber, p.name, p.location, p.quantity, p.minStock, p.unitPrice])]
+      .map(row => row.map(csvCell).join(';')).join('\r\n');
+    const blob = new Blob(['\uFEFF', lines], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `inventario_aguilas_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const filteredTransactions = transactions.filter(t => locationFilter === 'all' || matchesFilter(String(t.location ?? '') as HangarLocation, locationFilter));
 
   // Conteo por sede y almacén para el filtro
   const counts = useMemo(() => {
     const c: Record<string, number> = { all: parts.length };
     SEDES.forEach(sede => {
-      c[sede] = parts.filter(p => p.location.startsWith(sede)).length;
+      c[sede] = parts.filter(p => String(p.location ?? '').toLowerCase().startsWith(sede.toLowerCase().slice(0, 4))).length;
       ALMACENES[sede].forEach(alm => {
         c[alm] = parts.filter(p => p.location === alm).length;
       });
@@ -200,7 +303,7 @@ export const InventoryPanel = ({
   const handleScanSearch = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const found = parts.find(p =>
-      p.partNumber.toUpperCase().trim() === scanInput.toUpperCase().trim()
+      String(p.partNumber ?? '').toUpperCase().trim() === scanInput.toUpperCase().trim()
     );
     setScanResult(found || 'NOT_FOUND');
   };
@@ -241,6 +344,7 @@ export const InventoryPanel = ({
       }]);
       setIsAddOpen(false);
       setNewPart({ ...EMPTY_FORM });
+      void refreshAllParts();
     }
     setLoading(false);
   };
@@ -299,6 +403,7 @@ export const InventoryPanel = ({
       ));
       setIsEditOpen(false);
       setTargetPart(null);
+      void refreshAllParts();
     }
     setLoading(false);
   };
@@ -315,6 +420,7 @@ export const InventoryPanel = ({
     else {
       setParts(prev => prev.filter(p => p.id !== targetPart.id));
       setIsDeleteOpen(false); setTargetPart(null);
+      void refreshAllParts();
     }
     setLoading(false);
   };
@@ -360,7 +466,7 @@ export const InventoryPanel = ({
     setReqForm({
       part_number: part.partNumber, part_name: part.name,
       cantidad_solicitada: 1,
-      justificacion: `Stock agotado (0 unidades) en ${ALMACEN_LABEL[part.location]}. Reposición urgente.`,
+      justificacion: `Stock agotado (0 unidades) en ${ALMACEN_LABEL[part.location] ?? part.location}. Reposición urgente.`,
       solicitante: '',
     });
     setIsReqOpen(true);
@@ -399,12 +505,34 @@ export const InventoryPanel = ({
               Almacenes
             </span>
           </div>
-          <button onClick={() => setIsAddOpen(true)}
-            className="bg-[#E1AD01] text-black px-6 py-2.5 rounded-xl font-black text-[10px]
-                       uppercase tracking-widest hover:bg-white transition-all flex items-center gap-2">
-            <Plus className="h-4 w-4" /> Ingreso Certificado
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={() => void refreshAllParts()} disabled={syncing}
+              className="inline-flex items-center gap-2 px-3 py-2.5 rounded-xl border border-white/10 text-slate-300 text-[9px] font-bold uppercase disabled:opacity-40">
+              <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} /> Actualizar
+            </button>
+            <button type="button" onClick={printParts} disabled={syncing || !!syncError}
+              className="inline-flex items-center gap-2 px-3 py-2.5 rounded-xl border border-white/10 text-slate-300 text-[9px] font-bold uppercase disabled:opacity-40">
+              <Printer size={14} /> Imprimir todo
+            </button>
+            <button type="button" onClick={exportCsv} disabled={syncing || !!syncError}
+              className="inline-flex items-center gap-2 px-3 py-2.5 rounded-xl border border-white/10 text-slate-300 text-[9px] font-bold uppercase disabled:opacity-40">
+              <Download size={14} /> CSV
+            </button>
+            <button onClick={() => setIsAddOpen(true)}
+              className="bg-[#E1AD01] text-black px-4 py-2.5 rounded-xl font-black text-[10px]
+                         uppercase tracking-widest hover:bg-white transition-all flex items-center gap-2">
+              <Plus className="h-4 w-4" /> Ingreso Certificado
+            </button>
+          </div>
         </div>
+
+        {syncError && <div role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">
+          Error sincronizando: {syncError}. Los datos previos pueden estar desactualizados; reintenta antes de imprimir.
+        </div>}
+        <p className="text-[9px] text-slate-500 font-mono">
+          {syncing ? 'Consultando todas las páginas de Supabase…' : `${parts.length} registros cargados`}
+          {lastSynced ? ` · Actualizado ${lastSynced.toLocaleTimeString('es-VE')}` : ''}
+        </p>
 
         {/* Filtro jerárquico: Ver Todo → Sede → Almacén */}
         <div className="flex flex-wrap gap-2">
@@ -517,8 +645,28 @@ export const InventoryPanel = ({
               )}
             </div>
 
-            <div className="bg-[#0a0a0a] rounded-3xl border border-white/10 overflow-hidden shadow-2xl">
-              <table className="w-full text-left font-mono">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              {[
+                ['Repuestos filtrados', filteredParts.length.toLocaleString('es-VE')],
+                ['Unidades totales', totalUnits.toLocaleString('es-VE')],
+                ['Agotados / Bajo mínimo', `${zeroStockCount} / ${lowStockCount}`],
+                ['Valor estimado USD', `$${inventoryValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`],
+              ].map(([label, value]) => <div key={label} className="bg-[#0b0b0b] border border-white/10 rounded-xl p-4">
+                <p className="text-[9px] uppercase text-slate-500 font-black">{label}</p>
+                <p className="text-lg text-[#E1AD01] font-black mt-1">{value}</p>
+              </div>)}
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 text-[10px] text-slate-400">
+              <span>Mostrando {filteredParts.length ? (safePage - 1) * pageSize + 1 : 0}–{Math.min(safePage * pageSize, filteredParts.length)} de {filteredParts.length} repuestos</span>
+              <label className="flex items-center gap-2">Filas por página
+                <select aria-label="Filas por página" value={pageSize} onChange={e => setPageSize(Number(e.target.value))}
+                  className="bg-black border border-white/10 rounded-lg px-3 py-2 text-white">
+                  {PAGE_SIZES.map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </label>
+            </div>
+            <div className="bg-[#0a0a0a] rounded-3xl border border-white/10 overflow-x-auto shadow-2xl">
+              <table className="w-full min-w-[760px] text-left font-mono">
                 <thead>
                   <tr className="text-[9px] uppercase tracking-[0.3em] text-slate-500 font-black
                                  bg-white/5 border-b border-white/10">
@@ -530,7 +678,7 @@ export const InventoryPanel = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5 text-xs">
-                  {filteredParts.map(part => {
+                  {visibleParts.map(part => {
                     const isZero = part.quantity === 0;
                     const isLow  = !isZero && part.quantity <= (part.minStock || 5);
                     return (
@@ -551,10 +699,10 @@ export const InventoryPanel = ({
                           {isZero && <span className="block text-[7px] text-red-500/70 font-black uppercase tracking-widest mt-0.5">AGOTADO</span>}
                           {isLow  && <span className="block text-[7px] text-orange-400/70 font-black uppercase tracking-widest mt-0.5">BAJO MIN</span>}
                         </td>
-                        <td className="p-5 text-white font-black">${part.unitPrice.toFixed(2)}</td>
+                        <td className="p-5 text-white font-black">${Number(part.unitPrice || 0).toFixed(2)}</td>
                         <td className="p-5">
                           <span className="text-[9px] font-black uppercase text-white/50 block">
-                            {ALMACEN_LABEL[part.location]}
+                            {ALMACEN_LABEL[part.location] ?? part.location}
                           </span>
                         </td>
                         <td className="p-5">
@@ -594,6 +742,15 @@ export const InventoryPanel = ({
                   )}
                 </tbody>
               </table>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-[#0a0a0a] p-3">
+              <span className="text-[9px] font-mono text-slate-500">Página {safePage} de {totalPages}</span>
+              <div className="flex items-center gap-2">
+                <button type="button" disabled={safePage <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}
+                  className="rounded-lg border border-white/10 p-2 disabled:opacity-30" aria-label="Página anterior"><ChevronLeft size={16}/></button>
+                <button type="button" disabled={safePage >= totalPages} onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                  className="rounded-lg border border-white/10 p-2 disabled:opacity-30" aria-label="Página siguiente"><ChevronRight size={16}/></button>
+              </div>
             </div>
           </div>
         )}
@@ -659,7 +816,7 @@ export const InventoryPanel = ({
                   <div className="bg-black/50 p-4 rounded-xl border border-white/5">
                     <p className="text-[8px] text-slate-500 uppercase font-black">Almacén</p>
                     <p className="text-xl font-black text-[#E1AD01] uppercase italic leading-tight">
-                      {ALMACEN_LABEL[scanResult.location]}
+                      {ALMACEN_LABEL[scanResult.location] ?? scanResult.location}
                     </p>
                   </div>
                 </div>
