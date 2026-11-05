@@ -1129,7 +1129,7 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
   // ── Líneas del Estado de Resultados ─────────────────────────────────────
   const lineas = useMemo<LineaPL[]>(() => {
     const out: LineaPL[] = [];
-    const enP = (d: string | null | undefined) => { const f = fechaInput(d); return f >= desde && f <= hasta; };
+    const enP = (d: string | Date | null | undefined) => { const f = fechaInput(d); return f >= desde && f <= hasta; };   // issueDate: string | Date
     for (const t of transactions) {
       if (t.status !== 'PAID' || isFxTx(t) || isFinancingTx(t) || esReposicionLegacy(t) || t.category === 'Reposición Interna') continue;
       if (!enP(t.issueDate)) continue;
