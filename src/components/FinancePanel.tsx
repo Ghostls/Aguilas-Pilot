@@ -1,3 +1,19 @@
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v17.0
+// CHANGELOG v17.0 vs v16.8 (lógica QuickBooks solicitada por dirección Águilas):
+//   [NEW] BILLETERA DEL ALUMNO (USD): el alumno paga en USDT/ZELLE/CASH/BS → RECARGA (bóveda + caja + pagador
+//         + billetera en UNA transacción, RPC fn_wallet_recargar). La recarga es ANTICIPO (pasivo), no ingreso.
+//   [NEW] CONSUMOS: horas de vuelo, simulador, cursos, exámenes se descuentan de la billetera; el DÉFICIT pasa
+//         automáticamente a CxC (cuentas_por_cobrar, USD, 0 horas). Cola "Vuelos por cargar" desde bitacora_vuelos
+//         (un vuelo solo se cobra una vez; modo PAQUETE_LEGACY para vuelos cubiertos por horas compradas antes).
+//   [NEW] Aplicar saldo a deudas (FIFO), ajustes / saldo inicial, reembolsos, reversos con contra-asiento.
+//   [NEW] Anticipos sin matrícula VINCULADOS → "Aplicar a billetera" (sin volver a recibir dinero).
+//   [NEW] CLASES contables (servicio · aeronave · sede · piloto · proyecto) en Diario, Cajas y CxP; reclasificación.
+//   [NEW] REPORTES: Estado de Resultados (base devengado / efectivo), P&L por clase (rentabilidad por aeronave,
+//         sede, servicio, piloto, proyecto), Balance General, Flujo de Efectivo, Antigüedad CxC/CxP, Sin clasificar.
+//   [NEW] Impresión: estado de cuenta por alumno, movimientos de caja global / por caja / por período, reportes.
+//   [SEC] Recarga/reembolso de billetera no se anulan desde el Diario: se revierten desde Billeteras (guarda en BD).
+//   [PRESERVADO] Motor v16, pagadores v16.5, roles v16.6, cajas v16.7, anticipos v16.8, FX Desk, préstamos, cierre.
+// REQUISITO v17: migracion_finance_v17_billetera_clases.sql (sin ella el panel opera como v16.8 y avisa).
 // VALKYRON FINANCIAL INTELLIGENCE CENTER v16.8
 // CHANGELOG v16.8: anticipos sin matrícula registrados por RPC ATÓMICA,
 // vínculo documental sin doble ingreso ni acreditación de horas, paginación financiera,
@@ -77,6 +93,8 @@ import {
   AlertTriangle, RefreshCw, ReceiptText, Plane, Pencil, KeyRound,
   ArrowLeftRight, Repeat, TrendingUp, UserCheck, HandCoins, Scale, Ban,
   Users, Link2,
+  // ▼ v17
+  Printer, BarChart3, Tag, Undo2, PlaneTakeoff, Settings, MinusCircle, Search, Layers, Receipt, Info,
 } from 'lucide-react';
 
 // ─── TIPOS ────────────────────────────────────────────────────────────────────
@@ -84,7 +102,7 @@ import {
 export type PaymentMethod   = 'USDT' | 'ZELLE' | 'CASH' | 'BS';
 /** FINANCING_IN / FINANCING_OUT: préstamos (mueven caja, no son ingreso/egreso operativo) */
 export type TransactionType = 'INCOME' | 'EXPENSE' | 'INSTRUCTOR_PAY' | 'PAYABLE' | 'RECEIVABLE' | 'FX_EXCHANGE' | 'FINANCING_IN' | 'FINANCING_OUT';
-export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING' | 'PROVISIONALES';
+export type TabType         = 'LEDGER' | 'BÓVEDAS' | 'CAJAS' | 'CUENTAS' | 'REQUISITIONS' | 'CLOSING' | 'PROVISIONALES' | 'BILLETERAS' | 'REPORTES';   // [CHG v17]
 export type SubcajaEfectivo = 'ADM' | 'CEO';
 export type Prestamista     = 'Barquisimeto' | 'ROBERTO';
 export type FxLeg           = 'IN' | 'OUT';
@@ -179,6 +197,56 @@ interface PagoProvisional {
   estado: 'PENDIENTE' | 'VINCULADO' | 'ANULADO'; student_id: string | null;
   vinculado_por: string | null; vinculado_en: string | null;
 }
+
+// ─── [NEW v17] BILLETERA · CONSUMOS · TARIFARIO · CLASES ─────────────────────
+type WalletMovTipo = 'RECARGA' | 'CONSUMO' | 'APLICACION_CXC' | 'AJUSTE_CREDITO' | 'AJUSTE_DEBITO'
+  | 'SALDO_INICIAL' | 'ANTICIPO_APLICADO' | 'REEMBOLSO' | 'REVERSO';
+type TipoConsumo  = 'VUELO' | 'SIMULADOR' | 'CURSO' | 'EXAMEN' | 'MATERIAL' | 'OTRO';
+type ModoConsumo  = 'BILLETERA' | 'PAQUETE_LEGACY' | 'CORTESIA';
+type AjusteTipo   = 'SALDO_INICIAL' | 'AJUSTE_CREDITO' | 'AJUSTE_DEBITO';
+type TablaClase   = 'transacciones_finanzas' | 'cuentas_generales';
+type WalletModal  = 'RECARGA' | 'CONSUMO' | 'AJUSTE' | 'REEMBOLSO';
+type WalletSubTab = 'ALUMNOS' | 'VUELOS' | 'TARIFARIO';
+
+interface WalletCuenta { student_id: string; saldo_usd: number; actualizado_en: string; }
+/** Subledger inmutable de la billetera (saldo = Σ signo · monto) */
+interface WalletMovimiento {
+  id: string; student_id: string; tipo: WalletMovTipo; signo: 1 | -1; monto_usd: number; saldo_resultante: number;
+  moneda_origen: string | null; monto_origen: number | null; tasa: number | null;
+  asiento_id: string | null; consumo_id: string | null; cxc_id: string | null; provisional_id: string | null;
+  reverso_de: string | null; revertido: boolean; concepto: string; referencia: string; fecha: string;
+  creado_en: string; creado_por_email: string | null;
+}
+/** Documento de ingreso devengado (vuelo, simulador, curso...) */
+interface WalletConsumo {
+  id: string; student_id: string; servicio_id: string | null; tipo: TipoConsumo; descripcion: string;
+  cantidad: number; unidad: string; precio_unitario_usd: number; monto_total_usd: number;
+  monto_billetera_usd: number; monto_cxc_usd: number; cxc_id: string | null; modo: ModoConsumo;
+  vuelo_id: string | null; clase_servicio: string; clase_aeronave: string | null; clase_sede: string | null;
+  clase_piloto: string | null; clase_proyecto: string | null; fecha: string; estado: 'VIGENTE' | 'ANULADO';
+  motivo_anulacion: string | null; creado_en: string; creado_por_email: string | null;
+}
+interface ServicioCatalogo {
+  id: string; codigo: string; nombre: string; tipo: TipoConsumo; unidad: string; precio_usd: number;
+  aeronave_matricula: string | null; sede: string | null; clase_servicio: string; activo: boolean; notas: string | null;
+}
+interface ClasificacionRow {
+  tabla: TablaClase; registro_id: string; asiento_id: string | null;
+  servicio: string | null; aeronave: string | null; sede: string | null; piloto: string | null; proyecto: string | null;
+  tasa_ref: number | null;
+}
+/** Clase contable editable (QuickBooks "clases / ubicaciones") */
+interface ClaseForm { servicio: string; aeronave: string; sede: string; piloto: string; proyecto: string; }
+interface VueloBitacora {
+  id: string; student_id: string | null; fecha: string; horas: number; matricula: string | null;
+  tipo_mision: string | null; sede: string | null; destino: string | null;
+}
+interface ServicioEditForm {
+  id: string | null; codigo: string; nombre: string; tipo: TipoConsumo; unidad: string; precio: string;
+  aeronave_matricula: string; sede: string; clase_servicio: string; activo: boolean; notas: string;
+}
+interface MotivoAccion { tipo: 'REVERTIR' | 'ANULAR_CONSUMO'; id: string; titulo: string; detalle: string; }
+interface ReclasAccion { items: { tabla: TablaClase; id: string }[]; titulo: string; inicial: ClaseForm; }
 
 type FinanceTotals = { CASH: number; ZELLE: number; USDT: number; BS: number };
 interface FinancePanelProps {
@@ -355,6 +423,62 @@ const EVENTO_LABEL: Record<EventoContable, string> = {
   PRESTAMO_RECIBIDO: 'PRÉSTAMO RECIBIDO', PRESTAMO_DEVOLUCION: 'DEVOLUCIÓN PRÉSTAMO',
 };
 
+// ─── [NEW v17] CATÁLOGOS CONTABLES ────────────────────────────────────────────
+
+/** Categorías de Ledger reservadas para la billetera (identifican anticipos / reembolsos, no ingresos/gastos). */
+const CATEGORIA_BILLETERA = 'Billetera Alumno';
+const CATEGORIA_REEMBOLSO = 'Reembolso Billetera';
+
+type NaturalezaPL = 'INGRESO' | 'GASTO' | 'NEUTRO';
+/** Plan de cuentas de resultados = "servicio" (clase principal). */
+const SERVICIOS_PL: { k: string; l: string; n: NaturalezaPL; cod: string }[] = [
+  { k: 'INSTRUCCION_VUELO',  l: 'Instrucción de vuelo',                 n: 'INGRESO', cod: '4.1' },
+  { k: 'SIMULADOR',          l: 'Simulador',                            n: 'INGRESO', cod: '4.2' },
+  { k: 'CURSOS',             l: 'Cursos y teoría',                      n: 'INGRESO', cod: '4.3' },
+  { k: 'EXAMENES',           l: 'Exámenes y certificaciones',           n: 'INGRESO', cod: '4.4' },
+  { k: 'PAQUETES_HORAS',     l: 'Paquetes de horas (régimen anterior)', n: 'INGRESO', cod: '4.5' },
+  { k: 'MATRICULA',          l: 'Matrícula y aranceles',                n: 'INGRESO', cod: '4.6' },
+  { k: 'CARGOS_AJUSTE',      l: 'Cargos por ajuste de billetera',       n: 'INGRESO', cod: '4.7' },
+  { k: 'BONIFICACIONES',     l: 'Bonificaciones y descuentos (−)',      n: 'INGRESO', cod: '4.8' },
+  { k: 'OTROS_INGRESOS',     l: 'Otros ingresos',                       n: 'INGRESO', cod: '4.9' },
+  { k: 'COMBUSTIBLE',        l: 'Combustible',                          n: 'GASTO',   cod: '5.1' },
+  { k: 'MANTENIMIENTO',      l: 'Mantenimiento y repuestos',            n: 'GASTO',   cod: '5.2' },
+  { k: 'NOMINA_INSTRUCCION', l: 'Nómina instructores / capitanes',      n: 'GASTO',   cod: '5.3' },
+  { k: 'NOMINA_ADMIN',       l: 'Nómina administrativa',                n: 'GASTO',   cod: '5.4' },
+  { k: 'SEGUROS',            l: 'Seguros',                              n: 'GASTO',   cod: '5.5' },
+  { k: 'AEROPUERTO',         l: 'Tasas aeroportuarias y hangar',        n: 'GASTO',   cod: '5.6' },
+  { k: 'ADMINISTRATIVO',     l: 'Gastos administrativos',               n: 'GASTO',   cod: '5.7' },
+  { k: 'MARKETING',          l: 'Mercadeo',                             n: 'GASTO',   cod: '5.8' },
+  { k: 'IMPUESTOS',          l: 'Impuestos y tasas',                    n: 'GASTO',   cod: '5.9' },
+  { k: 'OTROS_GASTOS',       l: 'Otros gastos',                         n: 'GASTO',   cod: '5.10' },
+  { k: 'ANTICIPO_ALUMNO',    l: 'Anticipos de alumnos (billetera)',     n: 'NEUTRO',  cod: '2.3' },
+  { k: 'REEMBOLSO_ALUMNO',   l: 'Reembolsos de billetera',              n: 'NEUTRO',  cod: '2.3' },
+];
+const SERVICIO_LABEL = new Map(SERVICIOS_PL.map(s => [s.k, s.l]));
+const SERVICIO_ORDEN = new Map(SERVICIOS_PL.map((s, i) => [s.k, i]));
+const labelServicio = (k: string) => SERVICIO_LABEL.get(k) ?? (k ? k.replace(/_/g, ' ') : 'SIN CLASE');
+
+const SEDES_FIN: { k: string; l: string }[] = [
+  { k: 'BARQUISIMETO', l: 'Barquisimeto' }, { k: 'MATURIN', l: 'Maturín' }, { k: 'ADMINISTRACION', l: 'Administración central' },
+];
+const TIPOS_CONSUMO: { k: TipoConsumo; l: string; unidad: string }[] = [
+  { k: 'VUELO', l: 'Hora de vuelo', unidad: 'HORA' }, { k: 'SIMULADOR', l: 'Simulador', unidad: 'HORA' },
+  { k: 'CURSO', l: 'Curso', unidad: 'UNIDAD' },        { k: 'EXAMEN', l: 'Examen / chequeo', unidad: 'UNIDAD' },
+  { k: 'MATERIAL', l: 'Material', unidad: 'UNIDAD' },   { k: 'OTRO', l: 'Otro', unidad: 'UNIDAD' },
+];
+const SERVICIO_POR_TIPO: Record<TipoConsumo, string> = {
+  VUELO: 'INSTRUCCION_VUELO', SIMULADOR: 'SIMULADOR', CURSO: 'CURSOS', EXAMEN: 'EXAMENES', MATERIAL: 'OTROS_INGRESOS', OTRO: 'OTROS_INGRESOS',
+};
+const WALLET_MOV_LABEL: Record<WalletMovTipo, string> = {
+  RECARGA: 'Recarga', CONSUMO: 'Consumo', APLICACION_CXC: 'Aplicado a deuda', AJUSTE_CREDITO: 'Ajuste (+)',
+  AJUSTE_DEBITO: 'Ajuste (−)', SALDO_INICIAL: 'Saldo inicial', ANTICIPO_APLICADO: 'Anticipo aplicado',
+  REEMBOLSO: 'Reembolso', REVERSO: 'Reverso',
+};
+const MODO_CONSUMO_LABEL: Record<ModoConsumo, string> = {
+  BILLETERA: 'Cobrar a billetera', PAQUETE_LEGACY: 'Cubierto por paquete anterior', CORTESIA: 'Cortesía (sin cargo)',
+};
+const CLASE_VACIA: ClaseForm = { servicio: '', aeronave: '', sede: '', piloto: '', proyecto: '' };
+
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -442,7 +566,38 @@ const ERRORES_MOTOR: [RegExp, string][] = [
   [/pago_alumno_coherente/,         'Seleccione el alumno que pagó.'],
   [/NO_AUTORIZADO/,                 'Su usuario no está autorizado en finanzas (rol CEO / ADMIN / DIRECTOR).'],
   [/MOTOR_V16_NO_INSTALADO/,        'Motor contable v16 no instalado: ejecute migracion_finance_v16.sql.'],
+  // [NEW v17] billetera / consumos / clases
+  [/ASIENTO_DE_BILLETERA/,          'Este asiento es una recarga/reembolso de billetera: reviértalo desde Billeteras (mantiene el saldo del alumno coherente).'],
+  [/WALLET_SALDO_INSUFICIENTE/,     'Saldo de billetera insuficiente: el alumno ya consumió esos fondos. Anule consumos/aplicaciones o registre un ajuste.'],
+  [/WALLET_SIN_SALDO/,              'El alumno no tiene saldo disponible en su billetera.'],
+  [/WALLET_INMUTABLE/,              'Los movimientos de billetera son inmutables: use reverso o anulación.'],
+  [/CXC_NO_APLICABLE/,              'No hay deudas aplicables (solo CxC en USD sin horas prometidas; las de paquetes de horas se cobran desde CxC).'],
+  [/VUELO_YA_CARGADO/,              'Ese vuelo ya fue cargado a la billetera.'],
+  [/TARIFA_VUELO_NO_CONFIGURADA/,   'No hay tarifa de vuelo activa para esa aeronave: configure el Tarifario.'],
+  [/VUELO_SIN_ALUMNO/,              'El vuelo de bitácora no tiene alumno asociado.'],
+  [/VUELO_SIN_HORAS/,               'El vuelo de bitácora no tiene horas registradas.'],
+  [/CREDITO_EXCEDIDO/,              'El déficit supera el límite de crédito configurado. Marque "Autorizar sobre límite" si dirección lo aprueba.'],
+  [/CONSUMO_CON_COBROS/,            'La deuda de este consumo ya tiene cobros en caja: anúlelos primero en CxC.'],
+  [/CONSUMO_YA_ANULADO/,            'El consumo ya estaba anulado.'],
+  [/MOVIMIENTO_YA_REVERTIDO/,       'El movimiento ya fue revertido.'],
+  [/USE_ANULAR_CONSUMO/,            'Los consumos se anulan desde la lista de consumos.'],
+  [/REVERSO_NO_REVERSIBLE/,         'Un reverso no se puede revertir.'],
+  [/MOTIVO_REQUERIDO/,              'Indique un motivo (mínimo 5 caracteres).'],
+  [/RECARGA_SIN_CAJA/,              'Seleccione la caja que custodia el dinero.'],
+  [/RECARGA_TASA_REQUERIDA/,        'Indique la tasa Bs/USD.'],
+  [/RECARGA_CONVERSION_INCOHERENTE/,'La conversión a USD no coincide con el monto y la tasa.'],
+  [/RECARGA_(ASIENTO|PAGADOR)_INCOHERENTE/, 'El asiento no coincide con la recarga (monto o moneda).'],
+  [/ux_wallet_mov_provisional/,     'Ese anticipo ya fue aplicado a una billetera.'],
+  [/PROVISIONAL_NO_VINCULADO/,      'Vincule primero el anticipo a un estudiante matriculado.'],
+  [/ALUMNO_NO_EXISTE/,              'El alumno no existe.'],
+  [/CONSUMO_PRECIO_INVALIDO/,       'Precio inválido.'],
+  [/CONSUMO_DESCRIPCION_REQUERIDA/, 'Indique la descripción del consumo.'],
+  [/SERVICIO_DATOS_REQUERIDOS/,     'Código y nombre del servicio son obligatorios.'],
+  [/servicios_catalogo_codigo_key/, 'Ya existe un servicio con ese código.'],
 ];
+/** [NEW v17] Tabla / relación inexistente (migración v17 no aplicada) */
+const isMissingRelation = (err: { code?: string; message?: string } | null) =>
+  !!err && (err.code === '42P01' || err.code === 'PGRST205' || /does not exist|could not find the table|schema cache/i.test(err.message ?? ''));
 const traducirErrorMotor = (msg: string) => ERRORES_MOTOR.find(([re]) => re.test(msg))?.[1] ?? msg;
 const errMsg = (err: unknown, fallback: string) => (err instanceof Error ? err.message : fallback);
 
@@ -521,6 +676,104 @@ const downloadCSV = (rows: string[][], filename: string) => {
   const a   = document.createElement('a');
   a.href = url; a.download = filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);   // [FIX v16.1] libera el blob
+};
+
+// ─── [NEW v17] CLASES ─────────────────────────────────────────────────────────
+
+const normTxt = (v: unknown) => String(v ?? '').trim().toUpperCase();
+const claseTieneDatos = (c: ClaseForm | null | undefined) => !!c && Object.values(c).some(v => String(v).trim() !== '');
+/** Payload para fn_registrar_asiento_clasificado / fn_clasificar_registros */
+const claseAPayload = (c: ClaseForm, tasaRef?: number | null): Record<string, unknown> => ({
+  servicio: normTxt(c.servicio), aeronave: normTxt(c.aeronave), sede: normTxt(c.sede),
+  piloto: normTxt(c.piloto), proyecto: normTxt(c.proyecto), tasa_ref: tasaRef && tasaRef > 0 ? tasaRef : null,
+});
+const claseDeRow = (r: ClasificacionRow | undefined | null): ClaseForm => ({
+  servicio: r?.servicio ?? '', aeronave: r?.aeronave ?? '', sede: r?.sede ?? '', piloto: r?.piloto ?? '', proyecto: r?.proyecto ?? '',
+});
+/** Matrícula normalizada (YV-1234 ≡ YV1234) */
+const normMatricula = (m: string | null | undefined) => String(m ?? '').toUpperCase().replace(/[\s-]/g, '');
+/** Reemplaza el prefijo de referencia del asiento (WAL-, WRE-) en todas sus patas */
+const conPrefijo = (a: AsientoPayload, pref: string): AsientoPayload => {
+  const ref = `${pref}-${a.id.replace(/-/g, '').slice(0, 12).toUpperCase()}`;
+  return {
+    ...a, referencia: ref,
+    ledger: a.ledger.map(l => ({ ...l, invoice_number: ref })),
+    caja: a.caja.map(c => ({ ...c, referencia: ref })),
+  };
+};
+
+// ─── [NEW v17] IMPRESIÓN ──────────────────────────────────────────────────────
+
+interface PrintSeccion {
+  titulo?: string; columnas: string[]; filas: (string | number)[][];
+  alinear?: ('l' | 'r' | 'c')[]; totales?: (string | number)[]; nota?: string;
+}
+interface PrintDoc {
+  titulo: string; subtitulo?: string; meta?: [string, string][]; resumen?: [string, string][];
+  secciones: PrintSeccion[]; pie?: string; horizontal?: boolean;
+}
+const escHtml = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
+const usd = (n: number) => `${n < 0 ? '−' : ''}$${fmtNum(Math.abs(n))}`;
+
+/** Documento imprimible (el usuario puede "Guardar como PDF" desde el diálogo de impresión). */
+const imprimirDocumento = (d: PrintDoc) => {
+  const w = window.open('', '_blank', 'width=1100,height=800');
+  if (!w) { alert('El navegador bloqueó la ventana de impresión. Permita ventanas emergentes para este sitio.'); return; }
+  const tabla = (s: PrintSeccion) => {
+    const al = (i: number) => (s.alinear?.[i] === 'r' ? 'right' : s.alinear?.[i] === 'c' ? 'center' : 'left');
+    return `
+      ${s.titulo ? `<h2>${escHtml(s.titulo)}</h2>` : ''}
+      <table>
+        <thead><tr>${s.columnas.map((c, i) => `<th style="text-align:${al(i)}">${escHtml(c)}</th>`).join('')}</tr></thead>
+        <tbody>${s.filas.length ? s.filas.map(f => `<tr>${f.map((v, i) => `<td style="text-align:${al(i)}">${escHtml(v)}</td>`).join('')}</tr>`).join('')
+          : `<tr><td colspan="${s.columnas.length}" class="vacio">Sin registros</td></tr>`}</tbody>
+        ${s.totales ? `<tfoot><tr>${s.totales.map((v, i) => `<td style="text-align:${al(i)}">${escHtml(v)}</td>`).join('')}</tr></tfoot>` : ''}
+      </table>
+      ${s.nota ? `<p class="nota">${escHtml(s.nota)}</p>` : ''}`;
+  };
+  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${escHtml(d.titulo)}</title>
+    <style>
+      @page { size: A4 ${d.horizontal ? 'landscape' : 'portrait'}; margin: 12mm; }
+      * { box-sizing: border-box; }
+      body { font-family: 'Segoe UI', Arial, sans-serif; color: #111; font-size: 10.5px; margin: 0; }
+      header { border-bottom: 3px solid #E1AD01; padding-bottom: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: flex-end; }
+      header .marca { font-size: 9px; letter-spacing: .25em; color: #8a6d00; font-weight: 700; }
+      header h1 { font-size: 18px; margin: 2px 0 0; letter-spacing: .02em; }
+      header .sub { color: #555; font-size: 10px; margin-top: 2px; }
+      .meta { text-align: right; font-size: 9px; color: #555; line-height: 1.5; }
+      .resumen { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 14px; }
+      .resumen div { border: 1px solid #ddd; border-left: 3px solid #E1AD01; padding: 6px 10px; min-width: 140px; }
+      .resumen b { display: block; font-size: 13px; margin-top: 2px; }
+      .resumen span { font-size: 8.5px; color: #666; text-transform: uppercase; letter-spacing: .08em; }
+      h2 { font-size: 11.5px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .08em; color: #333; border-left: 3px solid #E1AD01; padding-left: 6px; }
+      table { width: 100%; border-collapse: collapse; page-break-inside: auto; }
+      tr { page-break-inside: avoid; }
+      th { background: #111; color: #E1AD01; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; padding: 5px 6px; }
+      td { border-bottom: 1px solid #e5e5e5; padding: 4px 6px; vertical-align: top; }
+      tbody tr:nth-child(even) td { background: #fafafa; }
+      tfoot td { font-weight: 700; border-top: 2px solid #111; background: #f3f3f3; }
+      .vacio { text-align: center; color: #999; padding: 10px; }
+      .nota { font-size: 9px; color: #666; margin: 4px 0 0; }
+      footer { margin-top: 18px; border-top: 1px solid #ccc; padding-top: 6px; font-size: 8.5px; color: #777; display: flex; justify-content: space-between; }
+      .firmas { display: flex; gap: 60px; margin-top: 40px; }
+      .firmas div { flex: 1; border-top: 1px solid #333; padding-top: 4px; text-align: center; font-size: 9px; }
+    </style></head><body>
+    <header>
+      <div><div class="marca">ÁGUILAS PILOT ACADEMY · VALKYRON FINANCIAL CORE</div>
+        <h1>${escHtml(d.titulo)}</h1>${d.subtitulo ? `<div class="sub">${escHtml(d.subtitulo)}</div>` : ''}</div>
+      <div class="meta">${(d.meta ?? []).map(([k, v]) => `${escHtml(k)}: <b>${escHtml(v)}</b>`).join('<br>')}
+        <br>Emitido: <b>${escHtml(new Date().toLocaleString('es-VE'))}</b></div>
+    </header>
+    ${d.resumen?.length ? `<div class="resumen">${d.resumen.map(([k, v]) => `<div><span>${escHtml(k)}</span><b>${escHtml(v)}</b></div>`).join('')}</div>` : ''}
+    ${d.secciones.map(tabla).join('')}
+    <div class="firmas"><div>Elaborado por</div><div>Revisado por</div><div>Dirección</div></div>
+    <footer><span>${escHtml(d.pie ?? 'Documento generado por Valkyron Financial Core. Montos en USD salvo indicación.')}</span><span>Águilas Pilot Academy</span></footer>
+  </body></html>`;
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+  setTimeout(() => { try { w.focus(); w.print(); } catch { /* el usuario puede imprimir manualmente */ } }, 350);
 };
 
 // ─── COMPONENTES UI REUTILIZABLES ─────────────────────────────────────────────
@@ -618,6 +871,42 @@ const PagadorFields: React.FC<{
   );
 };
 
+/** [NEW v17] Clase contable (servicio · aeronave · sede · piloto · proyecto) para P&L por clase */
+const ClaseFields: React.FC<{
+  value: ClaseForm; onChange: (c: ClaseForm) => void; flota: string[]; pilotos: string[];
+  naturaleza?: 'INGRESO' | 'GASTO' | 'TODOS'; className?: string; titulo?: string;
+}> = ({ value: v, onChange, flota, pilotos, naturaleza = 'TODOS', className = '', titulo = 'Clase contable (P&L por clase)' }) => {
+  const set = (k: keyof ClaseForm, val: string) => onChange({ ...v, [k]: val });
+  const servicios = SERVICIOS_PL.filter(s => s.n !== 'NEUTRO' && (naturaleza === 'TODOS' || s.n === naturaleza));
+  const sel = 'bg-black/50 border border-white/10 px-3 py-2.5 rounded-xl text-white text-[10px] font-mono outline-none focus:border-[#E1AD01]/60 w-full uppercase';
+  return (
+    <div className={`rounded-2xl border border-teal-500/20 bg-teal-500/[0.03] p-3 space-y-2 ${className}`}>
+      <p className="text-[8px] text-teal-400 font-black uppercase tracking-widest flex items-center gap-2"><Tag size={11} /> {titulo}</p>
+      <div className="grid grid-cols-2 gap-2">
+        <select value={v.servicio} onChange={e => set('servicio', e.target.value)} className={sel}>
+          <option value="">— SERVICIO / CUENTA —</option>
+          {servicios.map(s => <option key={s.k} value={s.k}>{s.cod} · {s.l}</option>)}
+        </select>
+        <select value={v.aeronave} onChange={e => set('aeronave', e.target.value)} className={sel}>
+          <option value="">— AERONAVE —</option>
+          {flota.map(m => <option key={m} value={m}>{m}</option>)}
+          {v.aeronave && !flota.includes(v.aeronave) && <option value={v.aeronave}>{v.aeronave}</option>}
+        </select>
+        <select value={v.sede} onChange={e => set('sede', e.target.value)} className={sel}>
+          <option value="">— SEDE / BASE —</option>
+          {SEDES_FIN.map(s => <option key={s.k} value={s.k}>{s.l}</option>)}
+        </select>
+        <select value={v.piloto} onChange={e => set('piloto', e.target.value)} className={sel}>
+          <option value="">— PILOTO / INSTRUCTOR —</option>
+          {pilotos.map(p => <option key={p} value={p}>{p}</option>)}
+          {v.piloto && !pilotos.includes(v.piloto) && <option value={v.piloto}>{v.piloto}</option>}
+        </select>
+        <input value={v.proyecto} onChange={e => set('proyecto', e.target.value)} placeholder="PROYECTO / COHORTE (opcional)" className={`${sel} col-span-2`} />
+      </div>
+    </div>
+  );
+};
+
 const AMOUNT_SIZE = {
   xl: { input: 'py-8 pl-14 pr-6 text-3xl bg-white/5', prefix: 'left-5 text-xl' },
   lg: { input: 'py-6 pl-14 pr-6 text-2xl bg-white/5', prefix: 'left-5 text-xl' },
@@ -671,9 +960,780 @@ const ModalActions: React.FC<{
   </div>
 );
 
+// ─── [NEW v17] REPORTES FINANCIEROS ───────────────────────────────────────────
+//  Base DEVENGADO: ingresos = consumos de billetera + ventas a crédito (CxC al emitir) + ingresos directos;
+//                  gastos = gastos directos + CxP al emitir. Excluye anticipos, reembolsos, cobros de CxC y pagos
+//                  de CxP (ya reconocidos), FX, financiamiento y reposiciones internas.
+//  Base EFECTIVO : todo movimiento operativo de bóveda (incluye anticipos recibidos y reembolsos como líneas propias).
+
+type BasePL      = 'DEVENGADO' | 'EFECTIVO';
+type DimensionPL = 'aeronave' | 'sede' | 'piloto' | 'proyecto';
+type ReporteKey  = 'PL' | 'PL_CLASE' | 'BALANCE' | 'FLUJO' | 'AGING' | 'SIN_CLASE' | 'IMPRESION';
+
+interface LineaPL {
+  fecha: string; nat: 'INGRESO' | 'GASTO'; servicio: string; aeronave: string; sede: string; piloto: string; proyecto: string;
+  usd: number; origen: string; ref: string; detalle: string; inferida: boolean; tabla: TablaClase | null; registroId: string | null;
+}
+
+const DIMENSIONES: { k: DimensionPL; l: string }[] = [
+  { k: 'aeronave', l: 'Aeronave (matrícula)' }, { k: 'sede', l: 'Sede / base de operación' },
+  { k: 'piloto', l: 'Piloto / instructor' },    { k: 'proyecto', l: 'Proyecto / cohorte' },
+];
+const REPORTES: { k: ReporteKey; l: string }[] = [
+  { k: 'PL', l: 'Estado de resultados' }, { k: 'PL_CLASE', l: 'P&L por clase' }, { k: 'BALANCE', l: 'Balance general' },
+  { k: 'FLUJO', l: 'Flujo de efectivo' }, { k: 'AGING', l: 'Antigüedad CxC / CxP' }, { k: 'SIN_CLASE', l: 'Sin clasificar' },
+  { k: 'IMPRESION', l: 'Imprimir movimientos' },
+];
+const ymd = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const prefijoRef = (ref: string | null | undefined) => String(ref ?? '').split('-')[0].toUpperCase();
+/** Servicio inferido de un gasto por su texto (solo cuando no hay clase explícita) */
+const inferirGasto = (txt: string, esNomina: boolean): string => {
+  const x = txt.toLowerCase();
+  if (esNomina || /n[oó]mina|payroll|sueldo|salario/.test(x)) return 'NOMINA_INSTRUCCION';
+  if (/fuel|combust|avgas|jet ?a|gasolina/.test(x)) return 'COMBUSTIBLE';
+  if (/mainten|manten|repuest|parts|taller|inspecci|overhaul|aceite|mro/.test(x)) return 'MANTENIMIENTO';
+  if (/segur|insur|p[oó]liza/.test(x)) return 'SEGUROS';
+  if (/hangar|aeropuert|aterriz|parking|tasa aero|estacionamiento/.test(x)) return 'AEROPUERTO';
+  if (/impuest|seniat|tribut|iva\b/.test(x)) return 'IMPUESTOS';
+  if (/publicidad|marketing|mercadeo|redes sociales/.test(x)) return 'MARKETING';
+  return 'OTROS_GASTOS';
+};
+/** Inventario MRO valorizado si los ítems traen cantidad y costo (estimado, memo). */
+const valorInventario = (inv: unknown[]): { total: number; n: number } => {
+  let total = 0, n = 0;
+  for (const raw of inv ?? []) {
+    const it = (raw ?? {}) as Record<string, unknown>;
+    const q = Number(it.quantity ?? it.cantidad ?? it.stock ?? it.qty);
+    const c = Number(it.unitCost ?? it.unit_cost ?? it.costo_unitario ?? it.costo ?? it.cost);
+    if (Number.isFinite(q) && Number.isFinite(c) && q > 0 && c > 0) { total += q * c; n++; }
+  }
+  return { total: round2(total), n };
+};
+
+interface ReportesProps {
+  transactions: LedgerTx[]; clasifMap: Map<string, ClasificacionRow>; consumos: WalletConsumo[];
+  walletMovs: WalletMovimiento[]; walletCuentas: WalletCuenta[]; cuentasCxC: CuentaPorCobrar[]; cuentas: CuentaGeneral[];
+  abonos: AbonoCuenta[]; provisionales: PagoProvisional[]; provisionalAplicado: Set<string>; flota: string[];
+  alumnos: AlumnoCxC[]; cajas: CajaChica[]; movCajas: MovimientoCaja[]; tasaBCV: number; inventory: unknown[];
+  v17: boolean; canEdit: boolean;
+  onReclasificar: (a: ReclasAccion) => void;
+  onImprimirCaja: (cajaId: string | null, desde: string, hasta: string) => void;
+  onImprimirAlumno: (studentId: string) => void;
+}
+
+const ReportesFinancieros: React.FC<ReportesProps> = ({
+  transactions, clasifMap, consumos, walletMovs, walletCuentas, cuentasCxC, cuentas, abonos, provisionales,
+  provisionalAplicado, flota, alumnos, cajas, movCajas, tasaBCV, inventory, v17, canEdit,
+  onReclasificar, onImprimirCaja, onImprimirAlumno,
+}) => {
+  const hoy = ymd(new Date());
+  const [rep,   setRep]   = useState<ReporteKey>('PL');
+  const [base,  setBase]  = useState<BasePL>('DEVENGADO');
+  const [dim,   setDim]   = useState<DimensionPL>('aeronave');
+  const [desde, setDesde] = useState(() => ymd(new Date(new Date().getFullYear(), new Date().getMonth(), 1)));
+  const [hasta, setHasta] = useState(hoy);
+  const [selSinClase, setSelSinClase] = useState<Set<string>>(new Set());
+  const [cajaImp,   setCajaImp]   = useState('');
+  const [alumnoImp, setAlumnoImp] = useState('');
+
+  const aUsd = useCallback((monto: number, moneda: string | null | undefined) =>
+    normalizePaymentMethod(moneda) === 'BS' ? (tasaBCV > 0 ? round2(monto / tasaBCV) : 0) : round2(monto), [tasaBCV]);
+  const nombreAlumno = useMemo(() => new Map(alumnos.map(a => [a.student_id, a.nombre])), [alumnos]);
+
+  const presets: { l: string; d: string; h: string }[] = useMemo(() => {
+    const n = new Date(); const y = n.getFullYear(); const m = n.getMonth();
+    return [
+      { l: 'Mes actual',    d: ymd(new Date(y, m, 1)),                 h: ymd(n) },
+      { l: 'Mes anterior',  d: ymd(new Date(y, m - 1, 1)),             h: ymd(new Date(y, m, 0)) },
+      { l: 'Trimestre',     d: ymd(new Date(y, Math.floor(m / 3) * 3, 1)), h: ymd(n) },
+      { l: 'Año en curso',  d: ymd(new Date(y, 0, 1)),                 h: ymd(n) },
+      { l: 'Histórico',     d: '2000-01-01',                           h: ymd(n) },
+    ];
+  }, []);
+
+  // ── Índices ─────────────────────────────────────────────────────────────
+  const idx = useMemo(() => {
+    const abonosPorAsiento = new Map<string, AbonoCuenta[]>();
+    for (const a of abonos) abonosPorAsiento.set(a.asiento_id, [...(abonosPorAsiento.get(a.asiento_id) ?? []), a]);
+    const cxcById       = new Map(cuentasCxC.map(c => [String(c.id), c]));
+    const consumoPorCxc = new Map(consumos.filter(c => c.cxc_id && c.estado === 'VIGENTE').map(c => [String(c.cxc_id), c]));
+    const prefPorAsiento = new Map<string, string>();
+    for (const t of transactions) if (t.asiento_id) prefPorAsiento.set(t.asiento_id, prefijoRef(t.invoiceNumber));
+    const facturasHora = new Set(transactions.map(t => String(t.invoiceNumber ?? '')).filter(r => r.startsWith('HORA-')).map(r => r.slice(5)));
+    const cxcHorasPagadas = new Set<string>();
+    for (const c of cuentasCxC) if (c.asiento_origen_id || facturasHora.has(String(c.id))) cxcHorasPagadas.add(String(c.id));
+    for (const a of abonos) if (a.cuenta_tipo === 'CXC' && prefPorAsiento.get(a.asiento_id) === 'HRS') cxcHorasPagadas.add(a.cuenta_id);
+    const flotaNorm = flota.map(m => ({ m, n: normMatricula(m) })).filter(x => x.n.length >= 3);
+    const sedeCajaPorAsiento = new Map<string, string>();
+    for (const mv of movCajas) {
+      if (!mv.asiento_id) continue;
+      const nom = (cajas.find(x => x.id === mv.caja_id)?.nombre ?? '').toUpperCase();
+      const sede = /MATUR/.test(nom) ? 'MATURIN' : /BARQUI|LARA/.test(nom) ? 'BARQUISIMETO' : '';
+      if (sede) sedeCajaPorAsiento.set(mv.asiento_id, sede);
+    }
+    const sedeAlumno = new Map(alumnos.map(a => [a.student_id, normTxt(a.sede).replace('Í', 'I')]));
+    return { abonosPorAsiento, cxcById, consumoPorCxc, cxcHorasPagadas, flotaNorm, sedeCajaPorAsiento, sedeAlumno };
+  }, [abonos, cuentasCxC, consumos, transactions, flota, movCajas, cajas, alumnos]);
+
+  const aeronaveEnTexto = useCallback((txt: string) => {
+    const blob = normMatricula(txt);
+    return idx.flotaNorm.find(f => blob.includes(f.n))?.m ?? '';
+  }, [idx]);
+
+  const usdTx = useCallback((t: LedgerTx) => {
+    if (normalizePaymentMethod(t.payment_method) !== 'BS') return round2(t.amount);
+    const tr = clasifMap.get(`transacciones_finanzas:${t.id}`)?.tasa_ref;
+    const tasa = tr && tr > 0 ? tr : tasaBCV;
+    return tasa > 0 ? round2(t.amount / tasa) : 0;
+  }, [clasifMap, tasaBCV]);
+
+  const esReembolsoTx = (t: LedgerTx) => t.category === CATEGORIA_REEMBOLSO || prefijoRef(t.invoiceNumber) === 'WRE';
+  const esAnticipoTx  = (t: LedgerTx, c?: ClasificacionRow) =>
+    t.category === CATEGORIA_BILLETERA || t.category === 'Anticipos sin matrícula' || c?.servicio === 'ANTICIPO_ALUMNO' || prefijoRef(t.invoiceNumber) === 'WAL';
+
+  /** Clase de una pata del Diario: explícita (clasificacion_contable) o inferida (abonos, consumo, texto, caja, alumno) */
+  const claseTx = useCallback((t: LedgerTx, nat: 'INGRESO' | 'GASTO') => {
+    const c    = clasifMap.get(`transacciones_finanzas:${t.id}`);
+    const pref = prefijoRef(t.invoiceNumber);
+    const txt  = `${t.category ?? ''} ${t.description ?? ''} ${t.entityName ?? ''}`;
+    const abs  = t.asiento_id ? idx.abonosPorAsiento.get(t.asiento_id) ?? [] : [];
+    const abCxc = abs.find(a => a.cuenta_tipo === 'CXC');
+    const abCxp = abs.find(a => a.cuenta_tipo === 'CXP');
+    const consumo = abCxc ? idx.consumoPorCxc.get(abCxc.cuenta_id) : undefined;
+    const cxpCl   = abCxp ? clasifMap.get(`cuentas_generales:${abCxp.cuenta_id}`) : undefined;
+    const entityId = (t as { entityId?: string | null }).entityId ?? null;
+    let servicio = c?.servicio ?? '';
+    if (!servicio) {
+      if (nat === 'INGRESO') {
+        if (pref === 'HRS' || pref === 'HORA' || /horas pagadas/i.test(txt)) servicio = 'PAQUETES_HORAS';
+        else if (consumo) servicio = consumo.clase_servicio;
+        else if (abCxc) { const cx = idx.cxcById.get(abCxc.cuenta_id); servicio = cx && cx.horas_prometidas > 0 ? 'PAQUETES_HORAS' : 'MATRICULA'; }
+        else if (/academia|matr[ií]cula|inscripci/i.test(txt)) servicio = 'MATRICULA';
+        else servicio = 'OTROS_INGRESOS';
+      } else {
+        servicio = cxpCl?.servicio || inferirGasto(txt, String(t.type) === 'INSTRUCTOR_PAY');
+      }
+    }
+    return {
+      servicio,
+      aeronave: c?.aeronave || consumo?.clase_aeronave || cxpCl?.aeronave || aeronaveEnTexto(`${t.description ?? ''} ${t.entityName ?? ''}`),
+      sede:     c?.sede || consumo?.clase_sede || cxpCl?.sede || (t.asiento_id ? idx.sedeCajaPorAsiento.get(t.asiento_id) ?? '' : '')
+                || (entityId ? idx.sedeAlumno.get(String(entityId)) ?? '' : ''),
+      piloto:   c?.piloto || consumo?.clase_piloto || cxpCl?.piloto
+                || (String(t.type) === 'INSTRUCTOR_PAY' ? normTxt(String(t.entityName ?? '').replace(/^N[ÓO]MINA:\s*/i, '')) : ''),
+      proyecto: c?.proyecto || consumo?.clase_proyecto || cxpCl?.proyecto || '',
+      inferida: !c?.servicio,
+    };
+  }, [clasifMap, idx, aeronaveEnTexto]);
+
+  // ── Líneas del Estado de Resultados ─────────────────────────────────────
+  const lineas = useMemo<LineaPL[]>(() => {
+    const out: LineaPL[] = [];
+    const enP = (d: string | null | undefined) => { const f = fechaInput(d); return f >= desde && f <= hasta; };
+    for (const t of transactions) {
+      if (t.status !== 'PAID' || isFxTx(t) || isFinancingTx(t) || esReposicionLegacy(t) || t.category === 'Reposición Interna') continue;
+      if (!enP(t.issueDate)) continue;
+      const s = signedLedgerAmount(t);
+      if (Math.abs(s) < 0.005) continue;
+      const nat: 'INGRESO' | 'GASTO' = s > 0 ? 'INGRESO' : 'GASTO';
+      const c     = clasifMap.get(`transacciones_finanzas:${t.id}`);
+      const reemb = esReembolsoTx(t);
+      const antic = !reemb && esAnticipoTx(t, c);
+      const abs   = t.asiento_id ? idx.abonosPorAsiento.get(t.asiento_id) ?? [] : [];
+      const pref  = prefijoRef(t.invoiceNumber);
+      if (base === 'DEVENGADO') {
+        if (antic || reemb) continue;                                                                    // pasivo, no resultado
+        if (nat === 'INGRESO' && (pref === 'CXC' || (pref !== 'HRS' && abs.some(a => a.cuenta_tipo === 'CXC')))) continue;   // cobro de CxC
+        if (nat === 'GASTO' && abs.some(a => a.cuenta_tipo === 'CXP')) continue;                          // pago de CxP
+      }
+      const cl = claseTx(t, nat);
+      out.push({
+        fecha: fechaInput(t.issueDate), nat,
+        servicio: reemb ? 'REEMBOLSO_ALUMNO' : antic ? 'ANTICIPO_ALUMNO' : cl.servicio,
+        aeronave: cl.aeronave, sede: cl.sede, piloto: cl.piloto, proyecto: cl.proyecto,
+        usd: usdTx(t), origen: 'Diario', ref: t.invoiceNumber, detalle: `${t.entityName} · ${t.description}`,
+        inferida: cl.inferida && !antic && !reemb, tabla: 'transacciones_finanzas', registroId: t.id,
+      });
+    }
+    if (base === 'DEVENGADO') {
+      for (const c of consumos) {
+        if (c.estado !== 'VIGENTE' || c.modo !== 'BILLETERA' || c.monto_total_usd <= 0 || !enP(c.fecha)) continue;
+        out.push({
+          fecha: fechaInput(c.fecha), nat: 'INGRESO', servicio: c.clase_servicio || SERVICIO_POR_TIPO[c.tipo],
+          aeronave: c.clase_aeronave ?? '', sede: c.clase_sede ?? '', piloto: c.clase_piloto ?? '', proyecto: c.clase_proyecto ?? '',
+          usd: c.monto_total_usd, origen: 'Consumo', ref: c.id.slice(0, 8).toUpperCase(),
+          detalle: `${nombreAlumno.get(c.student_id) ?? 'ALUMNO'} · ${c.descripcion}`, inferida: false, tabla: null, registroId: null,
+        });
+      }
+      for (const m of walletMovs) {
+        if (m.revertido || !enP(m.fecha) || (m.tipo !== 'AJUSTE_CREDITO' && m.tipo !== 'AJUSTE_DEBITO')) continue;
+        out.push({
+          fecha: fechaInput(m.fecha), nat: 'INGRESO', servicio: m.tipo === 'AJUSTE_CREDITO' ? 'BONIFICACIONES' : 'CARGOS_AJUSTE',
+          aeronave: '', sede: idx.sedeAlumno.get(m.student_id) ?? '', piloto: '', proyecto: '',
+          usd: m.tipo === 'AJUSTE_CREDITO' ? -m.monto_usd : m.monto_usd, origen: 'Ajuste billetera', ref: m.referencia,
+          detalle: `${nombreAlumno.get(m.student_id) ?? 'ALUMNO'} · ${m.concepto}`, inferida: false, tabla: null, registroId: null,
+        });
+      }
+      for (const c of cuentasCxC) {
+        const id = String(c.id);
+        if (idx.consumoPorCxc.has(id) || idx.cxcHorasPagadas.has(id) || c.monto_total <= 0 || !enP(c.fecha_emision)) continue;
+        out.push({
+          fecha: fechaInput(c.fecha_emision), nat: 'INGRESO', servicio: c.horas_prometidas > 0 ? 'PAQUETES_HORAS' : 'MATRICULA',
+          aeronave: '', sede: idx.sedeAlumno.get(c.student_id) ?? '', piloto: '', proyecto: '',
+          usd: aUsd(c.monto_total, c.moneda), origen: 'Venta a crédito (CxC)', ref: id.slice(0, 8).toUpperCase(),
+          detalle: `${c.nombre_alumno} · ${c.concepto}`, inferida: false, tabla: null, registroId: null,
+        });
+      }
+      for (const c of cuentas) {
+        if (c.categoria_interna === 'REPOSICION_CAJA' || c.entidad_tipo === 'PRESTAMISTA' || !enP(c.fecha_emision)) continue;
+        const cl = clasifMap.get(`cuentas_generales:${c.id}`);
+        const txt = `${c.entidad_nombre} ${c.concepto} ${c.notas ?? ''}`;
+        out.push({
+          fecha: fechaInput(c.fecha_emision), nat: 'GASTO', servicio: cl?.servicio || inferirGasto(txt, false),
+          aeronave: cl?.aeronave || aeronaveEnTexto(txt), sede: cl?.sede ?? '', piloto: cl?.piloto ?? '', proyecto: cl?.proyecto ?? '',
+          usd: aUsd(c.monto_total, c.moneda), origen: 'Factura proveedor (CxP)', ref: String(c.id).slice(0, 8).toUpperCase(),
+          detalle: `${c.entidad_nombre} · ${c.concepto}`, inferida: !cl?.servicio, tabla: 'cuentas_generales', registroId: c.id,
+        });
+      }
+    }
+    return out;
+  }, [transactions, clasifMap, idx, base, desde, hasta, claseTx, usdTx, consumos, walletMovs, cuentasCxC, cuentas, aUsd, nombreAlumno, aeronaveEnTexto]);
+
+  // ── Estado de resultados ────────────────────────────────────────────────
+  const resumen = useMemo(() => {
+    const acc = new Map<string, { nat: 'INGRESO' | 'GASTO'; servicio: string; usd: number; n: number; inferidas: number }>();
+    for (const l of lineas) {
+      const k = `${l.nat}|${l.servicio}`;
+      const cur = acc.get(k) ?? { nat: l.nat, servicio: l.servicio, usd: 0, n: 0, inferidas: 0 };
+      cur.usd = round2(cur.usd + l.usd); cur.n += 1; if (l.inferida) cur.inferidas += 1;
+      acc.set(k, cur);
+    }
+    const orden = (a: { servicio: string }, b: { servicio: string }) =>
+      (SERVICIO_ORDEN.get(a.servicio) ?? 99) - (SERVICIO_ORDEN.get(b.servicio) ?? 99) || a.servicio.localeCompare(b.servicio);
+    const ingresos = Array.from(acc.values()).filter(x => x.nat === 'INGRESO').sort(orden);
+    const gastos   = Array.from(acc.values()).filter(x => x.nat === 'GASTO').sort(orden);
+    const totIng = round2(ingresos.reduce((a, x) => a + x.usd, 0));
+    const totGas = round2(gastos.reduce((a, x) => a + x.usd, 0));
+    const utilidad = round2(totIng - totGas);
+    return { ingresos, gastos, totIng, totGas, utilidad, margen: totIng > 0 ? utilidad / totIng : 0 };
+  }, [lineas]);
+
+  // ── P&L por clase ───────────────────────────────────────────────────────
+  const porClase = useMemo(() => {
+    const val = (l: LineaPL) => l[dim] || 'SIN CLASE';
+    const act = new Map<string, number>();
+    for (const l of lineas) act.set(val(l), (act.get(val(l)) ?? 0) + Math.abs(l.usd));
+    const cols = Array.from(act.keys()).sort((a, b) =>
+      a === 'SIN CLASE' ? 1 : b === 'SIN CLASE' ? -1 : (act.get(b) ?? 0) - (act.get(a) ?? 0));
+    const celdas = new Map<string, Map<string, number>>();
+    for (const l of lineas) {
+      const k = `${l.nat}|${l.servicio}`;
+      const fila = celdas.get(k) ?? new Map<string, number>();
+      fila.set(val(l), round2((fila.get(val(l)) ?? 0) + l.usd));
+      celdas.set(k, fila);
+    }
+    const filas = (nat: 'INGRESO' | 'GASTO') => Array.from(celdas.entries())
+      .filter(([k]) => k.startsWith(`${nat}|`))
+      .map(([k, m]) => ({ servicio: k.split('|')[1], m, total: round2(Array.from(m.values()).reduce((a, x) => a + x, 0)) }))
+      .sort((a, b) => (SERVICIO_ORDEN.get(a.servicio) ?? 99) - (SERVICIO_ORDEN.get(b.servicio) ?? 99));
+    const ing = filas('INGRESO'), gas = filas('GASTO');
+    const totCol = (fs: { m: Map<string, number> }[], c: string) => round2(fs.reduce((a, f) => a + (f.m.get(c) ?? 0), 0));
+    const totIng = new Map(cols.map(c => [c, totCol(ing, c)]));
+    const totGas = new Map(cols.map(c => [c, totCol(gas, c)]));
+    const util   = new Map(cols.map(c => [c, round2((totIng.get(c) ?? 0) - (totGas.get(c) ?? 0))]));
+    return { cols, ing, gas, totIng, totGas, util };
+  }, [lineas, dim]);
+
+  // ── Balance general (al día) ────────────────────────────────────────────
+  const balance = useMemo(() => {
+    const bovedas = ALL_METHODS.map(m => {
+      const nativo = round2(transactions.filter(t => t.status === 'PAID' && t.payment_method === m).reduce((a, t) => a + signedLedgerAmount(t), 0));
+      return { m, nativo, usd: m === 'BS' ? (tasaBCV > 0 ? round2(nativo / tasaBCV) : 0) : nativo };
+    });
+    const efectivo   = round2(bovedas.reduce((a, b) => a + b.usd, 0));
+    const pendCxc    = cuentasCxC.filter(c => c.estatus === 'PENDIENTE' || c.estatus === 'PARCIAL');
+    const cxcBill    = round2(pendCxc.filter(c => idx.consumoPorCxc.has(String(c.id))).reduce((a, c) => a + aUsd(c.monto_pendiente, c.moneda), 0));
+    const cxcOtras   = round2(pendCxc.filter(c => !idx.consumoPorCxc.has(String(c.id))).reduce((a, c) => a + aUsd(c.monto_pendiente, c.moneda), 0));
+    const activos    = round2(efectivo + cxcBill + cxcOtras);
+    const pend       = cuentas.filter(c => c.estatus !== 'PAGADO');
+    const cxpProv    = round2(pend.filter(c => c.categoria_interna !== 'REPOSICION_CAJA' && c.entidad_tipo !== 'PRESTAMISTA').reduce((a, c) => a + aUsd(c.monto_pendiente, c.moneda), 0));
+    const prestamos  = round2(pend.filter(c => c.entidad_tipo === 'PRESTAMISTA').reduce((a, c) => a + aUsd(c.monto_pendiente, c.moneda), 0));
+    const billeteras = round2(walletCuentas.reduce((a, w) => a + w.saldo_usd, 0));
+    const provPend   = round2(provisionales.filter(p => (p.estado === 'PENDIENTE' || p.estado === 'VINCULADO') && !provisionalAplicado.has(p.id))
+      .reduce((a, p) => a + aUsd(p.monto, p.moneda), 0));
+    const pasivos    = round2(cxpProv + prestamos + billeteras + provPend);
+    const reposiciones = round2(pend.filter(c => c.categoria_interna === 'REPOSICION_CAJA').reduce((a, c) => a + aUsd(c.monto_pendiente, c.moneda), 0));
+    return { bovedas, efectivo, cxcBill, cxcOtras, activos, cxpProv, prestamos, billeteras, provPend, pasivos,
+      patrimonio: round2(activos - pasivos), reposiciones, inventario: valorInventario(inventory) };
+  }, [transactions, tasaBCV, cuentasCxC, idx, aUsd, cuentas, walletCuentas, provisionales, provisionalAplicado, inventory]);
+
+  // ── Flujo de efectivo ───────────────────────────────────────────────────
+  const flujo = useMemo(() => {
+    const G: [string, string][] = [
+      ['OP_ANTICIPOS', 'Cobros a alumnos · recargas de billetera'], ['OP_ALUMNOS', 'Cobros a alumnos · paquetes y CxC'],
+      ['OP_SINMAT', 'Anticipos sin matrícula'], ['OP_OTROS_ING', 'Otros ingresos operativos'], ['OP_REEMB', 'Reembolsos a alumnos'],
+      ['OP_PROV', 'Pagos a proveedores (CxP)'], ['OP_NOMINA', 'Nómina'], ['OP_GASTOS', 'Gastos directos y caja chica'],
+      ['FIN_IN', 'Préstamos recibidos'], ['FIN_OUT', 'Devoluciones de préstamos'], ['FX', 'Cambio de moneda (diferencial FX)'],
+    ];
+    const g = new Map<string, number>(G.map(([k]) => [k, 0]));
+    let inicial = 0;
+    for (const t of transactions) {
+      if (t.status !== 'PAID') continue;
+      const s = signedLedgerAmount(t);
+      if (Math.abs(s) < 0.005) continue;
+      const v = round2(Math.sign(s) * usdTx(t));
+      const f = fechaInput(t.issueDate);
+      if (f < desde) { inicial = round2(inicial + v); continue; }
+      if (f > hasta) continue;
+      const pref = prefijoRef(t.invoiceNumber);
+      const abs  = t.asiento_id ? idx.abonosPorAsiento.get(t.asiento_id) ?? [] : [];
+      const ty   = String(t.type);
+      const k = isFxTx(t) ? 'FX'
+        : ty === 'FINANCING_IN' ? 'FIN_IN' : ty === 'FINANCING_OUT' ? 'FIN_OUT'
+        : esReembolsoTx(t) ? 'OP_REEMB'
+        : (t.category === CATEGORIA_BILLETERA || pref === 'WAL') ? 'OP_ANTICIPOS'
+        : t.category === 'Anticipos sin matrícula' ? 'OP_SINMAT'
+        : v > 0 ? (['HRS', 'HORA', 'COB', 'CXC'].includes(pref) || t.category === 'Academia' ? 'OP_ALUMNOS' : 'OP_OTROS_ING')
+        : (abs.some(a => a.cuenta_tipo === 'CXP') || pref === 'PAG') ? 'OP_PROV'
+        : (ty === 'INSTRUCTOR_PAY' || pref === 'NOM') ? 'OP_NOMINA' : 'OP_GASTOS';
+      g.set(k, round2((g.get(k) ?? 0) + v));
+    }
+    const filas = G.map(([k, l]) => ({ k, l, v: g.get(k) ?? 0 }));
+    const op  = round2(filas.filter(f => f.k.startsWith('OP_')).reduce((a, f) => a + f.v, 0));
+    const fin = round2(filas.filter(f => f.k.startsWith('FIN_')).reduce((a, f) => a + f.v, 0));
+    const fx  = g.get('FX') ?? 0;
+    const neto = round2(op + fin + fx);
+    return { filas, inicial, op, fin, fx, neto, final: round2(inicial + neto) };
+  }, [transactions, usdTx, desde, hasta, idx]);
+
+  // ── Antigüedad ──────────────────────────────────────────────────────────
+  const aging = useMemo(() => {
+    const ref = Date.parse(hoy);
+    const bucket = (d: string | null | undefined) => {
+      const dias = Math.max(0, Math.floor((ref - Date.parse(fechaInput(d))) / 86_400_000));
+      return dias <= 30 ? 0 : dias <= 60 ? 1 : dias <= 90 ? 2 : 3;
+    };
+    const agrupar = <T,>(items: T[], key: (x: T) => string, fecha: (x: T) => string, monto: (x: T) => number) => {
+      const m = new Map<string, number[]>();
+      for (const it of items) {
+        const fila = m.get(key(it)) ?? [0, 0, 0, 0, 0];
+        const b = bucket(fecha(it)); const v = monto(it);
+        fila[b] = round2(fila[b] + v); fila[4] = round2(fila[4] + v);
+        m.set(key(it), fila);
+      }
+      return Array.from(m.entries()).sort((a, b) => b[1][4] - a[1][4]);
+    };
+    const cxc = agrupar(cuentasCxC.filter(c => (c.estatus === 'PENDIENTE' || c.estatus === 'PARCIAL') && c.monto_pendiente > 0),
+      c => c.nombre_alumno || 'ALUMNO', c => c.fecha_emision, c => aUsd(c.monto_pendiente, c.moneda));
+    const cxp = agrupar(cuentas.filter(c => c.estatus !== 'PAGADO' && c.categoria_interna !== 'REPOSICION_CAJA' && c.monto_pendiente > 0),
+      c => c.entidad_nombre, c => c.fecha_emision, c => aUsd(c.monto_pendiente, c.moneda));
+    const tot = (rows: [string, number[]][]) => [0, 1, 2, 3, 4].map(i => round2(rows.reduce((a, r) => a + r[1][i], 0)));
+    return { cxc, cxp, totCxc: tot(cxc), totCxp: tot(cxp) };
+  }, [cuentasCxC, cuentas, aUsd, hoy]);
+
+  const sinClase = useMemo(() => lineas.filter(l => l.tabla && l.registroId && l.inferida), [lineas]);
+
+  // ── Impresión / CSV ─────────────────────────────────────────────────────
+  const periodoTxt = `${fmtDate(desde)} – ${fmtDate(hasta)}`;
+  const metaBase: [string, string][] = [['Período', periodoTxt], ['Base', base === 'DEVENGADO' ? 'Devengado' : 'Efectivo'], ['Tasa Bs/USD', String(tasaBCV)]];
+  const pct = (v: number, t: number) => (t > 0 ? `${((v / t) * 100).toFixed(1)}%` : '—');
+
+  const imprimirReporte = () => {
+    if (rep === 'PL') {
+      imprimirDocumento({
+        titulo: 'Estado de Resultados', subtitulo: base === 'DEVENGADO' ? 'Base devengado (consumos y facturación del período)' : 'Base efectivo (movimientos de bóveda)',
+        meta: metaBase,
+        resumen: [['Ingresos', usd(resumen.totIng)], ['Gastos', usd(resumen.totGas)], ['Resultado neto', usd(resumen.utilidad)], ['Margen', pct(resumen.utilidad, resumen.totIng)]],
+        secciones: [
+          { titulo: 'Ingresos', columnas: ['Cuenta', 'Movs.', 'USD', '% ingresos'], alinear: ['l', 'r', 'r', 'r'],
+            filas: resumen.ingresos.map(x => [labelServicio(x.servicio), x.n, usd(x.usd), pct(x.usd, resumen.totIng)]),
+            totales: ['Total ingresos', '', usd(resumen.totIng), '100%'] },
+          { titulo: 'Gastos', columnas: ['Cuenta', 'Movs.', 'USD', '% ingresos'], alinear: ['l', 'r', 'r', 'r'],
+            filas: resumen.gastos.map(x => [labelServicio(x.servicio), x.n, usd(x.usd), pct(x.usd, resumen.totIng)]),
+            totales: ['Total gastos', '', usd(resumen.totGas), pct(resumen.totGas, resumen.totIng)] },
+          { titulo: 'Resultado', columnas: ['Concepto', 'USD'], alinear: ['l', 'r'],
+            filas: [['Ingresos', usd(resumen.totIng)], ['(−) Gastos', usd(resumen.totGas)]], totales: ['Resultado neto', usd(resumen.utilidad)],
+            nota: 'Bolívares convertidos a la tasa registrada en el movimiento o, en su defecto, a la tasa vigente del panel. No incluye depreciación de aeronaves.' },
+        ],
+      });
+    } else if (rep === 'PL_CLASE') {
+      const cols = porClase.cols;
+      const fila = (f: { servicio: string; m: Map<string, number>; total: number }) => [labelServicio(f.servicio), ...cols.map(c => usd(f.m.get(c) ?? 0)), usd(f.total)];
+      const tot = (m: Map<string, number>) => usd(round2(cols.reduce((a, c) => a + (m.get(c) ?? 0), 0)));
+      const al: ('l' | 'r')[] = ['l', ...cols.map(() => 'r' as const), 'r'];
+      imprimirDocumento({
+        titulo: `Estado de Resultados por ${DIMENSIONES.find(d => d.k === dim)?.l ?? dim}`, horizontal: true, meta: metaBase,
+        secciones: [
+          { titulo: 'Ingresos', columnas: ['Cuenta', ...cols, 'Total'], alinear: al, filas: porClase.ing.map(fila),
+            totales: ['Total ingresos', ...cols.map(c => usd(porClase.totIng.get(c) ?? 0)), tot(porClase.totIng)] },
+          { titulo: 'Gastos', columnas: ['Cuenta', ...cols, 'Total'], alinear: al, filas: porClase.gas.map(fila),
+            totales: ['Total gastos', ...cols.map(c => usd(porClase.totGas.get(c) ?? 0)), tot(porClase.totGas)] },
+          { titulo: 'Rentabilidad', columnas: ['Concepto', ...cols, 'Total'], alinear: al,
+            filas: [['Margen %', ...cols.map(c => pct(porClase.util.get(c) ?? 0, porClase.totIng.get(c) ?? 0)), pct(resumen.utilidad, resumen.totIng)]],
+            totales: ['Resultado', ...cols.map(c => usd(porClase.util.get(c) ?? 0)), usd(resumen.utilidad)],
+            nota: '"SIN CLASE" agrupa movimientos sin esa dimensión. Clasifíquelos en Reportes → Sin clasificar para afinar la rentabilidad por aeronave.' },
+        ],
+      });
+    } else if (rep === 'BALANCE') {
+      const b = balance;
+      imprimirDocumento({
+        titulo: 'Balance General', subtitulo: `Al ${fmtDate(hoy)}`, meta: [['Tasa Bs/USD', String(tasaBCV)]],
+        resumen: [['Activos', usd(b.activos)], ['Pasivos', usd(b.pasivos)], ['Patrimonio', usd(b.patrimonio)]],
+        secciones: [
+          { titulo: 'Activos', columnas: ['Cuenta', 'Moneda nativa', 'USD'], alinear: ['l', 'r', 'r'],
+            filas: [
+              ...b.bovedas.map(x => [`Bóveda ${x.m}`, fmtMonto(x.nativo, x.m), usd(x.usd)]),
+              ['Cuentas por cobrar · consumos de billetera', '', usd(b.cxcBill)],
+              ['Cuentas por cobrar · alumnos (otras)', '', usd(b.cxcOtras)],
+            ], totales: ['Total activos', '', usd(b.activos)] },
+          { titulo: 'Pasivos', columnas: ['Cuenta', '', 'USD'], alinear: ['l', 'r', 'r'],
+            filas: [
+              ['Cuentas por pagar · proveedores', '', usd(b.cxpProv)], ['Préstamos por pagar', '', usd(b.prestamos)],
+              ['Anticipos de alumnos · billeteras', '', usd(b.billeteras)], ['Anticipos sin matrícula por aplicar', '', usd(b.provPend)],
+            ], totales: ['Total pasivos', '', usd(b.pasivos)] },
+          { titulo: 'Patrimonio', columnas: ['Cuenta', '', 'USD'], alinear: ['l', 'r', 'r'],
+            filas: [['Patrimonio neto (activos − pasivos)', '', usd(b.patrimonio)]], totales: ['Total pasivo + patrimonio', '', usd(b.activos)],
+            nota: `Memo: reposiciones internas entre cajas ${usd(b.reposiciones)} (no son deuda con terceros).${b.inventario.n ? ` Inventario MRO estimado ${usd(b.inventario.total)} (${b.inventario.n} ítems, no incluido).` : ''} No incluye aeronaves ni activos fijos.` },
+        ],
+      });
+    } else if (rep === 'FLUJO') {
+      imprimirDocumento({
+        titulo: 'Estado de Flujo de Efectivo', meta: metaBase.filter(([k]) => k !== 'Base'),
+        resumen: [['Saldo inicial', usd(flujo.inicial)], ['Variación neta', usd(flujo.neto)], ['Saldo final', usd(flujo.final)]],
+        secciones: [
+          { titulo: 'Actividades de operación', columnas: ['Concepto', 'USD'], alinear: ['l', 'r'],
+            filas: flujo.filas.filter(f => f.k.startsWith('OP_')).map(f => [f.l, usd(f.v)]), totales: ['Flujo operativo', usd(flujo.op)] },
+          { titulo: 'Actividades de financiamiento', columnas: ['Concepto', 'USD'], alinear: ['l', 'r'],
+            filas: flujo.filas.filter(f => f.k.startsWith('FIN_')).map(f => [f.l, usd(f.v)]), totales: ['Flujo de financiamiento', usd(flujo.fin)] },
+          { titulo: 'Conciliación', columnas: ['Concepto', 'USD'], alinear: ['l', 'r'],
+            filas: [['Saldo inicial de efectivo', usd(flujo.inicial)], ['Flujo operativo', usd(flujo.op)], ['Flujo de financiamiento', usd(flujo.fin)], ['Cambio de moneda (FX)', usd(flujo.fx)]],
+            totales: ['Saldo final de efectivo', usd(flujo.final)] },
+        ],
+      });
+    } else if (rep === 'AGING') {
+      const cols = ['Entidad', '0–30 d', '31–60 d', '61–90 d', '+90 d', 'Total'];
+      const al: ('l' | 'r')[] = ['l', 'r', 'r', 'r', 'r', 'r'];
+      imprimirDocumento({
+        titulo: 'Antigüedad de Saldos', subtitulo: 'Días desde la emisión', meta: [['Corte', fmtDate(hoy)]],
+        secciones: [
+          { titulo: 'Cuentas por cobrar (alumnos)', columnas: cols, alinear: al, filas: aging.cxc.map(([k, v]) => [k, ...v.map(usd)]), totales: ['Total', ...aging.totCxc.map(usd)] },
+          { titulo: 'Cuentas por pagar (proveedores y préstamos)', columnas: cols, alinear: al, filas: aging.cxp.map(([k, v]) => [k, ...v.map(usd)]), totales: ['Total', ...aging.totCxp.map(usd)] },
+        ],
+      });
+    } else if (rep === 'SIN_CLASE') {
+      imprimirDocumento({
+        titulo: 'Movimientos sin clase explícita', meta: metaBase,
+        secciones: [{ columnas: ['Fecha', 'Origen', 'Ref.', 'Detalle', 'Servicio inferido', 'Aeronave', 'USD'], alinear: ['l', 'l', 'l', 'l', 'l', 'l', 'r'],
+          filas: sinClase.map(l => [fmtDate(l.fecha), l.origen, l.ref, l.detalle, labelServicio(l.servicio), l.aeronave || '—', usd(l.usd)]) }],
+      });
+    }
+  };
+
+  const exportarCSV = () => {
+    if (rep === 'PL_CLASE') {
+      const cols = porClase.cols;
+      downloadCSV([
+        ['Naturaleza', 'Cuenta', ...cols, 'Total'],
+        ...porClase.ing.map(f => ['INGRESO', `"${labelServicio(f.servicio)}"`, ...cols.map(c => (f.m.get(c) ?? 0).toFixed(2)), f.total.toFixed(2)]),
+        ...porClase.gas.map(f => ['GASTO', `"${labelServicio(f.servicio)}"`, ...cols.map(c => (f.m.get(c) ?? 0).toFixed(2)), f.total.toFixed(2)]),
+        ['RESULTADO', '', ...cols.map(c => (porClase.util.get(c) ?? 0).toFixed(2)), resumen.utilidad.toFixed(2)],
+      ], `PL_por_${dim}_${desde}_${hasta}.csv`);
+      return;
+    }
+    downloadCSV([
+      ['Fecha', 'Naturaleza', 'Cuenta', 'Aeronave', 'Sede', 'Piloto', 'Proyecto', 'USD', 'Origen', 'Ref', 'Detalle', 'Clase'],
+      ...lineas.map(l => [l.fecha, l.nat, `"${labelServicio(l.servicio)}"`, l.aeronave, l.sede, `"${l.piloto}"`, `"${l.proyecto}"`,
+        l.usd.toFixed(2), `"${l.origen}"`, l.ref, `"${l.detalle.replace(/"/g, "'")}"`, l.inferida ? 'INFERIDA' : 'EXPLÍCITA']),
+    ], `Resultados_${base}_${desde}_${hasta}.csv`);
+  };
+
+  // ── Render ──────────────────────────────────────────────────────────────
+  const chip = (on: boolean) => `px-3 py-2 rounded-xl text-[9px] font-black uppercase border transition-all ${on ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`;
+  const fila = (l: string, v: number, extra = '', bold = false) => (
+    <div className={`flex justify-between items-center py-2 border-b border-white/[0.04] ${bold ? 'font-black' : ''}`}>
+      <span className={`text-[10px] uppercase ${bold ? 'text-white' : 'text-zinc-400'}`}>{l}</span>
+      <span className={`text-[11px] font-black italic ${extra || (v < 0 ? 'text-red-400' : 'text-white')}`}>{usd(v)}</span>
+    </div>
+  );
+  const usaPeriodo = rep !== 'BALANCE' && rep !== 'AGING';
+  const usaBase    = rep === 'PL' || rep === 'PL_CLASE' || rep === 'SIN_CLASE';
+
+  return (
+    <div className="space-y-5">
+      {!v17 && (
+        <div className="flex items-start gap-3 p-4 rounded-xl bg-orange-500/10 border border-orange-500/30">
+          <Info size={14} className="text-orange-400 shrink-0 mt-0.5" />
+          <p className="text-[9px] text-orange-200 font-mono">Migración v17 no instalada: los reportes usan solo el Diario y CxC/CxP con clases inferidas. Billeteras, consumos y clases explícitas no están disponibles.</p>
+        </div>
+      )}
+      <div className={`${glass} rounded-3xl p-5 space-y-4`}>
+        <div className="flex flex-wrap gap-1.5">
+          {REPORTES.map(r => <button key={r.k} type="button" onClick={() => setRep(r.k)} className={chip(rep === r.k)}>{r.l}</button>)}
+        </div>
+        <div className="flex flex-wrap items-end gap-3">
+          {usaPeriodo && (<>
+            <div><Lbl>Desde</Lbl><input type="date" value={desde} onChange={e => setDesde(e.target.value)} className={`${inp} py-2.5`} style={noUpper} /></div>
+            <div><Lbl>Hasta</Lbl><input type="date" value={hasta} onChange={e => setHasta(e.target.value)} className={`${inp} py-2.5`} style={noUpper} /></div>
+            <div className="flex flex-wrap gap-1">
+              {presets.map(p => <button key={p.l} type="button" onClick={() => { setDesde(p.d); setHasta(p.h); }} className={chip(desde === p.d && hasta === p.h)}>{p.l}</button>)}
+            </div>
+          </>)}
+          {usaBase && (
+            <div className="flex gap-1">
+              {(['DEVENGADO', 'EFECTIVO'] as BasePL[]).map(b => <button key={b} type="button" onClick={() => setBase(b)} className={chip(base === b)}>{b === 'DEVENGADO' ? 'Base devengado' : 'Base efectivo'}</button>)}
+            </div>
+          )}
+          {rep === 'PL_CLASE' && (
+            <div className="min-w-[220px]"><Lbl>Clase</Lbl>
+              <select value={dim} onChange={e => setDim(e.target.value as DimensionPL)} className={`${inp} py-2.5`}>
+                {DIMENSIONES.map(d => <option key={d.k} value={d.k}>{d.l}</option>)}
+              </select>
+            </div>
+          )}
+          {rep !== 'IMPRESION' && (
+            <div className="flex gap-2 ml-auto">
+              {(rep === 'PL' || rep === 'PL_CLASE') && (
+                <button type="button" onClick={exportarCSV} className="bg-emerald-500/10 text-emerald-400 px-4 py-2.5 rounded-xl border border-emerald-500/20 text-[9px] font-black uppercase flex items-center gap-2 hover:bg-emerald-500/20"><Download size={12} /> CSV</button>
+              )}
+              <button type="button" onClick={imprimirReporte} className="bg-[#E1AD01] text-black px-4 py-2.5 rounded-xl text-[9px] font-black uppercase flex items-center gap-2 hover:bg-white"><Printer size={12} /> Imprimir / PDF</button>
+            </div>
+          )}
+        </div>
+        {usaBase && (
+          <p className="text-[8px] text-zinc-600 font-mono">
+            {base === 'DEVENGADO'
+              ? 'Devengado: ingreso cuando el alumno consume (vuelo, simulador, curso) o se le factura a crédito; gasto cuando se recibe la factura (CxP). Recargas de billetera y anticipos son pasivo, no ingreso.'
+              : 'Efectivo: ingreso/gasto cuando el dinero entra o sale de bóveda. Recargas de billetera y reembolsos se muestran en líneas propias.'}
+          </p>
+        )}
+      </div>
+
+      {rep === 'PL' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+          <div className="lg:col-span-4 grid grid-cols-2 lg:grid-cols-1 gap-3">
+            {([['Ingresos', resumen.totIng, 'text-emerald-400'], ['Gastos', resumen.totGas, 'text-red-400'],
+               ['Resultado neto', resumen.utilidad, resumen.utilidad >= 0 ? 'text-[#E1AD01]' : 'text-red-400']] as const).map(([l, v, c]) => (
+              <div key={l} className={`${glass} rounded-2xl p-5`}>
+                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">{l}</p>
+                <p className={`text-2xl font-black italic mt-1 ${c}`}>{usd(v)}</p>
+              </div>
+            ))}
+            <div className={`${glass} rounded-2xl p-5`}>
+              <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">Margen neto</p>
+              <p className="text-2xl font-black italic mt-1 text-white">{pct(resumen.utilidad, resumen.totIng)}</p>
+            </div>
+          </div>
+          <div className={`lg:col-span-8 ${glass} rounded-3xl p-6`}>
+            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400 mb-2">Ingresos</p>
+            {resumen.ingresos.length === 0 && <EmptyState text="Sin ingresos en el período" py="py-6" />}
+            {resumen.ingresos.map(x => <React.Fragment key={x.servicio}>{fila(`${labelServicio(x.servicio)}${x.inferidas ? ` · ${x.inferidas} inferida${x.inferidas === 1 ? '' : 's'}` : ''}`, x.usd)}</React.Fragment>)}
+            {fila('Total ingresos', resumen.totIng, 'text-emerald-400', true)}
+            <p className="text-[10px] font-black uppercase tracking-widest text-red-400 mt-6 mb-2">Gastos</p>
+            {resumen.gastos.length === 0 && <EmptyState text="Sin gastos en el período" py="py-6" />}
+            {resumen.gastos.map(x => <React.Fragment key={x.servicio}>{fila(`${labelServicio(x.servicio)}${x.inferidas ? ` · ${x.inferidas} inferida${x.inferidas === 1 ? '' : 's'}` : ''}`, x.usd)}</React.Fragment>)}
+            {fila('Total gastos', resumen.totGas, 'text-red-400', true)}
+            <div className="mt-4">{fila('Resultado neto del período', resumen.utilidad, resumen.utilidad >= 0 ? 'text-[#E1AD01]' : 'text-red-400', true)}</div>
+          </div>
+        </div>
+      )}
+
+      {rep === 'PL_CLASE' && (
+        <div className={`${glass} rounded-3xl overflow-hidden`}>
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px] font-mono">
+              <thead>
+                <tr className="text-zinc-500 text-[8px] uppercase tracking-widest border-b border-white/10">
+                  <th className="text-left p-3 font-black sticky left-0 bg-[#0b0b0b]">Cuenta</th>
+                  {porClase.cols.map(c => <th key={c} className={`text-right p-3 font-black whitespace-nowrap ${c === 'SIN CLASE' ? 'text-zinc-700' : 'text-[#E1AD01]'}`}>{c}</th>)}
+                  <th className="text-right p-3 font-black text-white">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(['INGRESO', 'GASTO'] as const).map(nat => {
+                  const fs = nat === 'INGRESO' ? porClase.ing : porClase.gas;
+                  const tot = nat === 'INGRESO' ? porClase.totIng : porClase.totGas;
+                  return (
+                    <React.Fragment key={nat}>
+                      <tr><td colSpan={porClase.cols.length + 2} className={`p-3 text-[9px] font-black uppercase tracking-widest ${nat === 'INGRESO' ? 'text-emerald-400' : 'text-red-400'}`}>{nat === 'INGRESO' ? 'Ingresos' : 'Gastos'}</td></tr>
+                      {fs.map(f => (
+                        <tr key={`${nat}${f.servicio}`} className="border-t border-white/[0.04] hover:bg-white/[0.02]">
+                          <td className="p-3 uppercase text-zinc-300 sticky left-0 bg-[#0b0b0b] whitespace-nowrap">{labelServicio(f.servicio)}</td>
+                          {porClase.cols.map(c => { const v = f.m.get(c) ?? 0; return <td key={c} className={`p-3 text-right ${Math.abs(v) < 0.005 ? 'text-zinc-800' : 'text-white'}`}>{usd(v)}</td>; })}
+                          <td className="p-3 text-right font-black">{usd(f.total)}</td>
+                        </tr>
+                      ))}
+                      <tr className="border-t border-white/10">
+                        <td className="p-3 font-black uppercase sticky left-0 bg-[#0b0b0b]">Total {nat === 'INGRESO' ? 'ingresos' : 'gastos'}</td>
+                        {porClase.cols.map(c => <td key={c} className={`p-3 text-right font-black ${nat === 'INGRESO' ? 'text-emerald-400' : 'text-red-400'}`}>{usd(tot.get(c) ?? 0)}</td>)}
+                        <td className="p-3 text-right font-black">{usd(nat === 'INGRESO' ? resumen.totIng : resumen.totGas)}</td>
+                      </tr>
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+              <tfoot>
+                <tr className="border-t-2 border-[#E1AD01]/40">
+                  <td className="p-3 font-black uppercase text-[#E1AD01] sticky left-0 bg-[#0b0b0b]">Resultado</td>
+                  {porClase.cols.map(c => { const v = porClase.util.get(c) ?? 0; return <td key={c} className={`p-3 text-right font-black italic ${v >= 0 ? 'text-[#E1AD01]' : 'text-red-400'}`}>{usd(v)}</td>; })}
+                  <td className={`p-3 text-right font-black italic ${resumen.utilidad >= 0 ? 'text-[#E1AD01]' : 'text-red-400'}`}>{usd(resumen.utilidad)}</td>
+                </tr>
+                <tr>
+                  <td className="p-3 text-[8px] uppercase text-zinc-600 sticky left-0 bg-[#0b0b0b]">Margen</td>
+                  {porClase.cols.map(c => <td key={c} className="p-3 text-right text-[9px] text-zinc-500">{pct(porClase.util.get(c) ?? 0, porClase.totIng.get(c) ?? 0)}</td>)}
+                  <td className="p-3 text-right text-[9px] text-zinc-400">{pct(resumen.utilidad, resumen.totIng)}</td>
+                </tr>
+              </tfoot>
+            </table>
+            {porClase.cols.length === 0 && <EmptyState icon={BarChart3} text="Sin movimientos en el período" />}
+          </div>
+        </div>
+      )}
+
+      {rep === 'BALANCE' && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+          <div className={`${glass} rounded-3xl p-6`}>
+            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400 mb-3">Activos</p>
+            {balance.bovedas.map(b => <React.Fragment key={b.m}>{fila(`Bóveda ${b.m}${b.m === 'BS' ? ` (${fmtMonto(b.nativo, 'BS')})` : ''}`, b.usd)}</React.Fragment>)}
+            {fila('CxC · consumos de billetera', balance.cxcBill)}
+            {fila('CxC · alumnos (otras)', balance.cxcOtras)}
+            {fila('Total activos', balance.activos, 'text-emerald-400', true)}
+          </div>
+          <div className={`${glass} rounded-3xl p-6`}>
+            <p className="text-[10px] font-black uppercase tracking-widest text-orange-400 mb-3">Pasivos</p>
+            {fila('CxP · proveedores', balance.cxpProv)}
+            {fila('Préstamos por pagar', balance.prestamos)}
+            {fila('Anticipos · billeteras de alumnos', balance.billeteras)}
+            {fila('Anticipos sin matrícula por aplicar', balance.provPend)}
+            {fila('Total pasivos', balance.pasivos, 'text-orange-400', true)}
+          </div>
+          <div className={`${glass} rounded-3xl p-6`}>
+            <p className="text-[10px] font-black uppercase tracking-widest text-[#E1AD01] mb-3">Patrimonio</p>
+            {fila('Patrimonio neto', balance.patrimonio, balance.patrimonio >= 0 ? 'text-[#E1AD01]' : 'text-red-400', true)}
+            <div className="mt-4 space-y-1 text-[8px] text-zinc-600 font-mono">
+              <p>Memo · reposiciones internas: {usd(balance.reposiciones)} (no es deuda con terceros).</p>
+              {balance.inventario.n > 0 && <p>Memo · inventario MRO estimado: {usd(balance.inventario.total)} ({balance.inventario.n} ítems, no incluido en totales).</p>}
+              <p>No incluye aeronaves ni activos fijos. BS a tasa {tasaBCV}.</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {rep === 'FLUJO' && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+          <div className="lg:col-span-4 grid grid-cols-3 lg:grid-cols-1 gap-3">
+            {([['Saldo inicial', flujo.inicial], ['Variación neta', flujo.neto], ['Saldo final', flujo.final]] as const).map(([l, v]) => (
+              <div key={l} className={`${glass} rounded-2xl p-5`}>
+                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">{l}</p>
+                <p className={`text-xl font-black italic mt-1 ${v >= 0 ? 'text-white' : 'text-red-400'}`}>{usd(v)}</p>
+              </div>
+            ))}
+          </div>
+          <div className={`lg:col-span-8 ${glass} rounded-3xl p-6`}>
+            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400 mb-2">Operación</p>
+            {flujo.filas.filter(f => f.k.startsWith('OP_')).map(f => <React.Fragment key={f.k}>{fila(f.l, f.v)}</React.Fragment>)}
+            {fila('Flujo operativo', flujo.op, flujo.op >= 0 ? 'text-emerald-400' : 'text-red-400', true)}
+            <p className="text-[10px] font-black uppercase tracking-widest text-violet-400 mt-5 mb-2">Financiamiento</p>
+            {flujo.filas.filter(f => f.k.startsWith('FIN_')).map(f => <React.Fragment key={f.k}>{fila(f.l, f.v)}</React.Fragment>)}
+            {fila('Flujo de financiamiento', flujo.fin, 'text-violet-400', true)}
+            <div className="mt-5">{fila('Cambio de moneda (FX)', flujo.fx, 'text-teal-400')}</div>
+            <div className="mt-2">{fila('Saldo final de efectivo (USD eq.)', flujo.final, 'text-[#E1AD01]', true)}</div>
+          </div>
+        </div>
+      )}
+
+      {rep === 'AGING' && (
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+          {([['Por cobrar · alumnos', aging.cxc, aging.totCxc, 'text-yellow-400'], ['Por pagar · proveedores y préstamos', aging.cxp, aging.totCxp, 'text-orange-400']] as const).map(([t, rows, tot, c]) => (
+            <div key={t} className={`${glass} rounded-3xl overflow-hidden`}>
+              <p className={`p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest ${c}`}>{t}</p>
+              <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
+                <table className="w-full text-[10px] font-mono">
+                  <thead><tr className="text-zinc-600 text-[8px] uppercase">{['Entidad', '0–30', '31–60', '61–90', '+90', 'Total'].map((h, i) => <th key={h} className={`p-3 font-black ${i ? 'text-right' : 'text-left'}`}>{h}</th>)}</tr></thead>
+                  <tbody>
+                    {rows.map(([k, v]) => (
+                      <tr key={k} className="border-t border-white/[0.04]">
+                        <td className="p-3 uppercase truncate max-w-[200px]">{k}</td>
+                        {v.map((x, i) => <td key={i} className={`p-3 text-right ${i === 3 && x > 0 ? 'text-red-400 font-black' : i === 4 ? 'font-black' : ''}`}>{usd(x)}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot><tr className="border-t border-white/10">{['Total', ...tot.map(usd)].map((x, i) => <td key={i} className={`p-3 font-black ${i ? 'text-right' : ''}`}>{x}</td>)}</tr></tfoot>
+                </table>
+                {rows.length === 0 && <EmptyState text="Sin saldos pendientes" />}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {rep === 'SIN_CLASE' && (
+        <div className={`${glass} rounded-3xl overflow-hidden`}>
+          <div className="p-5 border-b border-white/5 flex flex-wrap gap-3 items-center justify-between">
+            <p className="text-[10px] font-black uppercase tracking-widest">{sinClase.length} movimientos con clase inferida · {selSinClase.size} seleccionados</p>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => setSelSinClase(new Set(sinClase.map(l => `${l.tabla}:${l.registroId}`)))} className={chip(false)}>Seleccionar todo</button>
+              <button type="button" disabled={!selSinClase.size || !canEdit || !v17}
+                onClick={() => {
+                  const items = Array.from(selSinClase).map(k => { const [tabla, id] = k.split(/:(.+)/); return { tabla: tabla as TablaClase, id }; });
+                  const primero = sinClase.find(l => `${l.tabla}:${l.registroId}` === Array.from(selSinClase)[0]);
+                  onReclasificar({ items, titulo: `${items.length} movimiento(s)`, inicial: primero ? { servicio: primero.servicio, aeronave: primero.aeronave, sede: primero.sede, piloto: primero.piloto, proyecto: primero.proyecto } : CLASE_VACIA });
+                  setSelSinClase(new Set());
+                }}
+                className="bg-teal-500/15 text-teal-400 border border-teal-500/30 px-4 py-2 rounded-xl text-[9px] font-black uppercase disabled:opacity-30 flex items-center gap-2"><Tag size={12} /> Clasificar seleccionados</button>
+            </div>
+          </div>
+          <div className="max-h-[560px] overflow-y-auto p-4 space-y-1.5">
+            {sinClase.map(l => {
+              const k = `${l.tabla}:${l.registroId}`;
+              const on = selSinClase.has(k);
+              return (
+                <label key={k} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${on ? 'border-teal-500/40 bg-teal-500/5' : 'border-white/[0.05] hover:bg-white/[0.02]'}`}>
+                  <input type="checkbox" checked={on} onChange={() => setSelSinClase(p => { const n = new Set(p); if (n.has(k)) n.delete(k); else n.add(k); return n; })} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[10px] font-black uppercase truncate">{l.detalle}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(l.fecha)} · {l.origen} · {l.ref} · inferido: <span className="text-teal-400">{labelServicio(l.servicio)}</span>{l.aeronave ? ` · ${l.aeronave}` : ''}</p>
+                  </div>
+                  <span className={`text-[11px] font-black italic ${l.nat === 'INGRESO' ? 'text-emerald-400' : 'text-red-400'}`}>{l.nat === 'INGRESO' ? '+' : '−'}{usd(l.usd)}</span>
+                </label>
+              );
+            })}
+            {sinClase.length === 0 && <EmptyState icon={CheckCircle2} text="Todo el período tiene clase explícita" />}
+          </div>
+        </div>
+      )}
+
+      {rep === 'IMPRESION' && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          <div className={`${glass} rounded-3xl p-6 space-y-4`}>
+            <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Banknote size={14} className="text-[#E1AD01]" /> Movimientos de caja</h3>
+            <select value={cajaImp} onChange={e => setCajaImp(e.target.value)} className={inp}>
+              <option value="">TODAS LAS CAJAS (GLOBAL)</option>
+              {cajas.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+            </select>
+            <div className="grid grid-cols-2 gap-3">
+              <div><Lbl>Desde</Lbl><input type="date" value={desde} onChange={e => setDesde(e.target.value)} className={inp} style={noUpper} /></div>
+              <div><Lbl>Hasta</Lbl><input type="date" value={hasta} onChange={e => setHasta(e.target.value)} className={inp} style={noUpper} /></div>
+            </div>
+            <button type="button" onClick={() => onImprimirCaja(cajaImp || null, desde, hasta)} className="w-full py-4 bg-[#E1AD01] text-black rounded-2xl font-black text-[10px] uppercase flex items-center justify-center gap-2 hover:bg-white"><Printer size={14} /> Imprimir movimientos</button>
+          </div>
+          <div className={`${glass} rounded-3xl p-6 space-y-4`}>
+            <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Receipt size={14} className="text-[#E1AD01]" /> Estado de cuenta por alumno</h3>
+            <select value={alumnoImp} onChange={e => setAlumnoImp(e.target.value)} className={inp}>
+              <option value="">— SELECCIONE ALUMNO —</option>
+              {alumnos.map(a => <option key={a.student_id} value={a.student_id}>{a.nombre} · {a.serial} · {a.sede}</option>)}
+            </select>
+            <p className="text-[8px] text-zinc-600 font-mono">Incluye billetera, consumos, cuentas por cobrar y pagos con trazabilidad del alumno.</p>
+            <button type="button" disabled={!alumnoImp} onClick={() => onImprimirAlumno(alumnoImp)} className="w-full py-4 bg-[#E1AD01] text-black rounded-2xl font-black text-[10px] uppercase flex items-center justify-center gap-2 hover:bg-white disabled:opacity-30"><Printer size={14} /> Imprimir estado de cuenta</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 
-export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 'SIN_RANGO', setGlobalFinance = NOOP }) => {
+export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory = [], userRole = 'SIN_RANGO', setGlobalFinance = NOOP }) => {
   const [activeTab, setActiveTab] = useState<TabType>('LEDGER');
   const [tasaBCV,   setTasaBCV]   = useState(DEFAULT_TASA_BS);
 
@@ -827,6 +1887,53 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   const [reqAmount,   setReqAmount]   = useState('');
   const [physBalances, setPhysBalances] = useState<Record<PaymentMethod, string>>({ USDT: '', ZELLE: '', CASH: '', BS: '' });
 
+  // ▼ v17 — billeteras, consumos, tarifario, clases contables
+  const [walletCuentas,  setWalletCuentas]  = useState<WalletCuenta[]>([]);
+  const [walletMovs,     setWalletMovs]     = useState<WalletMovimiento[]>([]);
+  const [consumos,       setConsumos]       = useState<WalletConsumo[]>([]);
+  const [servicios,      setServicios]      = useState<ServicioCatalogo[]>([]);
+  const [clasif,         setClasif]         = useState<ClasificacionRow[]>([]);
+  const [flota,          setFlota]          = useState<string[]>([]);
+  const [vuelosBitacora, setVuelosBitacora] = useState<VueloBitacora[]>([]);
+  const [walletCorte,    setWalletCorte]    = useState<string>(hoyISO());
+  const [creditoMax,     setCreditoMax]     = useState<number | null>(null);
+  const [v17Instalado,   setV17Instalado]   = useState(true);
+  const [v17Avisos,      setV17Avisos]      = useState<string[]>([]);
+  const [walletError,    setWalletError]    = useState<string | null>(null);
+  const [walletInfo,     setWalletInfo]     = useState<string | null>(null);
+  const [savingWallet,   setSavingWallet]   = useState(false);
+  const [walletSubTab,   setWalletSubTab]   = useState<WalletSubTab>('ALUMNOS');
+  const [walletSel,      setWalletSel]      = useState<string | null>(null);
+  const [walletQuery,    setWalletQuery]    = useState('');
+  const [walletModal,    setWalletModal]    = useState<WalletModal | null>(null);
+  const RECARGA_INIT = {
+    moneda: 'ZELLE' as PaymentMethod, monto: '', tasa: String(DEFAULT_TASA_BS), caja_id: '', subcaja: 'ADM' as SubcajaEfectivo,
+    fecha: hoyISO(), concepto: '', aplicar_deudas: true,
+  };
+  const [recargaForm, setRecargaForm] = useState(RECARGA_INIT);
+  const [recargaPago, setRecargaPago] = useState<PagoForm>(() => pagoVacio());
+  const CONSUMO_INIT = {
+    servicio_id: '', tipo: 'VUELO' as TipoConsumo, cantidad: '1', precio: '', descripcion: '', fecha: hoyISO(),
+    modo: 'BILLETERA' as ModoConsumo, autorizar: false,
+  };
+  const [consumoForm,   setConsumoForm]   = useState(CONSUMO_INIT);
+  const [consumoClase,  setConsumoClase]  = useState<ClaseForm>(CLASE_VACIA);
+  const [ajusteForm,    setAjusteForm]    = useState({ tipo: 'AJUSTE_CREDITO' as AjusteTipo, monto: '', motivo: '' });
+  const [reembolsoForm, setReembolsoForm] = useState({
+    monto_usd: '', moneda: 'ZELLE' as PaymentMethod, tasa: String(DEFAULT_TASA_BS), caja_id: '', subcaja: 'ADM' as SubcajaEfectivo,
+    fecha: hoyISO(), concepto: '', referencia: '',
+  });
+  const [motivoAccion,  setMotivoAccion]  = useState<MotivoAccion | null>(null);
+  const [motivoTexto,   setMotivoTexto]   = useState('');
+  const [servicioEdit,  setServicioEdit]  = useState<ServicioEditForm | null>(null);
+  const [ledgerClase,   setLedgerClase]   = useState<ClaseForm>(CLASE_VACIA);
+  const [movClase,      setMovClase]      = useState<ClaseForm>(CLASE_VACIA);
+  const [cuentaClase,   setCuentaClase]   = useState<ClaseForm>(CLASE_VACIA);
+  const [reclasAccion,  setReclasAccion]  = useState<ReclasAccion | null>(null);
+  const [reclasForm,    setReclasForm]    = useState<ClaseForm>(CLASE_VACIA);
+  const [configForm,    setConfigForm]    = useState({ corte: hoyISO(), credito: '' });
+  const [vueloCargando, setVueloCargando] = useState<string | null>(null);
+
   // ▼ v16.6 — Resolver el rango desde la sesión real.
   // Corrige casos donde el layout entrega "SIN RANGO"/vacío aunque el perfil autenticado sea CEO o ADMIN.
   useEffect(() => {
@@ -885,15 +1992,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
    * Pagina las fuentes que determinan saldos para NO calcular totales incompletos.
    * Ordena por PK, estable incluso si varios movimientos comparten fecha.
    */
-  const leerTablaCompleta = async (tabla: string): Promise<{
+  const leerTablaCompleta = async (tabla: string, orden: string[] = ['id']): Promise<{   // [CHG v17] orden configurable (tablas sin columna id)
     data: any[] | null; error: { message: string; code?: string } | null;
   }> => {
     const PAGE = 500;
     const maxRows = 100_000; // fallo visible: nunca representar parciales como totales.
     const filas: any[] = [];
     for (let inicio = 0; inicio < maxRows; inicio += PAGE) {
-      const { data, error } = await supabase.from(tabla).select('*')
-        .order('id', { ascending: true }).range(inicio, inicio + PAGE - 1);
+      const q = orden.reduce((acc, col) => acc.order(col, { ascending: true }), supabase.from(tabla).select('*'));
+      const { data, error } = await q.range(inicio, inicio + PAGE - 1);
       if (error) return { data: null, error };
       filas.push(...(data ?? []));
       if ((data ?? []).length < PAGE) return { data: filas, error: null };
@@ -924,6 +2031,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         leerTablaCompleta('pagos_trazabilidad'), // [v16.8] historial completo
         leerTablaCompleta('pagos_provisionales'),
       ]);
+
+      // ▼ v17 — billeteras / consumos / tarifario / clases. Errores aquí NO bloquean el panel v16.8.
+      const [wcRes, wmRes, wsRes, scRes, clRes, cfgRes, flotaRes] = await Promise.all([
+        leerTablaCompleta('wallet_cuentas', ['student_id']),
+        leerTablaCompleta('wallet_movimientos'),
+        leerTablaCompleta('wallet_consumos'),
+        supabase.from('servicios_catalogo').select('*').order('tipo').order('nombre'),
+        leerTablaCompleta('clasificacion_contable', ['tabla', 'registro_id']),
+        supabase.from('finanzas_config').select('*'),
+        supabase.from('flota_aviones').select('*'),
+      ]);
+      const cxcBilletera = new Set<string>((wsRes.data ?? []).filter((c: any) => c.cxc_id && c.estado === 'VIGENTE').map((c: any) => String(c.cxc_id)));
 
       // [NEW v16.2] errores por tabla visibles (antes se ignoraban y la sección quedaba vacía)
       const consultas: [string, { error: { message: string; code?: string } | null }][] = [
@@ -1017,7 +2136,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         setCuentasCxC(norm);
         const cuentasConAbonos = new Set(abonosNorm.filter(a => a.cuenta_tipo === 'CXC').map(a => a.cuenta_id));
         setHistoricosRevisar(norm.filter(c => c.estatus === 'COBRADO' && c.monto_total > 0 &&
-          !c.asiento_origen_id && !cuentasConAbonos.has(String(c.id))).length);
+          !c.asiento_origen_id && !cuentasConAbonos.has(String(c.id)) && !cxcBilletera.has(String(c.id))).length);   // [CHG v17] deudas saldadas con billetera no son históricas
       }
 
       if (fxRes.data) setFxRegistros(fxRes.data.map((f: any) => ({
@@ -1028,6 +2147,57 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         caja_origen_id: f.caja_origen_id ?? f.caja_id ?? null, caja_destino_id: f.caja_destino_id ?? null,
         subcaja_origen: f.subcaja_origen ?? null, subcaja_destino: f.subcaja_destino ?? null, referencia: f.referencia ?? null,
       })));
+
+      // ▼ v17 — procesamiento no bloqueante
+      const v17Consultas: [string, { error: { message: string; code?: string } | null }][] = [
+        ['wallet_cuentas', wcRes], ['wallet_movimientos', wmRes], ['wallet_consumos', wsRes],
+        ['servicios_catalogo', scRes], ['clasificacion_contable', clRes], ['finanzas_config', cfgRes],
+      ];
+      const faltaV17 = v17Consultas.some(([, r]) => isMissingRelation(r.error));
+      setV17Instalado(!faltaV17);
+      const avisos = faltaV17 ? [] : v17Consultas.filter(([, r]) => r.error).map(([t, r]) => `${t}: ${r.error?.message ?? 'error'}`);
+      if (flotaRes.error && !isMissingRelation(flotaRes.error)) avisos.push(`flota_aviones: ${flotaRes.error.message}`);
+      if (!faltaV17) {
+        setWalletCuentas((wcRes.data ?? []).map((w: any): WalletCuenta => ({
+          student_id: String(w.student_id), saldo_usd: round2(Number(w.saldo_usd) || 0), actualizado_en: w.actualizado_en,
+        })));
+        setWalletMovs((wmRes.data ?? []).map((m: any): WalletMovimiento => ({
+          ...m, student_id: String(m.student_id), signo: Number(m.signo) < 0 ? -1 : 1,
+          monto_usd: round2(Number(m.monto_usd) || 0), saldo_resultante: round2(Number(m.saldo_resultante) || 0),
+          monto_origen: m.monto_origen != null ? round2(Number(m.monto_origen)) : null, tasa: m.tasa != null ? Number(m.tasa) : null,
+          revertido: !!m.revertido,
+        })).sort((a: WalletMovimiento, b: WalletMovimiento) => String(b.creado_en).localeCompare(String(a.creado_en))));
+        setConsumos((wsRes.data ?? []).map((c: any): WalletConsumo => ({
+          ...c, student_id: String(c.student_id), cantidad: Number(c.cantidad) || 0,
+          precio_unitario_usd: round2(Number(c.precio_unitario_usd) || 0), monto_total_usd: round2(Number(c.monto_total_usd) || 0),
+          monto_billetera_usd: round2(Number(c.monto_billetera_usd) || 0), monto_cxc_usd: round2(Number(c.monto_cxc_usd) || 0),
+          cxc_id: c.cxc_id != null ? String(c.cxc_id) : null, vuelo_id: c.vuelo_id != null ? String(c.vuelo_id) : null,
+        })).sort((a: WalletConsumo, b: WalletConsumo) => String(b.creado_en).localeCompare(String(a.creado_en))));
+        setServicios((scRes.data ?? []).map((s: any): ServicioCatalogo => ({ ...s, precio_usd: round2(Number(s.precio_usd) || 0), activo: !!s.activo })));
+        setClasif((clRes.data ?? []).map((c: any): ClasificacionRow => ({
+          ...c, registro_id: String(c.registro_id), tasa_ref: c.tasa_ref != null ? Number(c.tasa_ref) : null,
+        })));
+        const cfg = new Map<string, unknown>((cfgRes.data ?? []).map((c: any): [string, unknown] => [String(c.clave), c.valor]));
+        const corte = typeof cfg.get('wallet_fecha_corte') === 'string' ? String(cfg.get('wallet_fecha_corte')).slice(0, 10) : hoyISO();
+        const credito = cfg.get('credito_maximo_usd');
+        setWalletCorte(corte);
+        setCreditoMax(credito === null || credito === undefined || credito === '' ? null : Number(credito));
+        setConfigForm({ corte, credito: credito === null || credito === undefined ? '' : String(credito) });
+        // Vuelos desde la fecha de corte (fuente legal: bitacora_vuelos · horas_tac)
+        const { data: vuelosData, error: vuelosErr } = await supabase.from('bitacora_vuelos').select('*')
+          .gte('fecha', corte).order('fecha', { ascending: false }).limit(2000);
+        if (vuelosErr) avisos.push(`bitacora_vuelos: ${vuelosErr.message}`);
+        setVuelosBitacora((vuelosData ?? []).map((v: any): VueloBitacora => ({
+          id: String(v.id), student_id: v.student_id != null ? String(v.student_id) : null,
+          fecha: String(v.fecha ?? v.created_at ?? '').slice(0, 10), horas: round2(Number(v.horas_tac ?? v.horas) || 0),
+          matricula: v.aeronave_matricula ?? v.matricula ?? v.matricula_avion ?? null, tipo_mision: v.tipo_mision ?? null,
+          sede: v.sede_vuelo ?? v.sede ?? null, destino: v.destino ?? null,
+        })));
+      }
+      setFlota(Array.from(new Set((flotaRes.data ?? [])
+        .map((a: any) => String(a.matricula ?? a.tail_number ?? a.tailNumber ?? '').trim().toUpperCase())
+        .filter((m: string) => m.length >= 3))).sort());
+      setV17Avisos(avisos);
     } catch (e) {
       console.error('[FinancePanel v16.5] fetchAll error:', e);
     } finally {
@@ -1048,7 +2218,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   useEffect(() => {
     fetchAll();
     const tablas = ['transacciones_finanzas', 'solicitudes_compra', 'cajas_chicas', 'movimientos_caja_chica',
-      'cuentas_generales', 'cuentas_por_cobrar', 'fx_registros', 'abonos_cuentas', 'asientos_contables', 'pagos_trazabilidad', 'pagos_provisionales'];
+      'cuentas_generales', 'cuentas_por_cobrar', 'fx_registros', 'abonos_cuentas', 'asientos_contables', 'pagos_trazabilidad', 'pagos_provisionales',
+      // ▼ v17
+      'wallet_cuentas', 'wallet_movimientos', 'wallet_consumos', 'servicios_catalogo', 'clasificacion_contable', 'finanzas_config', 'bitacora_vuelos'];
     const ch = tablas.reduce((c, table) => c.on('postgres_changes', { event: '*', schema: 'public', table }, handleRealtimeChange),
       supabase.channel('finance-v16')).subscribe();
     return () => {
@@ -1072,6 +2244,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     try { localStorage.setItem('valkyron:recibido_por', recibidoPor); } catch { /* almacenamiento no disponible */ }
     const fill = (p: PagoForm) => (p.recibido_por ? p : { ...p, recibido_por: recibidoPor });
     setLedgerPago(fill); setMovPago(fill); setCuentaPago(fill); setPrestamoPago(fill); setProvisionalPago(fill);
+    setRecargaPago(fill);   // [NEW v17]
   }, [recibidoPor]);
 
   /** [NEW v16.5] Recuerda quién recibió y devuelve un formulario limpio */
@@ -1083,9 +2256,35 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   /** [NEW v16.5] Pagador por asiento (solo vigentes) */
   const pagoPorAsiento = useMemo(() => new Map(pagos.filter(x => !x.anulado).map(x => [x.asiento_id, x])), [pagos]);
 
+  // ▼ v17 — índices de billetera / clases (solo dependen del estado)
+  /** Recargas / reembolsos vigentes por asiento: el Diario NO debe anularlos directamente */
+  const walletMovPorAsiento = useMemo(() => new Map(walletMovs
+    .filter(m => m.asiento_id && (m.tipo === 'RECARGA' || m.tipo === 'REEMBOLSO') && !m.revertido)
+    .map(m => [m.asiento_id as string, m])), [walletMovs]);
+  /** CxC generadas por un consumo (déficit de billetera) */
+  const consumoPorCxc = useMemo(() => new Map(consumos
+    .filter(c => c.cxc_id && c.estado === 'VIGENTE').map(c => [c.cxc_id as string, c])), [consumos]);
+  const clasifMap = useMemo(() => new Map(clasif.map(c => [`${c.tabla}:${c.registro_id}`, c])), [clasif]);
+  const provisionalAplicado = useMemo(() => new Set(walletMovs
+    .filter(m => m.provisional_id && !m.revertido).map(m => m.provisional_id as string)), [walletMovs]);
+  const saldoWallet = useMemo(() => new Map(walletCuentas.map(w => [w.student_id, w.saldo_usd])), [walletCuentas]);
+  const pilotosLista = useMemo(() => Array.from(new Set(capitanes
+    .map((c: { nombre?: string | null }) => String(c?.nombre ?? '').trim().toUpperCase()).filter(Boolean))).sort(), [capitanes]);
+
   /** [v16.8] alertas informativas: no se ajustan saldos automáticamente. */
   const alertasIntegridad = useMemo(() => {
     const alertas: string[] = [];
+    // ▼ v17 — billetera: saldo cacheado = subledger; recargas con su asiento de caja vigente
+    for (const w of walletCuentas) {
+      const sub = round2(walletMovs.filter(m => m.student_id === w.student_id).reduce((a, m) => a + m.signo * m.monto_usd, 0));
+      if (Math.abs(sub - w.saldo_usd) > 0.009) alertas.push(`Billetera ${alumnos.find(a => a.student_id === w.student_id)?.nombre ?? w.student_id.slice(0, 8)}: saldo ${fmtNum(w.saldo_usd)} ≠ subledger ${fmtNum(sub)}.`);
+    }
+    for (const m of walletMovs) {
+      if (m.revertido || !m.asiento_id || (m.tipo !== 'RECARGA' && m.tipo !== 'REEMBOLSO')) continue;
+      if (!transactions.some(t => t.asiento_id === m.asiento_id && t.status === 'PAID')) {
+        alertas.push(`${WALLET_MOV_LABEL[m.tipo]} ${m.referencia}: su asiento de caja ya no existe en el Diario (billetera sin respaldo).`);
+      }
+    }
     const porAsiento = new Map(pagos.filter(p => !p.anulado).map(p => [p.asiento_id, p]));
     for (const t of transactions) {
       if (t.status !== 'PAID' || !t.asiento_id || isFxTx(t) || signedLedgerAmount(t) <= 0) continue;
@@ -1114,7 +2313,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       }
     }
     return alertas;
-  }, [transactions, pagos, provisionales, movCajas]);
+  }, [transactions, pagos, provisionales, movCajas, walletCuentas, walletMovs, alumnos]);   // [CHG v17]
 
   /** [NEW v16.2] Limpia la sesión corrupta (refresh token inválido) y vuelve al login */
   const reiniciarSesion = async () => {
@@ -1165,6 +2364,34 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     list.filter(c => c.estatus !== 'PAGADO').reduce((a, c) => round2(a + aUSD(c.monto_pendiente, c.moneda)), 0), [aUSD]);
   const totalCxP          = useMemo(() => totalPendienteUSD(cuentasProveedores),  [cuentasProveedores, totalPendienteUSD]);
   const totalReposiciones = useMemo(() => totalPendienteUSD(cuentasReposiciones), [cuentasReposiciones, totalPendienteUSD]);
+
+  // ▼ v17 — métricas de billetera
+  /** Deuda pendiente (USD eq.) por alumno: índice O(n) en lugar de filtrar por alumno en cada render */
+  const deudaPorAlumno = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of cxcPendientes) m.set(c.student_id, round2((m.get(c.student_id) ?? 0) + aUSD(c.monto_pendiente, normalizePaymentMethod(c.moneda))));
+    return m;
+  }, [cxcPendientes, aUSD]);
+  const deudaAlumnoUSD = useCallback((studentId: string) => deudaPorAlumno.get(studentId) ?? 0, [deudaPorAlumno]);
+  const totalBilleteras    = useMemo(() => round2(walletCuentas.reduce((a, w) => a + w.saldo_usd, 0)), [walletCuentas]);
+  const totalDeudaConsumos = useMemo(() => round2(cxcPendientes.filter(c => consumoPorCxc.has(String(c.id)))
+    .reduce((a, c) => a + aUSD(c.monto_pendiente, normalizePaymentMethod(c.moneda)), 0)), [cxcPendientes, consumoPorCxc, aUSD]);
+  const consumosMes = useMemo(() => {
+    const mes = hoyISO().slice(0, 7);
+    return round2(consumos.filter(c => c.estado === 'VIGENTE' && c.modo === 'BILLETERA' && String(c.fecha).slice(0, 7) === mes)
+      .reduce((a, c) => a + c.monto_total_usd, 0));
+  }, [consumos]);
+  /** Vuelos de bitácora (desde la fecha de corte) aún no cargados ni marcados como cubiertos */
+  const vuelosPorCargar = useMemo(() => {
+    const cargados = new Set(consumos.filter(c => c.estado === 'VIGENTE' && c.vuelo_id).map(c => c.vuelo_id as string));
+    return vuelosBitacora.filter(v => v.student_id && v.horas > 0 && !cargados.has(v.id) && v.fecha >= walletCorte);
+  }, [consumos, vuelosBitacora, walletCorte]);
+  /** Tarifa vigente de vuelo: específica de la aeronave o general */
+  const tarifaVuelo = useCallback((matricula: string | null) => {
+    const n = normMatricula(matricula);
+    const activos = servicios.filter(s => s.activo && s.tipo === 'VUELO');
+    return activos.find(s => s.aeronave_matricula && normMatricula(s.aeronave_matricula) === n) ?? activos.find(s => !s.aeronave_matricula) ?? null;
+  }, [servicios]);
 
   // ─── HELPERS DE CAJA ──────────────────────────────────────────────────────
 
@@ -1287,7 +2514,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
    * [CHG v16.5] Con pagador → fn_registrar_asiento_v2 (asiento + pagador atómicos). Si falta la migración v16.5
    * se lanza Error simple (no MotorNoInstaladoError) para que NINGUNA ruta legacy registre un ingreso sin pagador.
    */
-  const postAsiento = useCallback(async (a: AsientoPayload) => {
+  const postAsiento = useCallback(async (a: AsientoPayload, clase?: ClaseForm | null, tasaRef?: number | null) => {
+    // [NEW v17] con clase → motor + clasificación en UNA transacción (fn_registrar_asiento_clasificado).
+    // Sin la migración v17 se registra igual que en v16.8 (sin clase) para no bloquear la operación.
+    if (clase && claseTieneDatos(clase)) {
+      const { error: eCl } = await supabase.rpc('fn_registrar_asiento_clasificado', { p: a, p_clase: claseAPayload(clase, tasaRef) });
+      if (!eCl) return;
+      if (!isMissingRpc(eCl)) throw new Error(traducirErrorMotor(`${eCl.message} ${eCl.details ?? ''}`));
+      console.warn('[FinancePanel v17] fn_registrar_asiento_clasificado no instalada: se registra sin clase.');
+    }
     const { pago, ...sinPago } = a;
     if (!pago) return callMotor('fn_registrar_asiento', { p: sinPago });   // v1 recibe exactamente el payload de v16
     const { error } = await supabase.rpc('fn_registrar_asiento_v2', { p: a });
@@ -1303,12 +2538,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     throw new Error(traducirErrorMotor(error.message));
   }, [callMotor]);
 
-  const anularAsiento = (asientoId: string) => requireDirectorCode(async () => {
+  const anularAsientoMotor = (asientoId: string) => requireDirectorCode(async () => {
     setSavingAction(asientoId);
     try { await rpcAnularAsiento(asientoId); await refresh(); }
     catch (err) { const msg = errMsg(err, 'Error al anular asiento.'); setLedgerError(msg); setCajaError(msg); setCuentaError(msg); }
     finally { setSavingAction(null); }
   });
+
+  /** [CHG v17] Recargas/reembolsos de billetera se revierten desde su flujo (mantiene coherente el saldo del alumno). */
+  const anularAsiento = (asientoId: string) => {
+    const wm = walletMovPorAsiento.get(asientoId);
+    if (wm) {
+      const alumno = alumnos.find(a => a.student_id === wm.student_id)?.nombre ?? 'ALUMNO';
+      if (!window.confirm(`Este asiento es una ${WALLET_MOV_LABEL[wm.tipo].toUpperCase()} de billetera de ${alumno} (${usd(wm.monto_usd)}).\n\nSe revertirá en la billetera y se anulará su asiento de caja en una sola operación. ¿Continuar?`)) return;
+      setMotivoTexto('');
+      setMotivoAccion({ tipo: 'REVERTIR', id: wm.id, titulo: `Revertir ${WALLET_MOV_LABEL[wm.tipo]}`, detalle: `${alumno} · ${wm.referencia} · ${usd(wm.monto_usd)}` });
+      return;
+    }
+    anularAsientoMotor(asientoId);
+  };
 
   // ─── FX: PURGA / ANULACIÓN (v15) ──────────────────────────────────────────
 
@@ -1442,6 +2690,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
 
   /** Eliminar cuenta: anula sus abonos (nuevo → viejo), luego el asiento de origen y borra la fila legacy. */
   const deleteCuentaProtected = (id: string, esCxC: boolean) => {
+    // [NEW v17] la CxC de un consumo se elimina anulando el consumo (revierte billetera y aplicaciones)
+    const consumoLig = esCxC ? consumoPorCxc.get(String(id)) : undefined;
+    if (consumoLig) {
+      setMotivoTexto('');
+      setMotivoAccion({ tipo: 'ANULAR_CONSUMO', id: consumoLig.id, titulo: 'Anular consumo de billetera',
+        detalle: `Esta CxC la generó el consumo "${consumoLig.descripcion}" (${usd(consumoLig.monto_total_usd)}). Se anulará el consumo completo.` });
+      return;
+    }
     if (!esCxC) {
       const cuenta = cuentas.find(c => c.id === id);
       if (cuenta?.transfer_id) { openDeleteTransferModal(cuenta.transfer_id); return; }
@@ -1495,6 +2751,13 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       : esIngreso ? `INGRESO · ${ledgerPago.pagador_nombre.trim().toUpperCase()}` : `${ledger.type} ${ledger.currency}`;
     const concepto   = ledger.reference.trim().toUpperCase() || 'REGISTRO MANUAL';
     const category   = esNomina ? 'Nomina' : 'General';
+    // [NEW v17] clase contable: nómina → servicio NÓMINA y piloto = capitán (si no se indicó)
+    const capitanNom  = esNomina ? normTxt(capitanes.find(c => c.id === ledger.capitanId)?.nombre) : '';
+    const claseLedger: ClaseForm = {
+      ...ledgerClase,
+      servicio: ledgerClase.servicio || (esNomina ? 'NOMINA_INSTRUCCION' : ''),
+      piloto:   ledgerClase.piloto || capitanNom,
+    };
     try {
       try {
         await postAsiento(buildFlujo({
@@ -1504,7 +2767,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           entityId: esIngreso ? ledgerPago.alumno_id || null : null,
           referenciaExterna: esIngreso ? ledgerPago.referencia_pago.trim().toUpperCase() || undefined : undefined,
           pago: esIngreso ? ledgerPago : null,
-        }));
+        }), claseLedger, ledger.currency === 'BS' ? tasaBCV : null);   // [CHG v17] + clase
       } catch (err) {
         // ingresos con pagador nunca caen a la ruta legacy (postAsiento no lanza MotorNoInstaladoError en v2)
         if (!(err instanceof MotorNoInstaladoError) || cajaObj) throw err;
@@ -1517,6 +2780,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         if (error) { setLedgerError(error.code === '23505' ? 'Duplicado detectado.' : `Error: ${error.message}`); return; }
       }
       setLedger(p => ({ ...p, amount: '', reference: '' }));
+      setLedgerClase(CLASE_VACIA);   // [NEW v17] evita clasificar el siguiente registro por arrastre
       if (esIngreso) setLedgerPago(pagoRegistrado(ledgerPago));
       await refresh();
     } catch (err) { setLedgerError(errMsg(err, 'Error de conexión.')); }
@@ -1567,7 +2831,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
             category: 'Caja', cajaId: cajaActiva, subcaja, registradoPor: auditRole,
             referenciaExterna: (esEntrada ? movPago.referencia_pago.trim().toUpperCase() : referencia) || undefined,
             pago: esEntrada ? movPago : null,
-          }));
+          }), movClase, movForm.moneda === 'BS' ? tasaBCV : null);   // [CHG v17] + clase
         } catch (err) {
           if (err instanceof MotorNoInstaladoError) { setCajaError(`${err.message} Mientras tanto use clase UBICACIÓN.`); return; }
           throw err;
@@ -1581,6 +2845,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         if (error) { setCajaError(`Error: ${error.message}`); return; }
       }
       setMovForm(p => ({ ...p, monto: '', concepto: '', referencia: '' }));
+      setMovClase(CLASE_VACIA);   // [NEW v17]
       if (ingresoReal) setMovPago(pagoRegistrado(movPago));
       await refresh();
     } catch (err) { setCajaError(errMsg(err, 'Error de conexión.')); }
@@ -1799,6 +3064,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   //  Cobro CxC: Bóveda +R · Caja +R · CxC −A · horas += h_prom · A / total
   //  Pago CxP : Bóveda −R · Caja −R · CxP −A (préstamo → FINANCING_OUT). A = R en moneda de la cuenta.
 
+  /** [NEW v17] Clase heredada por el cobro de una CxC generada por consumo (servicio, aeronave, sede...) */
+  const claseDeCxc = (cxcId: string): ClaseForm | null => {
+    const c = consumoPorCxc.get(cxcId);
+    return c ? { servicio: c.clase_servicio, aeronave: c.clase_aeronave ?? '', sede: c.clase_sede ?? '', piloto: c.clase_piloto ?? '', proyecto: c.clase_proyecto ?? '' } : null;
+  };
+
   const cuentaDeModal = (m: { tipo: 'CXC' | 'CXP'; cuentaId: string } | null) => ({
     cxc: m?.tipo === 'CXC' ? cuentasCxC.find(x => x.id === m.cuentaId) ?? null : null,
     cxp: m?.tipo === 'CXP' ? cuentas.find(x => x.id === m.cuentaId) ?? null : null,
@@ -1869,7 +3140,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           concepto: `${cxc.concepto || 'COBRO'} · ${cxc.nombre_alumno}`.toUpperCase(),
           entityName: cxc.nombre_alumno, entityId: cxc.student_id, category: 'Academia',
           abonos: [abono], meta: { student_serial: cxc.student_serial }, pago: cobroPago,
-        }));
+        }), claseDeCxc(String(cxc.id)), cobroForm.moneda === 'BS' ? tasa : null);   // [CHG v17] hereda la clase del consumo
         setRecibidoPor(cobroPago.recibido_por.trim().toUpperCase());
       } else if (cxp) {
         const esPrest = cxp.entidad_tipo === 'PRESTAMISTA';
@@ -1881,7 +3152,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           category: esPrest ? 'Financiamiento' : 'Proveedores',
           esPrestamo: esPrest, prestamista: PRESTAMISTAS.find(p => esCxpPrestamista(cxp, p)) ?? null,
           abonos: [abono],
-        }));
+        }), esPrest ? null : claseDeRow(clasifMap.get(`cuentas_generales:${cxp.id}`)), cobroForm.moneda === 'BS' ? tasa : null);   // [CHG v17] hereda la clase de la factura
       }
       setCobroModal(null);
       await refresh();
@@ -2320,14 +3591,23 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     if (!f.concepto.trim())       { setCuentaError('Concepto requerido.'); return; }
     setSavingCuenta(true);
     try {
-      const { error } = await supabase.from('cuentas_generales').insert([{
+      const { data: cxpCreada, error } = await supabase.from('cuentas_generales').insert([{
         tipo: 'CXP', entidad_nombre: f.entidad_nombre.toUpperCase().trim(), entidad_tipo: f.entidad_tipo,
         proveedor_id: f.proveedor_id || null, moneda: f.moneda, monto_total: num, monto_pendiente: num,
         concepto: f.concepto.toUpperCase().trim(), fecha_emision: isoDe(f.fecha_emision),
         fecha_vencimiento: f.fecha_vencimiento ? isoDe(f.fecha_vencimiento) : null,
         estatus: 'PENDIENTE', notas: f.notas || null,
-      }]);
+      }]).select('id').single();   // [CHG v17] id para clasificar la factura
       if (error) { setCuentaError(`Error: ${error.message}`); return; }
+      // [NEW v17] clase contable de la factura (gasto devengado por aeronave / sede / servicio)
+      const cxpId = (cxpCreada as { id?: string | number } | null)?.id;
+      if (cxpId != null && claseTieneDatos(cuentaClase)) {
+        const { error: eCl } = await supabase.rpc('fn_clasificar_registros', {
+          p_tabla: 'cuentas_generales', p_ids: [String(cxpId)], p_clase: claseAPayload(cuentaClase, f.moneda === 'BS' ? tasaBCV : null),
+        });
+        if (eCl) setCuentaError(`CxP registrada, pero no se pudo clasificar: ${isMissingRpc(eCl) ? 'migración v17 no instalada' : eCl.message}`);
+      }
+      setCuentaClase(CLASE_VACIA);
       resetCuentaForm({ entidad_nombre: '', concepto: '', monto_total: '', notas: '', proveedor_id: '', fecha_vencimiento: '' });
       await refresh();
     } catch (err) { setCuentaError(errMsg(err, 'Error de conexión.')); }
@@ -2388,6 +3668,453 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       await refresh();
     } catch (err) { setReqError(errMsg(err, 'Error al rechazar.')); }
     finally { setSavingAction(null); }
+  };
+
+  // ─── [NEW v17] BILLETERAS ─────────────────────────────────────────────────
+  //  Recarga  : Bóveda +M · Caja +M · Pagador · Billetera +USD (anticipo, pasivo) [· aplicación FIFO a deudas]
+  //  Consumo  : Billetera −min(saldo, total) · déficit → CxC (USD, 0 h) · ingreso devengado por clase
+  //  Reembolso: Bóveda −M · Caja −M · Billetera −USD (cancela pasivo, no es gasto)
+
+  /** RPC v17 con traducción de errores del motor */
+  const rpcV17 = useCallback(async (fn: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const { data, error } = await supabase.rpc(fn, args);
+    if (error) {
+      if (isMissingRpc(error)) throw new Error('Migración v17 no instalada: ejecute migracion_finance_v17_billetera_clases.sql en Supabase.');
+      throw new Error(traducirErrorMotor(`${error.message} ${error.details ?? ''}`));
+    }
+    return (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+  }, []);
+
+  const alumnoPorId = useCallback((id: string | null | undefined) => (id ? alumnos.find(a => a.student_id === id) ?? null : null), [alumnos]);
+  const alumnoSel   = alumnoPorId(walletSel);
+
+  const guardV17 = (): string | null => {
+    if (!v17Instalado)     return 'Migración v17 no instalada: ejecute migracion_finance_v17_billetera_clases.sql en Supabase.';
+    if (sinSesion)         return 'Sesión expirada: inicie sesión de nuevo.';
+    if (fetchErrors.length) return 'Hay consultas financieras con error. Corrija esas alertas antes de operar.';
+    return null;
+  };
+
+  const abrirWalletModal = (tipo: WalletModal, studentId: string) => {
+    const al = alumnoPorId(studentId);
+    if (!al) return;
+    setWalletSel(studentId); setWalletError(null); setWalletInfo(null);
+    if (tipo === 'RECARGA') {
+      const moneda: PaymentMethod = 'ZELLE';
+      setRecargaForm({ ...RECARGA_INIT, moneda, tasa: String(tasaBCV), caja_id: defaultCajaFor(moneda), aplicar_deudas: deudaAlumnoUSD(studentId) > 0 });
+      setRecargaPago(pagoDeAlumno(recibidoPor, al.student_id, al.nombre));
+    } else if (tipo === 'CONSUMO') {
+      setConsumoForm({ ...CONSUMO_INIT });
+      setConsumoClase({ ...CLASE_VACIA, sede: normTxt(al.sede).replace('Í', 'I') });
+    } else if (tipo === 'AJUSTE') {
+      setAjusteForm({ tipo: 'AJUSTE_CREDITO', monto: '', motivo: '' });
+    } else {
+      const moneda: PaymentMethod = 'ZELLE';
+      setReembolsoForm({ monto_usd: '', moneda, tasa: String(tasaBCV), caja_id: defaultCajaFor(moneda), subcaja: 'ADM', fecha: hoyISO(), concepto: '', referencia: '' });
+    }
+    setWalletModal(tipo);
+  };
+  const cerrarWalletModal = () => { setWalletModal(null); setWalletError(null); };
+
+  /** Al elegir servicio del tarifario: tipo, precio, descripción y clase sugeridos */
+  const elegirServicioConsumo = (id: string) => {
+    const s = servicios.find(x => x.id === id);
+    setConsumoForm(p => ({
+      ...p, servicio_id: id, tipo: s?.tipo ?? p.tipo, precio: s ? String(s.precio_usd) : p.precio,
+      descripcion: s ? s.nombre.toUpperCase() : p.descripcion,
+    }));
+    if (s) setConsumoClase(c => ({ ...c, servicio: s.clase_servicio || SERVICIO_POR_TIPO[s.tipo], aeronave: s.aeronave_matricula ? normTxt(s.aeronave_matricula) : c.aeronave, sede: s.sede ? normTxt(s.sede) : c.sede }));
+  };
+
+  const handleRecarga = async (e: React.FormEvent) => {
+    e.preventDefault(); setWalletError(null);
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    if (!canManageFinance) { setWalletError('Su rol no puede recibir dinero (CEO / ADMIN / DIRECTOR).'); return; }
+    const al = alumnoSel;
+    if (!al) { setWalletError('Seleccione el alumno.'); return; }
+    const f = recargaForm;
+    const monto = round2(parseFloat(f.monto));
+    if (!Number.isFinite(monto) || monto <= 0) { setWalletError('Monto inválido.'); return; }
+    const tasa = round4(parseFloat(f.tasa));
+    const montoUsd = f.moneda === 'BS' ? (tasa > 0 ? round2(monto / tasa) : NaN) : monto;
+    if (!Number.isFinite(montoUsd) || montoUsd <= 0) { setWalletError('Tasa Bs/USD inválida.'); return; }
+    if (!f.caja_id) { setWalletError('Seleccione la caja que recibe el dinero (obligatorio en recargas).'); return; }
+    const cajaErr = validarCajaMoneda(f.caja_id, f.moneda);
+    if (cajaErr) { setWalletError(cajaErr); return; }
+    const errPago = validarPago(recargaPago, f.moneda);
+    if (errPago) { setWalletError(errPago); return; }
+    const extra = f.concepto.trim().toUpperCase();
+    const asiento = conPrefijo(buildFlujo({
+      evento: 'INGRESO_DIRECTO', dir: 'IN', ledgerType: 'INCOME', moneda: f.moneda, monto, fechaISO: isoDe(f.fecha),
+      concepto: `RECARGA BILLETERA · ${al.nombre}${extra ? ` · ${extra}` : ''}`, entityName: al.nombre, entityId: al.student_id,
+      category: CATEGORIA_BILLETERA, cajaId: f.caja_id, subcaja: cajaEsEfectivo(f.caja_id) ? f.subcaja : null, registradoPor: auditRole,
+      referenciaExterna: recargaPago.referencia_pago.trim().toUpperCase() || undefined, pago: recargaPago,
+      meta: { origen: 'WALLET_RECARGA', student_serial: al.serial, monto_usd: montoUsd, tasa: f.moneda === 'BS' ? tasa : null },
+    }), 'WAL');
+    setSavingWallet(true);
+    try {
+      const r = await rpcV17('fn_wallet_recargar', {
+        p_asiento: asiento,
+        p_recarga: {
+          student_id: al.student_id, monto_usd: montoUsd, moneda_origen: f.moneda, monto_origen: monto,
+          tasa: f.moneda === 'BS' ? tasa : null, aplicar_deudas: f.aplicar_deudas, concepto: extra || 'RECARGA DE BILLETERA',
+        },
+      });
+      setRecargaPago(pagoRegistrado(recargaPago));
+      const aplicado = Number(r.aplicado_cxc ?? 0);
+      setWalletInfo(`Recarga ${asiento.referencia}: +${usd(montoUsd)} a ${al.nombre}${aplicado > 0 ? ` · ${usd(aplicado)} aplicados a deudas` : ''} · saldo ${usd(Number(r.saldo ?? 0))}.`);
+      setWalletModal(null);
+      await refresh();
+    } catch (err) { setWalletError(errMsg(err, 'No se pudo registrar la recarga.')); }
+    finally { setSavingWallet(false); }
+  };
+
+  const handleConsumo = async (e: React.FormEvent) => {
+    e.preventDefault(); setWalletError(null);
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    const al = alumnoSel;
+    if (!al) { setWalletError('Seleccione el alumno.'); return; }
+    const f = consumoForm;
+    const cantidad = round2(parseFloat(f.cantidad));
+    if (!Number.isFinite(cantidad) || cantidad <= 0) { setWalletError('Cantidad inválida.'); return; }
+    const serv = servicios.find(s => s.id === f.servicio_id) ?? null;
+    const precio = f.modo === 'BILLETERA' ? round2(parseFloat(f.precio)) : 0;
+    if (f.modo === 'BILLETERA' && (!Number.isFinite(precio) || precio < 0)) { setWalletError('Precio unitario inválido.'); return; }
+    const descripcion = (f.descripcion.trim() || serv?.nombre || '').toUpperCase();
+    if (descripcion.length < 3) { setWalletError('Describa el consumo.'); return; }
+    setSavingWallet(true);
+    try {
+      const r = await rpcV17('fn_wallet_consumir', {
+        p: {
+          student_id: al.student_id, servicio_id: serv?.id ?? null, tipo: f.tipo,
+          unidad: serv?.unidad ?? TIPOS_CONSUMO.find(t => t.k === f.tipo)?.unidad ?? 'UNIDAD',
+          descripcion, cantidad, precio_unitario_usd: precio, fecha: f.fecha, modo: f.modo,
+          clase_servicio: consumoClase.servicio || null, clase_aeronave: consumoClase.aeronave || null,
+          clase_sede: consumoClase.sede || null, clase_piloto: consumoClase.piloto || null,
+          clase_proyecto: consumoClase.proyecto || null, autorizar_sobre_limite: f.autorizar,
+        },
+      });
+      const aCxc = Number(r.a_cxc ?? 0);
+      setWalletInfo(`Consumo de ${al.nombre}: ${usd(Number(r.monto_total ?? 0))} · billetera ${usd(Number(r.desde_billetera ?? 0))}${aCxc > 0 ? ` · ${usd(aCxc)} pasan a cuentas por cobrar` : ''}.`);
+      setWalletModal(null);
+      await refresh();
+    } catch (err) { setWalletError(errMsg(err, 'No se pudo registrar el consumo.')); }
+    finally { setSavingWallet(false); }
+  };
+
+  const handleAjuste = (e: React.FormEvent) => {
+    e.preventDefault(); setWalletError(null);
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    const al = alumnoSel;
+    if (!al) { setWalletError('Seleccione el alumno.'); return; }
+    const monto = round2(parseFloat(ajusteForm.monto));
+    if (!Number.isFinite(monto) || monto <= 0) { setWalletError('Monto inválido.'); return; }
+    if (ajusteForm.motivo.trim().length < 5) { setWalletError('Indique el motivo (mínimo 5 caracteres).'); return; }
+    if (ajusteForm.tipo === 'AJUSTE_DEBITO' && monto > (saldoWallet.get(al.student_id) ?? 0)) { setWalletError('El débito excede el saldo de la billetera.'); return; }
+    const f = { ...ajusteForm };
+    requireDirectorCode(async () => {
+      setSavingWallet(true);
+      try {
+        const r = await rpcV17('fn_wallet_ajuste', { p_student: al.student_id, p_tipo: f.tipo, p_monto: monto, p_motivo: f.motivo.trim().toUpperCase(), p_fecha: hoyISO() });
+        setWalletInfo(`${WALLET_MOV_LABEL[f.tipo]} de ${usd(monto)} a ${al.nombre} · saldo ${usd(Number(r.saldo ?? 0))}.`);
+        setWalletModal(null);
+        await refresh();
+      } catch (err) { setWalletError(errMsg(err, 'No se pudo registrar el ajuste.')); }
+      finally { setSavingWallet(false); }
+    });
+  };
+
+  const handleReembolso = (e: React.FormEvent) => {
+    e.preventDefault(); setWalletError(null);
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    if (!canManageFinance) { setWalletError('Su rol no puede sacar dinero (CEO / ADMIN / DIRECTOR).'); return; }
+    const al = alumnoSel;
+    if (!al) { setWalletError('Seleccione el alumno.'); return; }
+    const f = { ...reembolsoForm };
+    const montoUsd = round2(parseFloat(f.monto_usd));
+    if (!Number.isFinite(montoUsd) || montoUsd <= 0) { setWalletError('Monto inválido.'); return; }
+    if (montoUsd > (saldoWallet.get(al.student_id) ?? 0) + 0.001) { setWalletError('El reembolso excede el saldo de la billetera.'); return; }
+    const tasa = round4(parseFloat(f.tasa));
+    if (f.moneda === 'BS' && !(tasa > 0)) { setWalletError('Tasa Bs/USD inválida.'); return; }
+    const montoOrigen = f.moneda === 'BS' ? round2(montoUsd * tasa) : montoUsd;
+    if (!f.caja_id) { setWalletError('Seleccione la caja de donde sale el dinero.'); return; }
+    const cajaErr = validarCajaMoneda(f.caja_id, f.moneda);
+    if (cajaErr) { setWalletError(cajaErr); return; }
+    const subcaja = cajaEsEfectivo(f.caja_id) ? f.subcaja : null;
+    if (!confirmarFondos(f.moneda, montoOrigen, f.caja_id, subcaja)) return;
+    const asiento = conPrefijo(buildFlujo({
+      evento: 'GASTO_DIRECTO', dir: 'OUT', ledgerType: 'EXPENSE', moneda: f.moneda, monto: montoOrigen, fechaISO: isoDe(f.fecha),
+      concepto: `REEMBOLSO BILLETERA · ${al.nombre}${f.concepto.trim() ? ` · ${f.concepto.trim().toUpperCase()}` : ''}`,
+      entityName: al.nombre, entityId: al.student_id, category: CATEGORIA_REEMBOLSO, cajaId: f.caja_id, subcaja,
+      registradoPor: auditRole, referenciaExterna: f.referencia.trim().toUpperCase() || undefined,
+      meta: { origen: 'WALLET_REEMBOLSO', student_serial: al.serial, monto_usd: montoUsd, tasa: f.moneda === 'BS' ? tasa : null },
+    }), 'WRE');
+    requireDirectorCode(async () => {
+      setSavingWallet(true);
+      try {
+        const r = await rpcV17('fn_wallet_reembolsar', {
+          p_asiento: asiento,
+          p_reembolso: { student_id: al.student_id, monto_usd: montoUsd, moneda_origen: f.moneda, monto_origen: montoOrigen,
+            tasa: f.moneda === 'BS' ? tasa : null, concepto: f.concepto.trim().toUpperCase() || 'REEMBOLSO DE BILLETERA' },
+        });
+        setWalletInfo(`Reembolso ${asiento.referencia} a ${al.nombre}: ${fmtMonto(montoOrigen, f.moneda)} · saldo ${usd(Number(r.saldo ?? 0))}.`);
+        setWalletModal(null);
+        await refresh();
+      } catch (err) { setWalletError(errMsg(err, 'No se pudo registrar el reembolso.')); }
+      finally { setSavingWallet(false); }
+    });
+  };
+
+  /** Aplica saldo de billetera a deudas del alumno (FIFO) o a una CxC puntual. No mueve caja. */
+  const aplicarBilleteraADeuda = async (studentId: string, cxcId?: string) => {
+    const g = guardV17();
+    if (g) { setWalletError(g); setCuentaError(g); return; }
+    const saldo = saldoWallet.get(studentId) ?? 0;
+    if (saldo <= 0) { alert('El alumno no tiene saldo en su billetera.'); return; }
+    const nombre = alumnoPorId(studentId)?.nombre ?? 'ALUMNO';
+    if (!window.confirm(`Aplicar hasta ${usd(saldo)} de la billetera de ${nombre} a ${cxcId ? 'esta cuenta por cobrar' : 'sus deudas (más antiguas primero)'}?\n\nNo mueve caja: el dinero ya fue recibido como anticipo.`)) return;
+    setSavingAction(cxcId ?? studentId);
+    try {
+      const r = await rpcV17('fn_wallet_aplicar_cxc', { p_student: studentId, p_cxc_id: cxcId ?? null, p_monto: null });
+      setWalletInfo(`Aplicados ${usd(Number(r.aplicado ?? 0))} de la billetera de ${nombre} · saldo ${usd(Number(r.saldo ?? 0))}.`);
+      await refresh();
+    } catch (err) { const msg = errMsg(err, 'No se pudo aplicar el saldo.'); setWalletError(msg); setCuentaError(msg); }
+    finally { setSavingAction(null); }
+  };
+
+  /** Carga un vuelo de bitácora a la billetera (o lo marca cubierto por paquete anterior) */
+  const cargarVuelo = async (v: VueloBitacora, modo: ModoConsumo) => {
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    if (modo === 'BILLETERA' && !tarifaVuelo(v.matricula)) { setWalletError(`Sin tarifa de vuelo activa para ${v.matricula ?? 'la aeronave'}: configure el Tarifario.`); return; }
+    setVueloCargando(v.id); setWalletError(null);
+    try {
+      const r = await rpcV17('fn_wallet_cargar_vuelo', {
+        p_vuelo_id: v.id, p_servicio_id: null, p_modo: modo, p_precio: null, p_piloto: null, p_autorizar_sobre_limite: false,
+      });
+      const nombre = alumnoPorId(v.student_id)?.nombre ?? 'ALUMNO';
+      const aCxc = Number(r.a_cxc ?? 0);
+      setWalletInfo(modo === 'BILLETERA'
+        ? `Vuelo ${v.matricula ?? ''} de ${nombre}: ${usd(Number(r.monto_total ?? 0))}${aCxc > 0 ? ` · ${usd(aCxc)} a cuentas por cobrar` : ''}.`
+        : `Vuelo ${v.matricula ?? ''} de ${nombre} marcado como ${MODO_CONSUMO_LABEL[modo].toLowerCase()}.`);
+      await refresh();
+    } catch (err) { setWalletError(errMsg(err, 'No se pudo cargar el vuelo.')); }
+    finally { setVueloCargando(null); }
+  };
+
+  const cargarTodosVuelos = async () => {
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    const lista = vuelosPorCargar.filter(v => tarifaVuelo(v.matricula));
+    if (!lista.length) { setWalletError('No hay vuelos con tarifa configurada para cargar.'); return; }
+    if (!window.confirm(`Cargar ${lista.length} vuelo(s) a las billeteras con la tarifa vigente de cada aeronave?\nLo que no cubra el saldo pasará a cuentas por cobrar.`)) return;
+    setVueloCargando('ALL'); setWalletError(null);
+    const errores: string[] = [];
+    let ok = 0;
+    for (const v of lista) {   // secuencial: cada carga es una transacción con bloqueo por alumno
+      try {
+        await rpcV17('fn_wallet_cargar_vuelo', { p_vuelo_id: v.id, p_servicio_id: null, p_modo: 'BILLETERA', p_precio: null, p_piloto: null, p_autorizar_sobre_limite: false });
+        ok++;
+      } catch (err) { errores.push(`${alumnoPorId(v.student_id)?.nombre ?? 'ALUMNO'} ${fmtDate(v.fecha)}: ${errMsg(err, 'error')}`); }
+    }
+    setVueloCargando(null);
+    setWalletInfo(`${ok} de ${lista.length} vuelo(s) cargados.`);
+    if (errores.length) setWalletError(`${errores.length} vuelo(s) no se cargaron: ${errores.slice(0, 4).join(' · ')}${errores.length > 4 ? ' …' : ''}`);
+    await refresh();
+  };
+
+  /** Reverso de movimiento / anulación de consumo (motivo + clave director) */
+  const pedirRevertir = (m: WalletMovimiento) => {
+    if (m.tipo === 'CONSUMO' && m.consumo_id) {
+      const c = consumos.find(x => x.id === m.consumo_id);
+      setMotivoTexto('');
+      setMotivoAccion({ tipo: 'ANULAR_CONSUMO', id: m.consumo_id, titulo: 'Anular consumo', detalle: `${c?.descripcion ?? m.concepto} · ${usd(c?.monto_total_usd ?? m.monto_usd)}` });
+      return;
+    }
+    setMotivoTexto('');
+    setMotivoAccion({ tipo: 'REVERTIR', id: m.id, titulo: `Revertir ${WALLET_MOV_LABEL[m.tipo]}`, detalle: `${m.concepto} · ${m.referencia} · ${usd(m.monto_usd)}` });
+  };
+  const pedirAnularConsumo = (c: WalletConsumo) => {
+    setMotivoTexto('');
+    setMotivoAccion({ tipo: 'ANULAR_CONSUMO', id: c.id, titulo: 'Anular consumo', detalle: `${c.descripcion} · ${usd(c.monto_total_usd)}${c.monto_cxc_usd > 0 ? ` (incluye ${usd(c.monto_cxc_usd)} en CxC)` : ''}` });
+  };
+  const confirmarMotivo = () => {
+    const acc = motivoAccion;
+    if (!acc) return;
+    if (motivoTexto.trim().length < 5) { setWalletError('Indique el motivo (mínimo 5 caracteres).'); return; }
+    const motivo = motivoTexto.trim().toUpperCase();
+    setMotivoAccion(null);
+    requireDirectorCode(async () => {
+      setSavingAction(acc.id);
+      try {
+        if (acc.tipo === 'REVERTIR') await rpcV17('fn_wallet_revertir_movimiento', { p_mov_id: acc.id, p_motivo: motivo });
+        else await rpcV17('fn_wallet_anular_consumo', { p_consumo_id: acc.id, p_motivo: motivo });
+        setWalletInfo(`${acc.titulo}: completado. ${acc.detalle}`);
+        await refresh();
+      } catch (err) {
+        const msg = errMsg(err, 'No se pudo completar la operación.');
+        setWalletError(msg); setLedgerError(msg); setCajaError(msg); setCuentaError(msg);
+      } finally { setSavingAction(null); }
+    });
+  };
+
+  /** Anticipo sin matrícula VINCULADO → saldo de billetera (no vuelve a recibir dinero) */
+  const aplicarProvisionalBilletera = async (p: PagoProvisional) => {
+    const g = guardV17();
+    if (g) { setProvisionalError(g); return; }
+    let tasa: number | null = null;
+    if (p.moneda === 'BS') {
+      const t = window.prompt(`Tasa Bs/USD para convertir ${fmtMonto(p.monto, 'BS')} a USD:`, String(tasaBCV));
+      if (t === null) return;
+      tasa = round4(parseFloat(t));
+      if (!Number.isFinite(tasa) || tasa <= 0) { setProvisionalError('Tasa inválida.'); return; }
+    }
+    const montoUsd = p.moneda === 'BS' && tasa ? round2(p.monto / tasa) : p.monto;
+    const al = alumnoPorId(p.student_id);
+    if (!window.confirm(`Aplicar el anticipo ${p.referencia_pago} (${fmtMonto(p.monto, p.moneda)} ≈ ${usd(montoUsd)}) a la billetera de ${al?.nombre ?? 'el alumno'}?\n\nNo vuelve a recibir dinero: convierte el anticipo en saldo disponible.`)) return;
+    setSavingProvisionalLink(true); setProvisionalError(null);
+    try {
+      await rpcV17('fn_wallet_aplicar_provisional', { p_pago_id: p.id, p_tasa: tasa });
+      await refresh();
+    } catch (err) { setProvisionalError(errMsg(err, 'No se pudo aplicar el anticipo.')); }
+    finally { setSavingProvisionalLink(false); }
+  };
+
+  /** Tarifario */
+  const abrirServicio = (s?: ServicioCatalogo) => setServicioEdit(s
+    ? { id: s.id, codigo: s.codigo, nombre: s.nombre, tipo: s.tipo, unidad: s.unidad, precio: String(s.precio_usd),
+        aeronave_matricula: s.aeronave_matricula ?? '', sede: s.sede ?? '', clase_servicio: s.clase_servicio, activo: s.activo, notas: s.notas ?? '' }
+    : { id: null, codigo: '', nombre: '', tipo: 'VUELO', unidad: 'HORA', precio: '', aeronave_matricula: '', sede: '',
+        clase_servicio: 'INSTRUCCION_VUELO', activo: true, notas: '' });
+  const guardarServicio = async () => {
+    const s = servicioEdit;
+    if (!s) return;
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    const precio = round2(parseFloat(s.precio));
+    if (!Number.isFinite(precio) || precio < 0) { setWalletError('Precio inválido.'); return; }
+    if (!s.codigo.trim() || !s.nombre.trim()) { setWalletError('Código y nombre son obligatorios.'); return; }
+    setSavingWallet(true); setWalletError(null);
+    try {
+      await rpcV17('fn_servicio_guardar', { p: {
+        id: s.id, codigo: s.codigo, nombre: s.nombre, tipo: s.tipo, unidad: s.unidad, precio_usd: precio,
+        aeronave_matricula: s.aeronave_matricula || null, sede: s.sede || null, clase_servicio: s.clase_servicio,
+        activo: s.activo, notas: s.notas,
+      } });
+      setServicioEdit(null);
+      await refresh();
+    } catch (err) { setWalletError(errMsg(err, 'No se pudo guardar el servicio.')); }
+    finally { setSavingWallet(false); }
+  };
+
+  const guardarConfig = async () => {
+    const g = guardV17();
+    if (g) { setWalletError(g); return; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(configForm.corte)) { setWalletError('Fecha de corte inválida.'); return; }
+    const cred = configForm.credito.trim() === '' ? null : round2(parseFloat(configForm.credito));
+    if (cred !== null && (!Number.isFinite(cred) || cred < 0)) { setWalletError('Límite de crédito inválido.'); return; }
+    setSavingWallet(true); setWalletError(null);
+    try {
+      await rpcV17('fn_finanzas_config_set', { p_clave: 'wallet_fecha_corte', p_valor: configForm.corte });
+      await rpcV17('fn_finanzas_config_set', { p_clave: 'credito_maximo_usd', p_valor: cred });
+      setWalletInfo('Configuración guardada.');
+      await refresh();
+    } catch (err) { setWalletError(errMsg(err, 'No se pudo guardar la configuración.')); }
+    finally { setSavingWallet(false); }
+  };
+
+  /** Reclasificación (solo metadatos de clase: nunca toca montos) */
+  const abrirReclas = (a: ReclasAccion) => { setReclasForm(a.inicial); setReclasAccion(a); };
+  const handleReclasificar = async () => {
+    const a = reclasAccion;
+    if (!a) return;
+    const g = guardV17();
+    if (g) { alert(g); return; }
+    setSavingWallet(true);
+    try {
+      const grupos = new Map<TablaClase, string[]>();
+      for (const it of a.items) grupos.set(it.tabla, [...(grupos.get(it.tabla) ?? []), it.id]);
+      for (const [tabla, ids] of grupos) {
+        await rpcV17('fn_clasificar_registros', { p_tabla: tabla, p_ids: ids, p_clase: claseAPayload(reclasForm) });
+      }
+      setReclasAccion(null);
+      await refresh();
+    } catch (err) { alert(errMsg(err, 'No se pudo clasificar.')); }
+    finally { setSavingWallet(false); }
+  };
+
+  // ─── [NEW v17] IMPRESIÓN ──────────────────────────────────────────────────
+
+  /** Estado de cuenta del alumno: billetera, consumos, CxC y pagos con trazabilidad */
+  const imprimirEstadoCuenta = (studentId: string) => {
+    const al = alumnoPorId(studentId);
+    if (!al) return;
+    const movs  = walletMovs.filter(m => m.student_id === studentId).slice().sort((a, b) => String(a.creado_en).localeCompare(String(b.creado_en)));
+    const cons  = consumos.filter(c => c.student_id === studentId).slice().sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+    const cxc   = cuentasCxC.filter(c => c.student_id === studentId).slice().sort((a, b) => String(a.fecha_emision).localeCompare(String(b.fecha_emision)));
+    const pagAl = pagos.filter(p => p.alumno_id === studentId && !p.anulado).slice().sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+    const saldo = saldoWallet.get(studentId) ?? 0;
+    const deuda = deudaAlumnoUSD(studentId);
+    const recargado = round2(movs.filter(m => !m.revertido && ['RECARGA', 'ANTICIPO_APLICADO', 'SALDO_INICIAL'].includes(m.tipo)).reduce((a, m) => a + m.monto_usd, 0));
+    const consumido = round2(cons.filter(c => c.estado === 'VIGENTE' && c.modo === 'BILLETERA').reduce((a, c) => a + c.monto_total_usd, 0));
+    imprimirDocumento({
+      titulo: 'Estado de Cuenta del Alumno', subtitulo: `${al.nombre} · ${al.serial} · Sede ${al.sede}`,
+      meta: [['Alumno', al.nombre], ['Serial', al.serial]],
+      resumen: [['Saldo billetera', usd(saldo)], ['Deuda pendiente', usd(deuda)], ['Posición neta', usd(round2(saldo - deuda))],
+        ['Total acreditado', usd(recargado)], ['Total consumido', usd(consumido)]],
+      secciones: [
+        { titulo: 'Movimientos de billetera', columnas: ['Fecha', 'Tipo', 'Concepto', 'Referencia', 'Crédito', 'Débito', 'Saldo'],
+          alinear: ['l', 'l', 'l', 'l', 'r', 'r', 'r'],
+          filas: movs.map(m => [fmtDate(m.fecha), `${WALLET_MOV_LABEL[m.tipo]}${m.revertido ? ' (revertido)' : ''}`, m.concepto, m.referencia,
+            m.signo > 0 ? usd(m.monto_usd) : '', m.signo < 0 ? usd(m.monto_usd) : '', usd(m.saldo_resultante)]) },
+        { titulo: 'Servicios consumidos', columnas: ['Fecha', 'Descripción', 'Cant.', 'P. unit.', 'Total', 'Billetera', 'A crédito', 'Estado'],
+          alinear: ['l', 'l', 'r', 'r', 'r', 'r', 'r', 'l'],
+          filas: cons.map(c => [fmtDate(c.fecha), c.descripcion, `${c.cantidad} ${c.unidad}`, usd(c.precio_unitario_usd), usd(c.monto_total_usd),
+            usd(c.monto_billetera_usd), usd(c.monto_cxc_usd), c.estado === 'ANULADO' ? 'ANULADO' : c.modo === 'BILLETERA' ? 'VIGENTE' : MODO_CONSUMO_LABEL[c.modo]]),
+          totales: ['', 'Total consumido', '', '', usd(consumido), '', '', ''] },
+        { titulo: 'Cuentas por cobrar', columnas: ['Emisión', 'Concepto', 'Total', 'Pagado', 'Pendiente', 'Estatus'], alinear: ['l', 'l', 'r', 'r', 'r', 'l'],
+          filas: cxc.map(c => [fmtDate(c.fecha_emision), c.concepto, fmtMonto(c.monto_total, normalizePaymentMethod(c.moneda)),
+            fmtMonto(c.monto_pagado, normalizePaymentMethod(c.moneda)), fmtMonto(c.monto_pendiente, normalizePaymentMethod(c.moneda)), c.estatus]),
+          totales: ['', 'Pendiente total (USD eq.)', '', '', usd(deuda), ''] },
+        { titulo: 'Pagos recibidos (trazabilidad)', columnas: ['Fecha', 'Método', 'Monto', 'Referencia', 'Pagó', 'Recibió'], alinear: ['l', 'l', 'r', 'l', 'l', 'l'],
+          filas: pagAl.map(p => [fmtDate(p.fecha), p.metodo, fmtMonto(p.monto, p.metodo), p.referencia_pago ?? '—', `${p.pagador_nombre}${p.pagador_documento ? ` · ${p.pagador_documento}` : ''}`, p.recibido_por]) },
+      ],
+      pie: 'Saldo de billetera en USD. Los pagos en Bs se acreditan a la tasa del día del pago. Documento sin validez fiscal.',
+    });
+  };
+
+  /** Movimientos de caja global o por caja en un período */
+  const imprimirMovimientosCaja = (cajaId: string | null, desde: string, hasta: string) => {
+    const lista = cajaId ? cajas.filter(c => c.id === cajaId) : cajas;
+    const secciones: PrintSeccion[] = lista.map((c): PrintSeccion => {
+      const movs = movCajas.filter(m => m.caja_id === c.id && fechaInput(m.fecha) >= desde && fechaInput(m.fecha) <= hasta)
+        .slice().sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+      const tot = ALL_METHODS.map(mo => {
+        const ms = movs.filter(m => m.moneda === mo);
+        return { mo, ent: round2(ms.filter(m => m.tipo === 'ENTRADA').reduce((a, m) => a + m.monto, 0)), sal: round2(ms.filter(m => m.tipo === 'SALIDA').reduce((a, m) => a + m.monto, 0)) };
+      }).filter(x => x.ent || x.sal);
+      return {
+        titulo: c.nombre, columnas: ['Fecha', 'Tipo', 'Moneda', 'Monto', 'Concepto', 'Referencia', 'Pagó → Recibió / Registró'],
+        alinear: ['l', 'l', 'l', 'r', 'l', 'l', 'l'],
+        filas: movs.map(m => {
+          const pg = m.asiento_id ? pagoPorAsiento.get(m.asiento_id) : undefined;
+          return [fmtDate(m.fecha), m.tipo, m.moneda, `${m.tipo === 'ENTRADA' ? '+' : '−'}${fmtMonto(m.monto, m.moneda)}`, m.concepto, m.referencia ?? '',
+            pg ? `${pg.pagador_nombre} → ${pg.recibido_por}` : (m.registrado_por ?? '')];
+        }),
+        nota: tot.length ? tot.map(x => `${x.mo}: entradas ${fmtMonto(x.ent, x.mo)} · salidas ${fmtMonto(x.sal, x.mo)} · neto ${fmtMonto(round2(x.ent - x.sal), x.mo)}`).join('   |   ') : undefined,
+      };
+    }).filter(s => cajaId || s.filas.length > 0);
+    imprimirDocumento({
+      titulo: cajaId ? `Movimientos de caja · ${lista[0]?.nombre ?? ''}` : 'Movimientos de caja · Global',
+      subtitulo: `${fmtDate(desde)} – ${fmtDate(hasta)}`, horizontal: true,
+      meta: [['Cajas', String(lista.length)]],
+      resumen: ALL_METHODS.map(m => [`Saldo actual ${m}`, fmtMonto(round2(lista.reduce((a, c) => a + getCajaBalance(c.id, m), 0)), m)] as [string, string]),
+      secciones: secciones.length ? secciones : [{ columnas: ['Sin movimientos en el período'], filas: [] }],
+    });
   };
 
   // ─── EXPORTS ──────────────────────────────────────────────────────────────
@@ -2460,7 +4187,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
   if (loading) return (
     <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
       <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v16.8...</p>
+      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v17.0...</p>
     </div>
   );
 
@@ -2485,6 +4212,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     const border = legacy ? 'border-red-500/30' : fx ? 'border-teal-500/15' : fin ? 'border-violet-500/15' : 'border-white/[0.05]';
     const pm     = t.payment_method as PaymentMethod;
     const pagoTx = t.asiento_id ? pagoPorAsiento.get(t.asiento_id) : undefined;   // [NEW v16.5]
+    const clTx   = clasifMap.get(`transacciones_finanzas:${t.id}`);                // [NEW v17]
     return (
       <div key={t.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group hover:bg-white/[0.04] transition-all ${border}`}>
         <div className="flex-1 min-w-0">
@@ -2493,6 +4221,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
             {fin && <Badge tone={TONE.fin}>FINANC.</Badge>}
             {legacy && <Badge tone={TONE.red}>REPOSICIÓN LEGACY</Badge>}
             {t.asiento_id && <Badge tone={TONE.asiento} title="Asiento enlazado (bóveda + caja + cuentas)"><Link2 size={8} /> ASIENTO</Badge>}
+            {t.asiento_id && walletMovPorAsiento.has(t.asiento_id) && <Badge tone={TONE.emerald} title="Recarga / reembolso de billetera: se revierte desde Billeteras"><Wallet size={8} /> BILLETERA</Badge>}
+            {clTx?.servicio && <Badge tone={TONE.fx} title="Clase contable explícita"><Tag size={8} /> {labelServicio(clTx.servicio)}{clTx.aeronave ? ` · ${clTx.aeronave}` : ''}</Badge>}
             <span className="truncate">{t.entityName}</span>
           </p>
           <p className="text-[8px] text-zinc-600 font-mono mt-0.5 truncate">
@@ -2508,6 +4238,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           {mode === 'DIARIO' && <CheckCircle2 className={`h-4 w-4 shrink-0 ${t.status === 'PAID' ? 'text-emerald-500/40' : 'text-zinc-700'}`} />}
           {mode === 'DIARIO' && !t.fx_id && !t.asiento_id && (
             <button onClick={() => openEditTx(t)} className={`${btnIcon} hover:text-[#E1AD01] hover:bg-[#E1AD01]/10`}><Pencil size={13} /></button>
+          )}
+          {mode === 'DIARIO' && v17Instalado && canManageFinance && !fx && !fin && (   // [NEW v17] clase contable
+            <button onClick={() => abrirReclas({ items: [{ tabla: 'transacciones_finanzas', id: t.id }], titulo: `${t.entityName} · ${t.invoiceNumber}`, inicial: claseDeRow(clTx) })}
+              title="Clase contable (servicio · aeronave · sede · piloto · proyecto)" className={`${btnIcon} hover:text-teal-400 hover:bg-teal-500/10`}><Tag size={13} /></button>
           )}
           <button onClick={() => deleteTxProtected(t.id)} disabled={busy} title={t.asiento_id ? 'Anular asiento completo' : 'Eliminar'}
             className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
@@ -2535,6 +4269,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     { key: 'LEDGER', label: 'Diario', icon: Landmark }, { key: 'BÓVEDAS', label: 'Bóvedas', icon: Coins },
     { key: 'CAJAS', label: 'Cajas', icon: Banknote }, { key: 'CUENTAS', label: 'CxC/CxP', icon: ReceiptText },
     { key: 'PROVISIONALES', label: 'Sin matrícula', icon: Users },
+    { key: 'BILLETERAS', label: 'Billeteras', icon: Wallet }, { key: 'REPORTES', label: 'Reportes', icon: BarChart3 },   // [NEW v17]
     { key: 'REQUISITIONS', label: 'Reqs', icon: FileSignature }, { key: 'CLOSING', label: 'Cierre', icon: Lock },
   ];
 
@@ -2543,6 +4278,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
     { label: 'Horas Acreditadas', value: `${totalHorasAcred.toFixed(1)}h`, sub: `${horasPagadas.length} pagados · incluye parciales`, icon: Plane, card: 'bg-emerald-500/5 border-emerald-500/10', txt: 'text-emerald-400', ico: 'text-emerald-400/20' },
     { label: 'Por Pagar (Proveedores + Préstamos)', value: `$${fmtNum(totalCxP)}`, sub: `${cuentasProveedores.filter(c => c.estatus !== 'PAGADO').length} pendientes · USD eq.`, icon: ArrowDownCircle, card: 'bg-orange-500/5 border-orange-500/10', txt: 'text-orange-400', ico: 'text-orange-400/20' },
     { label: 'Reposiciones Internas', value: `$${fmtNum(totalReposiciones)}`, sub: `${cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').length} entre cajas`, icon: ArrowLeftRight, card: 'bg-purple-500/5 border-purple-500/10', txt: 'text-purple-400', ico: 'text-purple-400/20' },
+    // [NEW v17] billeteras = anticipos de alumnos (pasivo)
+    { label: 'Billeteras (Anticipos)', value: `$${fmtNum(totalBilleteras)}`, sub: `${walletCuentas.filter(w => w.saldo_usd > 0).length} con saldo · ${vuelosPorCargar.length} vuelos por cargar`, icon: Wallet, card: 'bg-teal-500/5 border-teal-500/10', txt: 'text-teal-400', ico: 'text-teal-400/20' },
   ];
 
   const provisionPendientes = provisionales.filter(p => p.estado === 'PENDIENTE' || p.estado === 'VINCULADO');
@@ -2559,8 +4296,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
         <div className="flex items-center gap-3">
           <div>
-            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v16.8</p>
-            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Motor de asientos · Bóveda ↔ Caja ↔ CxC/CxP en una sola operación</p>
+            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v17.0</p>
+            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Motor de asientos · Bóveda ↔ Caja ↔ CxC/CxP ↔ Billetera en una sola operación · P&amp;L por clase</p>
           </div>
           <button onClick={() => refresh()} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors"><RefreshCw size={12} /></button>
         </div>
@@ -2609,6 +4346,20 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
           <p className="text-[9px] text-orange-200">{alertasIntegridad.length} posibles anomalías en trazabilidad, asientos o transferencias. No implica fraude ni confirma descuadre.</p>
           {alertasIntegridad.slice(0, 8).map((a, i) => <p key={i} className="text-[8px] text-orange-300/80 font-mono">• {a}</p>)}
           {alertasIntegridad.length > 8 && <p className="text-[8px] text-orange-300">+ {alertasIntegridad.length - 8} hallazgos adicionales. Revisión manual requerida.</p>}
+        </div>
+      )}
+
+      {/* [NEW v17] estado de la migración v17 (no bloquea el panel v16.8) */}
+      {!v17Instalado && (
+        <div className="flex items-start gap-3 p-4 rounded-xl bg-teal-500/5 border border-teal-500/25">
+          <Info size={14} className="text-teal-400 shrink-0 mt-0.5" />
+          <p className="text-[9px] text-teal-200 font-mono flex-1">Billeteras, consumos y clases contables requieren <b>migracion_finance_v17_billetera_clases.sql</b>. El resto del panel opera como v16.8.</p>
+        </div>
+      )}
+      {v17Instalado && v17Avisos.length > 0 && (
+        <div className="p-4 rounded-xl bg-teal-500/5 border border-teal-500/25 space-y-1">
+          <p className="text-[9px] text-teal-400 font-black uppercase">Avisos de billeteras / clases</p>
+          {v17Avisos.map(a => <p key={a} className="text-[8px] text-teal-200/80 font-mono break-words">• {a}</p>)}
         </div>
       )}
 
@@ -2672,7 +4423,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
       )}
 
       {/* KPI CUENTAS — USD equivalente */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         {KPI_CUENTAS.map(({ label, value, sub, icon: Icon, card, txt, ico }) => (
           <div key={label} className={`${glass} ${card} border rounded-2xl p-4 flex items-center justify-between`}>
             <div>
@@ -2748,6 +4499,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                     <p className="text-[8px] text-yellow-300">Pagó: {pagador?.pagador_nombre??'REVISAR TRAZABILIDAD'} · Recibió: {pagador?.recibido_por??'REVISAR'} · Caja: {cajaNombre(p.caja_id)}</p>
                     <p className="text-[8px] text-zinc-600 break-all">Asiento: {p.asiento_id} · Registro: {p.creado_en}</p>
                     {alumno && <p className="text-[9px] text-blue-400">Perfil vinculado: {alumno.nombre} · {alumno.serial}. Sin aplicación de CxC/horas.</p>}
+                    {/* [NEW v17] anticipo vinculado → saldo de billetera */}
+                    {provisionalAplicado.has(p.id) && <Badge tone={TONE.emerald}><Wallet size={8} /> Aplicado a billetera</Badge>}
+                    {p.estado === 'VINCULADO' && p.student_id && !provisionalAplicado.has(p.id) && v17Instalado && canManageFinance && (
+                      <button type="button" onClick={() => aplicarProvisionalBilletera(p)} disabled={savingProvisionalLink}
+                        className="border border-teal-500/30 text-teal-300 rounded-xl px-3 py-2 text-[9px] font-black flex items-center gap-2 disabled:opacity-30">
+                        <Wallet size={11} /> Aplicar a billetera del alumno
+                      </button>
+                    )}
                     {p.estado==='PENDIENTE' && (
                       <button type="button" onClick={()=>{setProvisionalLinkId(p.id);setProvisionalStudentId('');setProvisionalError(null);}}
                         className="border border-blue-500/30 text-blue-300 rounded-xl px-3 py-2 text-[9px] font-black">Vincular a estudiante matriculado</button>
@@ -2821,7 +4580,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
               <AmountInput size="xl" value={ledger.amount} moneda={ledger.currency} prefixCls="text-[#E1AD01]" disabled={savingLedger}
                 onChange={v => setLedger(p => ({ ...p, amount: v }))} />
               <input value={ledger.reference} onChange={e => setLedger(p => ({ ...p, reference: e.target.value }))} placeholder="REFERENCIA / TRAZABILIDAD" className={inp} disabled={savingLedger} />
-              <p className="text-[8px] text-zinc-600 font-mono">Cobros de alumnos y pagos a proveedores se registran desde CxC/CxP para que rebajen la cuenta.</p>
+              {/* [NEW v17] clase contable del movimiento */}
+              {v17Instalado && (
+                <ClaseFields value={ledgerClase} onChange={setLedgerClase} flota={flota} pilotos={pilotosLista}
+                  naturaleza={ledger.type === 'INCOME' ? 'INGRESO' : 'GASTO'} />
+              )}
+              <p className="text-[8px] text-zinc-600 font-mono">Cobros de alumnos y pagos a proveedores se registran desde CxC/CxP para que rebajen la cuenta. Pagos que el alumno deja como saldo: Billeteras → Recargar.</p>
               <ErrorBanner msg={ledgerError} onClose={() => setLedgerError(null)} />
               <button type="submit" disabled={savingLedger}
                 className="w-full py-5 bg-[#E1AD01] text-black rounded-2xl font-black uppercase text-[10px] tracking-widest hover:bg-white transition-all flex items-center justify-center gap-2 disabled:opacity-40">
@@ -2966,6 +4730,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                 { l: 'Préstamo Externo', icon: HandCoins,      cls: 'bg-violet-500/10 text-violet-400 border-violet-500/20 hover:bg-violet-500/20',  on: () => { setCajaError(null); setPrestamoModal(true); } },
                 { l: 'Transferir',       icon: ArrowLeftRight, cls: 'bg-purple-500/10 text-purple-400 border-purple-500/20 hover:bg-purple-500/20',  on: () => setTransferModalOpen(true) },
                 { l: 'Exportar',         icon: Download,       cls: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/20', on: handleExportCajasExcel },
+                // [NEW v17] impresión global del mes en curso (otros períodos: Reportes → Imprimir movimientos)
+                { l: 'Imprimir mes',     icon: Printer,        cls: 'bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/20 hover:bg-[#E1AD01]/20', on: () => imprimirMovimientosCaja(null, `${hoyISO().slice(0, 7)}-01`, hoyISO()) },
               ] as { l: string; icon: LucideIcon; cls: string; on: () => void }[]).map(({ l, icon: Icon, cls, on }) => (
                 <button key={l} onClick={on} className={`${cls} border px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2`}>
                   <Icon size={13} /> {l}
@@ -3128,6 +4894,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                     {movForm.clase === 'OPERATIVO' && movForm.tipo === 'ENTRADA'
                       ? <PagadorFields value={movPago} onChange={setMovPago} moneda={movForm.moneda} alumnos={alumnos} />
                       : <input value={movForm.referencia} onChange={e => setMovForm(p => ({ ...p, referencia: e.target.value }))} placeholder="REFERENCIA (opcional)" className={inp} disabled={savingCaja} />}
+                    {/* [NEW v17] clase contable del ingreso/gasto real */}
+                    {v17Instalado && movForm.clase === 'OPERATIVO' && (
+                      <ClaseFields value={movClase} onChange={setMovClase} flota={flota} pilotos={pilotosLista}
+                        naturaleza={movForm.tipo === 'ENTRADA' ? 'INGRESO' : 'GASTO'} />
+                    )}
                     <ErrorBanner msg={cajaError} onClose={() => setCajaError(null)} />
                     <button type="submit" disabled={savingCaja}
                       className={`w-full py-5 rounded-2xl font-black uppercase text-[10px] tracking-widest transition-all flex items-center justify-center gap-2 disabled:opacity-40 ${movForm.tipo === 'ENTRADA' ? 'bg-emerald-500 text-black hover:bg-emerald-400' : 'bg-red-500 text-white hover:bg-red-400'}`}>
@@ -3140,9 +4911,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                   <div className="p-6 border-b border-white/5">
                     <div className="flex justify-between items-center mb-3">
                       <h3 className="text-[10px] font-black uppercase tracking-widest italic">Historial · {caja.nombre}</h3>
-                      <button onClick={() => handleExportCajaIndividual(caja.id)} className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/20 text-[8px] font-black uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1.5">
-                        <Download size={10} /> Exportar
-                      </button>
+                      <div className="flex gap-2">
+                        <button onClick={() => handleExportCajaIndividual(caja.id)} className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/20 text-[8px] font-black uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1.5">
+                          <Download size={10} /> Exportar
+                        </button>
+                        {/* [NEW v17] */}
+                        <button onClick={() => imprimirMovimientosCaja(caja.id, '2000-01-01', hoyISO())} className="bg-[#E1AD01]/10 text-[#E1AD01] px-3 py-1.5 rounded-lg border border-[#E1AD01]/20 text-[8px] font-black uppercase hover:bg-[#E1AD01]/20 transition-all flex items-center gap-1.5">
+                          <Printer size={10} /> Imprimir
+                        </button>
+                      </div>
                     </div>
                     <div className="flex gap-2 flex-wrap">
                       {conf.esCajaEfectivo ? chipsEfectivo : conf.monedasPermitidas.filter(m => movs.some(mv => mv.moneda === m)).map(m => {
@@ -3317,6 +5094,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                     <input type="date" value={cuentaForm.fecha_vencimiento} onChange={e => setCuentaForm(p => ({ ...p, fecha_vencimiento: e.target.value }))} className={inp} style={noUpper} />
                     <input value={cuentaForm.notas} onChange={e => setCuentaForm(p => ({ ...p, notas: e.target.value }))} placeholder="NOTAS (opcional)" className={inp} />
                     <p className="md:col-span-3 text-[8px] text-zinc-600 font-mono">Los préstamos de Barquisimeto/Roberto se registran en Cajas → Préstamo Externo (crean su CxP y la entrada de dinero en un solo asiento).</p>
+                    {/* [NEW v17] clase de la factura: el pago la hereda y el P&L devengado la usa */}
+                    {v17Instalado && (
+                      <ClaseFields className="md:col-span-3" value={cuentaClase} onChange={setCuentaClase} flota={flota} pilotos={pilotosLista}
+                        naturaleza="GASTO" titulo="Clase de la factura (ej. combustible / mantenimiento de una aeronave)" />
+                    )}
                   </>)}
 
                   <div className="md:col-span-3"><ErrorBanner msg={cuentaError} onClose={() => setCuentaError(null)} /></div>
@@ -3390,6 +5172,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                             <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
                             <p className="text-[8px] text-yellow-400/70 font-mono mt-0.5">{c.horas_compradas > 0 ? `${c.horas_compradas}/${c.horas_prometidas}h acreditadas` : `${c.horas_prometidas}h`} · {c.moneda || 'USD'}</p>
                             {c.estatus === 'PARCIAL' && <p className="text-[8px] text-emerald-400/80 font-mono mt-0.5">Pagado {fmtMonto(c.monto_pagado, mon)} · {nAb} abono{nAb === 1 ? '' : 's'}</p>}
+                            {/* [NEW v17] deuda generada por consumo sin fondos */}
+                            {consumoPorCxc.has(String(c.id)) && <p className="text-[8px] text-teal-400 font-mono mt-0.5 flex items-center gap-1"><Wallet size={9} /> Consumo sin fondos · billetera</p>}
                           </div>
                           <div className="text-right ml-2">
                             <p className="font-black italic text-sm text-yellow-400">{fmtMonto(c.monto_pendiente, mon)}</p>
@@ -3401,6 +5185,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
                             className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
                             {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><CheckCircle2 size={11} /> Cobrar</>}
                           </button>
+                          {/* [NEW v17] aplicar saldo de billetera (sin mover caja) */}
+                          {(saldoWallet.get(c.student_id) ?? 0) > 0 && c.horas_prometidas === 0 && mon !== 'BS' && (
+                            <button onClick={() => aplicarBilleteraADeuda(c.student_id, String(c.id))} disabled={savingAction === c.id}
+                              title={`Saldo billetera: ${usd(saldoWallet.get(c.student_id) ?? 0)}`}
+                              className="px-3 py-2 bg-teal-500/10 text-teal-400 rounded-xl border border-teal-500/20 hover:bg-teal-500/20 transition-all disabled:opacity-30 text-[8px] font-black uppercase flex items-center gap-1">
+                              <Wallet size={11} /> Billetera
+                            </button>
+                          )}
                           <button onClick={() => deleteCuentaProtected(c.id, true)} disabled={savingAction === c.id} className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
                             <Trash2 size={12} />
                           </button>
@@ -3686,7 +5478,577 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, userRole = 
         );
       })()}
 
+      {/* ══ TAB: BILLETERAS v17 ══════════════════════════════════════════════ */}
+      {activeTab === 'BILLETERAS' && (() => {
+        const q = walletQuery.trim().toUpperCase();
+        const lista = alumnos
+          .filter(a => !q || `${a.nombre} ${a.serial} ${a.sede}`.toUpperCase().includes(q))
+          .map(a => ({ a, saldo: saldoWallet.get(a.student_id) ?? 0, deuda: deudaAlumnoUSD(a.student_id) }))
+          .sort((x, y) => Number(y.saldo + y.deuda > 0) - Number(x.saldo + x.deuda > 0) || x.a.nombre.localeCompare(y.a.nombre));
+        const sel      = alumnoSel;
+        const movsSel  = sel ? walletMovs.filter(m => m.student_id === sel.student_id) : [];
+        const consSel  = sel ? consumos.filter(c => c.student_id === sel.student_id) : [];
+        const cxcSel   = sel ? cxcPendientes.filter(c => c.student_id === sel.student_id) : [];
+        const saldoSel = sel ? saldoWallet.get(sel.student_id) ?? 0 : 0;
+        const deudaSel = sel ? deudaAlumnoUSD(sel.student_id) : 0;
+        const conDeuda = alumnos.filter(a => deudaAlumnoUSD(a.student_id) > 0).length;
+        const subTabs: { k: WalletSubTab; l: string; n?: number; icon: LucideIcon }[] = [
+          { k: 'ALUMNOS', l: 'Alumnos', icon: Users }, { k: 'VUELOS', l: 'Vuelos por cargar', n: vuelosPorCargar.length, icon: PlaneTakeoff },
+          { k: 'TARIFARIO', l: 'Tarifario y ajustes', icon: Settings },
+        ];
+        const accion = 'px-4 py-3 rounded-xl text-[9px] font-black uppercase border transition-all flex items-center gap-2 disabled:opacity-30';
+        return (
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              {([
+                ['Billeteras · anticipos', usd(totalBilleteras), `${walletCuentas.filter(w => w.saldo_usd > 0).length} alumnos con saldo`, 'text-teal-400', Wallet],
+                ['Deuda por consumos', usd(totalDeudaConsumos), `${conDeuda} alumnos con deuda (todas las CxC)`, 'text-yellow-400', ArrowUpCircle],
+                ['Consumos del mes', usd(consumosMes), 'Ingreso devengado (vuelo, simulador, cursos)', 'text-emerald-400', Receipt],
+                ['Vuelos por cargar', String(vuelosPorCargar.length), `Desde ${fmtDate(walletCorte)} · bitácora MRO`, vuelosPorCargar.length ? 'text-orange-400' : 'text-zinc-500', PlaneTakeoff],
+              ] as [string, string, string, string, LucideIcon][]).map(([l, v, s, c, Icon]) => (
+                <div key={l} className={`${glass} rounded-2xl p-4 flex items-center justify-between`}>
+                  <div>
+                    <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">{l}</p>
+                    <p className={`${c} font-black text-lg italic`}>{v}</p>
+                    <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{s}</p>
+                  </div>
+                  <Icon className={`${c} opacity-20 h-9 w-9`} />
+                </div>
+              ))}
+            </div>
+
+            {!v17Instalado && <EmptyState icon={Wallet} text="Ejecute migracion_finance_v17_billetera_clases.sql para habilitar las billeteras" />}
+            <ErrorBanner msg={walletModal ? null : walletError} onClose={() => setWalletError(null)} />
+            {walletInfo && (
+              <div className="flex items-start gap-3 p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
+                <CheckCircle2 size={14} className="text-emerald-400 shrink-0 mt-0.5" />
+                <p className="text-[10px] text-emerald-300 flex-1 font-mono">{walletInfo}</p>
+                <button type="button" onClick={() => setWalletInfo(null)} className="text-emerald-700 hover:text-emerald-400"><X size={12} /></button>
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-1 p-1.5 bg-black/60 rounded-2xl border border-white/5 w-fit">
+              {subTabs.map(({ k, l, n, icon: Icon }) => (
+                <button key={k} type="button" onClick={() => setWalletSubTab(k)}
+                  className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all ${walletSubTab === k ? 'bg-teal-500 text-black' : 'text-zinc-500 hover:text-white hover:bg-white/5'}`}>
+                  <Icon size={12} /> {l}{n ? <span className={`px-1.5 rounded ${walletSubTab === k ? 'bg-black/20' : 'bg-orange-500/20 text-orange-400'}`}>{n}</span> : null}
+                </button>
+              ))}
+            </div>
+
+            {walletSubTab === 'ALUMNOS' && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className={`lg:col-span-4 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
+                  <div className="p-4 border-b border-white/5 relative">
+                    <Search size={12} className="absolute left-7 top-1/2 -translate-y-1/2 text-zinc-600" />
+                    <input value={walletQuery} onChange={e => setWalletQuery(e.target.value)} placeholder="BUSCAR ALUMNO · SERIAL · SEDE" className={`${inp} pl-9 py-3`} />
+                  </div>
+                  <div className="flex-1 overflow-y-auto max-h-[680px] p-3 space-y-1.5">
+                    {lista.map(({ a, saldo, deuda }) => (
+                      <button key={a.student_id} type="button" onClick={() => { setWalletSel(a.student_id); setWalletError(null); }}
+                        className={`w-full text-left p-3 rounded-xl border transition-all ${walletSel === a.student_id ? 'border-teal-500/50 bg-teal-500/10' : 'border-white/[0.05] hover:bg-white/[0.03]'}`}>
+                        <div className="flex justify-between items-start gap-2">
+                          <div className="min-w-0">
+                            <p className="text-[10px] font-black uppercase truncate">{a.nombre}</p>
+                            <p className="text-[8px] text-zinc-600 font-mono">{a.serial} · {a.sede}</p>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <p className={`text-[11px] font-black italic ${saldo > 0 ? 'text-teal-400' : 'text-zinc-700'}`}>{usd(saldo)}</p>
+                            {deuda > 0 && <p className="text-[8px] font-black text-yellow-400">debe {usd(deuda)}</p>}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                    {lista.length === 0 && <EmptyState icon={Users} text="Sin alumnos" />}
+                  </div>
+                </div>
+
+                <div className="lg:col-span-8 space-y-5">
+                  {!sel ? (
+                    <div className={`${glass} rounded-3xl`}><EmptyState icon={Wallet} text="Seleccione un alumno para ver su billetera" py="py-24" /></div>
+                  ) : (<>
+                    <div className={`${glass} rounded-3xl p-6 border-t-2 border-t-teal-500`}>
+                      <div className="flex flex-wrap justify-between items-start gap-4 mb-5">
+                        <div>
+                          <p className="text-[8px] text-zinc-600 font-black uppercase tracking-[0.3em]">Billetera del alumno · USD</p>
+                          <h3 className="text-xl font-black uppercase italic">{sel.nombre}</h3>
+                          <p className="text-[9px] text-zinc-500 font-mono">{sel.serial} · Sede {sel.sede}</p>
+                        </div>
+                        <div className="grid grid-cols-3 gap-3 text-center">
+                          {([['Saldo', saldoSel, 'text-teal-400'], ['Deuda', deudaSel, deudaSel > 0 ? 'text-yellow-400' : 'text-zinc-600'],
+                             ['Posición', round2(saldoSel - deudaSel), saldoSel - deudaSel >= 0 ? 'text-emerald-400' : 'text-red-400']] as const).map(([l, v, c]) => (
+                            <div key={l} className="bg-black/30 rounded-xl px-4 py-3 border border-white/5">
+                              <p className="text-[7px] text-zinc-600 font-black uppercase">{l}</p>
+                              <p className={`text-base font-black italic ${c}`}>{usd(v)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button type="button" disabled={!v17Instalado || !canManageFinance} onClick={() => abrirWalletModal('RECARGA', sel.student_id)}
+                          className={`${accion} bg-emerald-500 text-black border-emerald-500 hover:bg-emerald-400`}><Wallet size={12} /> Recargar (pago)</button>
+                        <button type="button" disabled={!v17Instalado} onClick={() => abrirWalletModal('CONSUMO', sel.student_id)}
+                          className={`${accion} bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/30 hover:bg-[#E1AD01]/20`}><Receipt size={12} /> Registrar consumo</button>
+                        <button type="button" disabled={!v17Instalado || saldoSel <= 0 || deudaSel <= 0 || savingAction === sel.student_id} onClick={() => aplicarBilleteraADeuda(sel.student_id)}
+                          className={`${accion} bg-teal-500/10 text-teal-400 border-teal-500/30 hover:bg-teal-500/20`}>{savingAction === sel.student_id ? <Loader2 size={12} className="animate-spin" /> : <Repeat size={12} />} Aplicar saldo a deuda</button>
+                        <button type="button" disabled={!v17Instalado || !canManageFinance} onClick={() => abrirWalletModal('AJUSTE', sel.student_id)}
+                          className={`${accion} bg-violet-500/10 text-violet-400 border-violet-500/30 hover:bg-violet-500/20`}><Scale size={12} /> Ajuste</button>
+                        <button type="button" disabled={!v17Instalado || !canManageFinance || saldoSel <= 0} onClick={() => abrirWalletModal('REEMBOLSO', sel.student_id)}
+                          className={`${accion} bg-red-500/10 text-red-400 border-red-500/30 hover:bg-red-500/20`}><MinusCircle size={12} /> Reembolso</button>
+                        <button type="button" onClick={() => imprimirEstadoCuenta(sel.student_id)}
+                          className={`${accion} bg-white/5 text-white border-white/10 hover:bg-white/10 ml-auto`}><Printer size={12} /> Estado de cuenta</button>
+                      </div>
+                    </div>
+
+                    <div className={`${glass} rounded-3xl overflow-hidden`}>
+                      <p className="p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Receipt size={13} className="text-[#E1AD01]" /> Consumos · {consSel.length}</p>
+                      <div className="max-h-[320px] overflow-y-auto p-4 space-y-2">
+                        {consSel.map(c => (
+                          <div key={c.id} className={`p-4 rounded-2xl border group flex justify-between items-center gap-3 ${c.estado === 'ANULADO' ? 'border-red-500/10 opacity-40' : 'border-white/[0.05] bg-white/[0.02]'}`}>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
+                                {c.vuelo_id && <PlaneTakeoff size={10} className="text-[#E1AD01] shrink-0" />}{c.descripcion}
+                                {c.modo !== 'BILLETERA' && <Badge tone={TONE.blue}>{MODO_CONSUMO_LABEL[c.modo]}</Badge>}
+                                {c.estado === 'ANULADO' && <Badge tone={TONE.red}>Anulado</Badge>}
+                              </p>
+                              <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(c.fecha)} · {c.cantidad} {c.unidad} × {usd(c.precio_unitario_usd)} · {labelServicio(c.clase_servicio)}{c.clase_aeronave ? ` · ${c.clase_aeronave}` : ''}{c.clase_piloto ? ` · ${c.clase_piloto}` : ''}</p>
+                              {c.monto_cxc_usd > 0 && <p className="text-[8px] text-yellow-400 font-mono">Billetera {usd(c.monto_billetera_usd)} · a crédito {usd(c.monto_cxc_usd)}</p>}
+                              {c.motivo_anulacion && <p className="text-[8px] text-red-400/70 font-mono">Motivo: {c.motivo_anulacion}</p>}
+                            </div>
+                            <span className="text-sm font-black italic text-[#E1AD01]">{usd(c.monto_total_usd)}</span>
+                            {c.estado === 'VIGENTE' && canManageFinance && (
+                              <button type="button" onClick={() => pedirAnularConsumo(c)} disabled={savingAction === c.id} title="Anular consumo" className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+                                {savingAction === c.id ? <Loader2 size={13} className="animate-spin" /> : <Ban size={13} />}
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                        {consSel.length === 0 && <EmptyState text="Sin consumos" py="py-8" />}
+                      </div>
+                    </div>
+
+                    <div className={`${glass} rounded-3xl overflow-hidden`}>
+                      <p className="p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Layers size={13} className="text-teal-400" /> Movimientos de billetera · {movsSel.length}</p>
+                      <div className="max-h-[360px] overflow-y-auto p-4 space-y-2">
+                        {movsSel.map(m => (
+                          <div key={m.id} className={`p-3.5 rounded-2xl border group flex justify-between items-center gap-3 ${m.revertido ? 'border-white/[0.03] opacity-40' : m.tipo === 'REVERSO' ? 'border-red-500/15' : 'border-white/[0.05] bg-white/[0.02]'}`}>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
+                                <Badge tone={m.signo > 0 ? TONE.emerald : TONE.orange}>{WALLET_MOV_LABEL[m.tipo]}</Badge>
+                                {m.revertido && <Badge tone={TONE.red}>Revertido</Badge>}
+                                <span className="truncate">{m.concepto}</span>
+                              </p>
+                              <p className="text-[8px] text-zinc-600 font-mono mt-0.5">
+                                {fmtDate(m.fecha)} · {m.referencia}
+                                {m.moneda_origen && m.monto_origen ? ` · ${fmtMonto(m.monto_origen, normalizePaymentMethod(m.moneda_origen))}${m.tasa ? ` @ ${m.tasa}` : ''}` : ''}
+                                {m.creado_por_email ? ` · ${m.creado_por_email}` : ''}
+                              </p>
+                            </div>
+                            <div className="text-right">
+                              <p className={`text-sm font-black italic ${m.signo > 0 ? 'text-emerald-400' : 'text-red-400'}`}>{m.signo > 0 ? '+' : '−'}{usd(m.monto_usd)}</p>
+                              <p className="text-[8px] text-zinc-600 font-mono">saldo {usd(m.saldo_resultante)}</p>
+                            </div>
+                            {!m.revertido && m.tipo !== 'REVERSO' && canManageFinance && (
+                              <button type="button" onClick={() => pedirRevertir(m)} disabled={savingAction === m.id} title={m.tipo === 'CONSUMO' ? 'Anular consumo' : 'Revertir (contra-asiento)'} className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+                                {savingAction === m.id ? <Loader2 size={13} className="animate-spin" /> : <Undo2 size={13} />}
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                        {movsSel.length === 0 && <EmptyState text="Billetera sin movimientos" py="py-8" />}
+                      </div>
+                    </div>
+
+                    {cxcSel.length > 0 && (
+                      <div className={`${glass} rounded-3xl overflow-hidden`}>
+                        <p className="p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><ArrowUpCircle size={13} className="text-yellow-400" /> Cuentas por cobrar pendientes · {usd(deudaSel)}</p>
+                        <div className="p-4 space-y-2">
+                          {cxcSel.map(c => {
+                            const mon = normalizePaymentMethod(c.moneda);
+                            const aplicable = c.horas_prometidas === 0 && mon !== 'BS';
+                            return (
+                              <div key={c.id} className="p-3.5 rounded-2xl border border-yellow-500/10 flex justify-between items-center gap-3">
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-[10px] font-black uppercase truncate">{c.concepto}</p>
+                                  <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(c.fecha_emision)} · {c.estatus}{consumoPorCxc.has(String(c.id)) ? ' · consumo sin fondos' : c.horas_prometidas > 0 ? ` · paquete ${c.horas_prometidas}h (cobrar en CxC)` : ''}</p>
+                                </div>
+                                <span className="text-sm font-black italic text-yellow-400">{fmtMonto(c.monto_pendiente, mon)}</span>
+                                {aplicable && saldoSel > 0 && (
+                                  <button type="button" onClick={() => aplicarBilleteraADeuda(sel.student_id, String(c.id))} disabled={savingAction === String(c.id)}
+                                    className="px-3 py-2 bg-teal-500/10 text-teal-400 rounded-xl border border-teal-500/20 text-[8px] font-black uppercase flex items-center gap-1 disabled:opacity-30">
+                                    <Wallet size={10} /> Aplicar
+                                  </button>
+                                )}
+                                <button type="button" onClick={() => { setActiveTab('CUENTAS'); }} className="px-3 py-2 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20 text-[8px] font-black uppercase">Cobrar en CxC</button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </>)}
+                </div>
+              </div>
+            )}
+
+            {walletSubTab === 'VUELOS' && (
+              <div className={`${glass} rounded-3xl overflow-hidden`}>
+                <div className="p-5 border-b border-white/5 flex flex-wrap gap-3 justify-between items-center">
+                  <div>
+                    <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><PlaneTakeoff size={14} className="text-[#E1AD01]" /> Vuelos por cargar · desde {fmtDate(walletCorte)}</h3>
+                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Fuente: bitácora MRO (horas TAC). Cada vuelo se cobra una sola vez; lo que el saldo no cubra pasa a cuentas por cobrar.</p>
+                  </div>
+                  <button type="button" onClick={cargarTodosVuelos} disabled={!vuelosPorCargar.length || vueloCargando !== null}
+                    className="bg-[#E1AD01] text-black px-5 py-3 rounded-xl text-[9px] font-black uppercase flex items-center gap-2 disabled:opacity-30">
+                    {vueloCargando === 'ALL' ? <Loader2 size={12} className="animate-spin" /> : <PlaneTakeoff size={12} />} Cargar todos con tarifa
+                  </button>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[10px] font-mono">
+                    <thead>
+                      <tr className="text-zinc-600 text-[8px] uppercase tracking-widest">
+                        {['Fecha', 'Alumno', 'Aeronave', 'Misión', 'Horas', 'Tarifa', 'Monto', 'Saldo alumno', ''].map((h, i) => <th key={i} className={`p-3 font-black ${i >= 4 && i <= 7 ? 'text-right' : 'text-left'}`}>{h}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {vuelosPorCargar.map(v => {
+                        const t = tarifaVuelo(v.matricula);
+                        const monto = t ? round2(v.horas * t.precio_usd) : null;
+                        const saldo = saldoWallet.get(v.student_id ?? '') ?? 0;
+                        const busy = vueloCargando === v.id || vueloCargando === 'ALL';
+                        return (
+                          <tr key={v.id} className="border-t border-white/[0.04] hover:bg-white/[0.02]">
+                            <td className="p-3">{fmtDate(v.fecha)}</td>
+                            <td className="p-3 uppercase truncate max-w-[180px]">{alumnoPorId(v.student_id)?.nombre ?? '—'}</td>
+                            <td className="p-3 text-[#E1AD01] font-black">{v.matricula ?? '—'}</td>
+                            <td className="p-3 uppercase text-zinc-500">{[v.tipo_mision, v.destino].filter(Boolean).join(' · ') || '—'}</td>
+                            <td className="p-3 text-right font-black">{v.horas.toFixed(1)}</td>
+                            <td className="p-3 text-right">{t ? usd(t.precio_usd) : <span className="text-red-400">SIN TARIFA</span>}</td>
+                            <td className="p-3 text-right font-black text-white">{monto !== null ? usd(monto) : '—'}</td>
+                            <td className={`p-3 text-right ${monto !== null && saldo < monto ? 'text-yellow-400' : 'text-teal-400'}`}>{usd(saldo)}</td>
+                            <td className="p-3">
+                              <div className="flex gap-1 justify-end">
+                                <button type="button" disabled={busy || !t} onClick={() => cargarVuelo(v, 'BILLETERA')} className="px-3 py-1.5 rounded-lg bg-[#E1AD01]/15 text-[#E1AD01] border border-[#E1AD01]/30 text-[8px] font-black uppercase disabled:opacity-30">
+                                  {vueloCargando === v.id ? <Loader2 size={10} className="animate-spin" /> : 'Cargar'}
+                                </button>
+                                <button type="button" disabled={busy} onClick={() => cargarVuelo(v, 'PAQUETE_LEGACY')} title="El alumno ya había pagado estas horas en el régimen anterior" className="px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[8px] font-black uppercase disabled:opacity-30">Paquete</button>
+                                <button type="button" disabled={busy} onClick={() => cargarVuelo(v, 'CORTESIA')} title="Sin cargo (vuelo de cortesía / reposición)" className="px-3 py-1.5 rounded-lg bg-white/5 text-zinc-400 border border-white/10 text-[8px] font-black uppercase disabled:opacity-30">Cortesía</button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {vuelosPorCargar.length === 0 && <EmptyState icon={CheckCircle2} text="Todos los vuelos desde la fecha de corte están cargados" py="py-16" />}
+                </div>
+              </div>
+            )}
+
+            {walletSubTab === 'TARIFARIO' && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                <div className={`lg:col-span-4 ${glass} rounded-3xl p-6 space-y-4 h-fit`}>
+                  <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Settings size={14} className="text-teal-400" /> Política de billetera</h3>
+                  <div>
+                    <Lbl>Fecha de inicio del régimen billetera</Lbl>
+                    <input type="date" value={configForm.corte} onChange={e => setConfigForm(p => ({ ...p, corte: e.target.value }))} className={inp} style={noUpper} />
+                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Vuelos anteriores no aparecen en "Vuelos por cargar" (se rigen por los paquetes de horas).</p>
+                  </div>
+                  <div>
+                    <Lbl>Límite de crédito por alumno (USD)</Lbl>
+                    <input type="number" min="0" step="1" value={configForm.credito} onChange={e => setConfigForm(p => ({ ...p, credito: e.target.value }))} placeholder="VACÍO = SIN LÍMITE" className={inp} />
+                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Si la deuda supera el límite, el consumo exige autorización explícita. Actual: {creditoMax === null ? 'sin límite' : usd(creditoMax)}.</p>
+                  </div>
+                  <button type="button" onClick={guardarConfig} disabled={savingWallet || !canManageFinance || !v17Instalado} className="w-full py-3.5 bg-teal-500 text-black rounded-xl text-[10px] font-black uppercase disabled:opacity-30 flex items-center justify-center gap-2">
+                    {savingWallet ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />} Guardar política
+                  </button>
+                </div>
+                <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden`}>
+                  <div className="p-5 border-b border-white/5 flex justify-between items-center">
+                    <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Receipt size={14} className="text-[#E1AD01]" /> Tarifario · {servicios.length} servicios</h3>
+                    <button type="button" onClick={() => abrirServicio()} disabled={!canManageFinance || !v17Instalado} className="bg-[#E1AD01] text-black px-4 py-2.5 rounded-xl text-[9px] font-black uppercase flex items-center gap-2 disabled:opacity-30"><PlusCircle size={12} /> Nuevo servicio</button>
+                  </div>
+                  <div className="p-4 space-y-2 max-h-[620px] overflow-y-auto">
+                    {servicios.map(s => (
+                      <div key={s.id} className={`p-4 rounded-2xl border flex justify-between items-center gap-3 ${s.activo ? 'border-white/[0.06] bg-white/[0.02]' : 'border-white/[0.03] opacity-50'}`}>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
+                            {s.nombre}{!s.activo && <Badge tone={TONE.red}>Inactivo</Badge>}{s.precio_usd === 0 && <Badge tone={TONE.orange}>Sin precio</Badge>}
+                          </p>
+                          <p className="text-[8px] text-zinc-600 font-mono">{s.codigo} · {s.tipo} · {labelServicio(s.clase_servicio)}{s.aeronave_matricula ? ` · ${s.aeronave_matricula}` : ' · todas las aeronaves'}{s.sede ? ` · ${s.sede}` : ''}</p>
+                        </div>
+                        <span className="text-base font-black italic text-[#E1AD01]">{usd(s.precio_usd)}<span className="text-[8px] text-zinc-600 not-italic"> /{s.unidad.toLowerCase()}</span></span>
+                        <button type="button" onClick={() => abrirServicio(s)} disabled={!canManageFinance} className="text-zinc-600 hover:text-[#E1AD01] p-2 disabled:opacity-30"><Pencil size={13} /></button>
+                      </div>
+                    ))}
+                    {servicios.length === 0 && <EmptyState icon={Receipt} text="Tarifario vacío" />}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* ══ TAB: REPORTES v17 ════════════════════════════════════════════════ */}
+      {activeTab === 'REPORTES' && (
+        <ReportesFinancieros
+          transactions={transactions} clasifMap={clasifMap} consumos={consumos} walletMovs={walletMovs}
+          walletCuentas={walletCuentas} cuentasCxC={cuentasCxC} cuentas={cuentas} abonos={abonos} provisionales={provisionales}
+          provisionalAplicado={provisionalAplicado} flota={flota} alumnos={alumnos} cajas={cajas} movCajas={movCajas}
+          tasaBCV={tasaBCV} inventory={inventory} v17={v17Instalado} canEdit={canManageFinance}
+          onReclasificar={abrirReclas} onImprimirCaja={imprimirMovimientosCaja} onImprimirAlumno={imprimirEstadoCuenta} />
+      )}
+
       {/* ══ MODALES ══════════════════════════════════════════════════════════ */}
+
+      {/* [NEW v17] RECARGA DE BILLETERA */}
+      {walletModal === 'RECARGA' && alumnoSel && (() => {
+        const f = recargaForm;
+        const monto = parseFloat(f.monto);
+        const tasa  = parseFloat(f.tasa);
+        const montoUsd = Number.isFinite(monto) && monto > 0 ? (f.moneda === 'BS' ? (tasa > 0 ? round2(monto / tasa) : NaN) : round2(monto)) : NaN;
+        const saldo = saldoWallet.get(alumnoSel.student_id) ?? 0;
+        const deudaAplicable = round2(cxcPendientes.filter(c => c.student_id === alumnoSel.student_id && c.horas_prometidas === 0 && normalizePaymentMethod(c.moneda) !== 'BS')
+          .reduce((a, c) => a + c.monto_pendiente, 0));
+        const aplicaria = f.aplicar_deudas && Number.isFinite(montoUsd) ? round2(Math.min(saldo + montoUsd, deudaAplicable)) : 0;
+        const cajaSel = cajaById(f.caja_id);
+        return (
+          <ModalShell accent="border-t-emerald-500" maxW="max-w-2xl">
+            <ModalHeader icon={Wallet} tone={TONE.emerald} title="Recargar billetera"
+              subtitle={`${alumnoSel.nombre} · saldo ${usd(saldo)}${deudaAplicable > 0 ? ` · deuda aplicable ${usd(deudaAplicable)}` : ''}`} onClose={cerrarWalletModal} />
+            <form onSubmit={handleRecarga} className="space-y-4">
+              <div><Lbl>Moneda / medio de pago</Lbl>
+                <MonedaPicker value={f.moneda} onChange={m => setRecargaForm(p => ({ ...p, moneda: m, caja_id: ajustarCaja(p.caja_id, m) }))} />
+              </div>
+              <div className={`grid ${f.moneda === 'BS' ? 'grid-cols-2' : 'grid-cols-1'} gap-3`}>
+                <AmountInput size="lg" value={f.monto} moneda={f.moneda} disabled={savingWallet} onChange={v => setRecargaForm(p => ({ ...p, monto: v }))} />
+                {f.moneda === 'BS' && (
+                  <input type="number" step="0.0001" min="0.0001" required value={f.tasa} onChange={e => setRecargaForm(p => ({ ...p, tasa: e.target.value }))}
+                    className="w-full bg-black/50 border border-white/10 py-6 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-[#E1AD01] text-white" placeholder="Tasa Bs/USD" />
+                )}
+              </div>
+              <div>
+                <Lbl>Caja que recibe el dinero *</Lbl>
+                <select value={f.caja_id} onChange={e => setRecargaForm(p => ({ ...p, caja_id: e.target.value }))} className={inp}>
+                  <option value="">— SELECCIONE CAJA —</option>
+                  {cajas.map(c => { const ok = cajaAceptaMoneda(c, f.moneda); return <option key={c.id} value={c.id} disabled={!ok}>{c.nombre}{ok ? '' : ` · NO ACEPTA ${f.moneda}`}</option>; })}
+                </select>
+              </div>
+              {cajaEsEfectivo(f.caja_id) && <SubcajaToggle value={f.subcaja} onChange={sc => setRecargaForm(p => ({ ...p, subcaja: sc }))} />}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <input type="date" required value={f.fecha} onChange={e => setRecargaForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
+                <input value={f.concepto} onChange={e => setRecargaForm(p => ({ ...p, concepto: e.target.value }))} placeholder="CONCEPTO (ej. PAGO PAQUETE PPL)" className={inp} />
+              </div>
+              <PagadorFields value={recargaPago} onChange={setRecargaPago} moneda={f.moneda} alumnos={alumnos} />
+              {deudaAplicable > 0 && (
+                <label className="flex items-center gap-3 p-3 rounded-xl border border-yellow-500/20 bg-yellow-500/5 cursor-pointer">
+                  <input type="checkbox" checked={f.aplicar_deudas} onChange={e => setRecargaForm(p => ({ ...p, aplicar_deudas: e.target.checked }))} />
+                  <span className="text-[9px] text-yellow-300 font-black uppercase">Saldar primero sus deudas ({usd(deudaAplicable)} en CxC sin horas, las más antiguas primero)</span>
+                </label>
+              )}
+              {Number.isFinite(montoUsd) && (
+                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
+                  <p className="text-emerald-400">+ {fmtMonto(monto, f.moneda)} · Bóveda {f.moneda}</p>
+                  <p className={cajaSel ? 'text-emerald-400' : 'text-red-400'}>{cajaSel ? `+ ${fmtMonto(monto, f.moneda)} · Caja ${cajaSel.nombre}` : 'Falta la caja'}</p>
+                  <p className="text-teal-400">+ {usd(montoUsd)} · Billetera {alumnoSel.nombre}{f.moneda === 'BS' ? ` (@ ${f.tasa})` : ''}</p>
+                  {aplicaria > 0 && <p className="text-yellow-400">− {usd(aplicaria)} · aplicado a deudas</p>}
+                  <p className="text-zinc-500 md:col-span-2">Anticipo (pasivo): se vuelve ingreso cuando el alumno consume vuelo, simulador o cursos.</p>
+                </div>
+              )}
+              <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
+              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-emerald-500 text-black hover:bg-emerald-400" label={<><Wallet size={14} /> Registrar recarga</>} />
+            </form>
+          </ModalShell>
+        );
+      })()}
+
+      {/* [NEW v17] CONSUMO */}
+      {walletModal === 'CONSUMO' && alumnoSel && (() => {
+        const f = consumoForm;
+        const cant   = parseFloat(f.cantidad);
+        const precio = f.modo === 'BILLETERA' ? parseFloat(f.precio) : 0;
+        const total  = Number.isFinite(cant) && Number.isFinite(precio) ? round2(cant * precio) : NaN;
+        const saldo  = saldoWallet.get(alumnoSel.student_id) ?? 0;
+        const desdeW = Number.isFinite(total) ? round2(Math.min(Math.max(saldo, 0), total)) : 0;
+        const aCxc   = Number.isFinite(total) ? round2(total - desdeW) : 0;
+        const deuda  = deudaAlumnoUSD(alumnoSel.student_id);
+        const excede = creditoMax !== null && aCxc > 0 && deuda + aCxc > creditoMax;
+        const unidad = servicios.find(s => s.id === f.servicio_id)?.unidad ?? TIPOS_CONSUMO.find(t => t.k === f.tipo)?.unidad ?? 'UNIDAD';
+        return (
+          <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-2xl">
+            <ModalHeader icon={Receipt} tone={TONE.asiento} title="Registrar consumo" subtitle={`${alumnoSel.nombre} · saldo ${usd(saldo)}${deuda > 0 ? ` · deuda ${usd(deuda)}` : ''}`} onClose={cerrarWalletModal} />
+            <form onSubmit={handleConsumo} className="space-y-4">
+              <div><Lbl>Servicio del tarifario</Lbl>
+                <select value={f.servicio_id} onChange={e => elegirServicioConsumo(e.target.value)} className={inp}>
+                  <option value="">— CARGO LIBRE (sin tarifario) —</option>
+                  {servicios.filter(s => s.activo).map(s => <option key={s.id} value={s.id}>{s.nombre} · {usd(s.precio_usd)}/{s.unidad.toLowerCase()}{s.aeronave_matricula ? ` · ${s.aeronave_matricula}` : ''}</option>)}
+                </select>
+              </div>
+              <div className="grid grid-cols-3 md:grid-cols-6 gap-1.5">
+                {TIPOS_CONSUMO.map(t => (
+                  <button key={t.k} type="button" onClick={() => { setConsumoForm(p => ({ ...p, tipo: t.k })); setConsumoClase(c => ({ ...c, servicio: c.servicio || SERVICIO_POR_TIPO[t.k] })); }}
+                    className={`py-2.5 rounded-xl text-[8px] font-black uppercase border transition-all ${f.tipo === t.k ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`}>{t.l}</button>
+                ))}
+              </div>
+              <div className="grid grid-cols-3 gap-3">
+                <div><Lbl>Cantidad ({unidad.toLowerCase()})</Lbl><input type="number" step="0.1" min="0.1" required value={f.cantidad} onChange={e => setConsumoForm(p => ({ ...p, cantidad: e.target.value }))} className={inp} /></div>
+                <div><Lbl>Precio unitario USD</Lbl><input type="number" step="0.01" min="0" required={f.modo === 'BILLETERA'} disabled={f.modo !== 'BILLETERA'} value={f.modo === 'BILLETERA' ? f.precio : '0'} onChange={e => setConsumoForm(p => ({ ...p, precio: e.target.value }))} className={inp} /></div>
+                <div><Lbl>Fecha</Lbl><input type="date" required value={f.fecha} onChange={e => setConsumoForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} /></div>
+              </div>
+              <input value={f.descripcion} onChange={e => setConsumoForm(p => ({ ...p, descripcion: e.target.value }))} placeholder="DESCRIPCIÓN (ej. SIMULADOR FNPT II · 2 SESIONES)" className={inp} />
+              <div>
+                <Lbl>Modalidad</Lbl>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['BILLETERA', 'PAQUETE_LEGACY', 'CORTESIA'] as ModoConsumo[]).map(m => (
+                    <button key={m} type="button" onClick={() => setConsumoForm(p => ({ ...p, modo: m }))}
+                      className={`py-2.5 rounded-xl text-[8px] font-black uppercase border transition-all ${f.modo === m ? 'bg-teal-500/15 text-teal-400 border-teal-500/30' : optOff}`}>{MODO_CONSUMO_LABEL[m]}</button>
+                  ))}
+                </div>
+              </div>
+              <ClaseFields value={consumoClase} onChange={setConsumoClase} flota={flota} pilotos={pilotosLista} naturaleza="INGRESO" titulo="Clase del ingreso (aeronave · instructor · sede)" />
+              {Number.isFinite(total) && (
+                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-3 gap-2 text-center">
+                  {([['Total', total, 'text-white'], ['De la billetera', desdeW, 'text-teal-400'], ['A cuentas por cobrar', aCxc, aCxc > 0 ? 'text-yellow-400' : 'text-zinc-600']] as const).map(([l, v, c]) => (
+                    <div key={l}><p className="text-[7px] text-zinc-600 font-black uppercase">{l}</p><p className={`text-base font-black italic ${c}`}>{usd(v)}</p></div>
+                  ))}
+                </div>
+              )}
+              {aCxc > 0 && <p className="text-[9px] text-yellow-300 font-mono">El saldo no alcanza: {usd(aCxc)} se registran como deuda del alumno (CxC) y se cobran luego o con su próxima recarga.</p>}
+              {excede && (
+                <label className="flex items-center gap-3 p-3 rounded-xl border border-red-500/30 bg-red-500/5 cursor-pointer">
+                  <input type="checkbox" checked={f.autorizar} onChange={e => setConsumoForm(p => ({ ...p, autorizar: e.target.checked }))} />
+                  <span className="text-[9px] text-red-300 font-black uppercase">Supera el límite de crédito ({usd(creditoMax ?? 0)}): autorizo el consumo</span>
+                </label>
+              )}
+              <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
+              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} disabled={excede && !f.autorizar}
+                submitCls="bg-[#E1AD01] text-black hover:bg-white" label={<><Receipt size={14} /> Registrar consumo</>} />
+            </form>
+          </ModalShell>
+        );
+      })()}
+
+      {/* [NEW v17] AJUSTE */}
+      {walletModal === 'AJUSTE' && alumnoSel && (
+        <ModalShell accent="border-t-violet-500">
+          <ModalHeader icon={Scale} tone={TONE.fin} title="Ajuste de billetera" subtitle={`${alumnoSel.nombre} · saldo ${usd(saldoWallet.get(alumnoSel.student_id) ?? 0)}`} onClose={cerrarWalletModal} />
+          <form onSubmit={handleAjuste} className="space-y-4">
+            <div className="grid grid-cols-3 gap-1.5">
+              {(['SALDO_INICIAL', 'AJUSTE_CREDITO', 'AJUSTE_DEBITO'] as AjusteTipo[]).map(t => (
+                <button key={t} type="button" onClick={() => setAjusteForm(p => ({ ...p, tipo: t }))}
+                  className={`py-2.5 rounded-xl text-[8px] font-black uppercase border transition-all ${ajusteForm.tipo === t ? 'bg-violet-500/15 text-violet-400 border-violet-500/30' : optOff}`}>{WALLET_MOV_LABEL[t]}</button>
+              ))}
+            </div>
+            <p className="text-[8px] text-zinc-500 font-mono">
+              {ajusteForm.tipo === 'SALDO_INICIAL' ? 'Migración de saldos previos (no afecta el P&L).'
+                : ajusteForm.tipo === 'AJUSTE_CREDITO' ? 'Bonificación / descuento: aumenta el saldo y resta ingresos en el P&L.'
+                : 'Cargo adicional sin servicio del tarifario: disminuye el saldo y suma ingresos.'} No mueve caja. Requiere clave de director.
+            </p>
+            <AmountInput size="lg" value={ajusteForm.monto} moneda="USDT" prefixCls="text-violet-400" onChange={v => setAjusteForm(p => ({ ...p, monto: v }))} />
+            <textarea value={ajusteForm.motivo} onChange={e => setAjusteForm(p => ({ ...p, motivo: e.target.value }))} rows={2} placeholder="MOTIVO (obligatorio, queda en auditoría)"
+              className="w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-violet-500/60 resize-none uppercase" />
+            <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
+            <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-violet-500 text-white hover:bg-violet-400" label={<><KeyRound size={13} /> Registrar ajuste</>} />
+          </form>
+        </ModalShell>
+      )}
+
+      {/* [NEW v17] REEMBOLSO */}
+      {walletModal === 'REEMBOLSO' && alumnoSel && (() => {
+        const f = reembolsoForm;
+        const montoUsd = parseFloat(f.monto_usd);
+        const tasa = parseFloat(f.tasa);
+        const origen = Number.isFinite(montoUsd) && montoUsd > 0 ? (f.moneda === 'BS' ? round2(montoUsd * tasa) : round2(montoUsd)) : NaN;
+        const cajaSel = cajaById(f.caja_id);
+        return (
+          <ModalShell accent="border-t-red-500" maxW="max-w-xl">
+            <ModalHeader icon={MinusCircle} tone={TONE.red} title="Reembolso al alumno" subtitle={`${alumnoSel.nombre} · saldo ${usd(saldoWallet.get(alumnoSel.student_id) ?? 0)}`} onClose={cerrarWalletModal} />
+            <form onSubmit={handleReembolso} className="space-y-4">
+              <div><Lbl>Monto a devolver (USD de billetera)</Lbl><AmountInput size="lg" value={f.monto_usd} moneda="USDT" prefixCls="text-red-400" onChange={v => setReembolsoForm(p => ({ ...p, monto_usd: v }))} /></div>
+              <div><Lbl>Se paga en</Lbl><MonedaPicker value={f.moneda} onChange={m => setReembolsoForm(p => ({ ...p, moneda: m, caja_id: ajustarCaja(p.caja_id, m) }))} /></div>
+              {f.moneda === 'BS' && <div><Lbl>Tasa Bs/USD</Lbl><input type="number" step="0.0001" min="0.0001" value={f.tasa} onChange={e => setReembolsoForm(p => ({ ...p, tasa: e.target.value }))} className={inp} /></div>}
+              <select value={f.caja_id} onChange={e => setReembolsoForm(p => ({ ...p, caja_id: e.target.value }))} className={inp}>
+                <option value="">— CAJA DE DONDE SALE —</option>
+                {cajas.map(c => { const ok = cajaAceptaMoneda(c, f.moneda); return <option key={c.id} value={c.id} disabled={!ok}>{c.nombre}{ok ? ` · ${fmtMonto(getCajaBalance(c.id, f.moneda), f.moneda)}` : ` · NO ACEPTA ${f.moneda}`}</option>; })}
+              </select>
+              {cajaEsEfectivo(f.caja_id) && <SubcajaToggle value={f.subcaja} onChange={sc => setReembolsoForm(p => ({ ...p, subcaja: sc }))} />}
+              <div className="grid grid-cols-2 gap-3">
+                <input type="date" value={f.fecha} onChange={e => setReembolsoForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
+                <input value={f.referencia} onChange={e => setReembolsoForm(p => ({ ...p, referencia: e.target.value }))} placeholder="REF. TRANSFERENCIA / RECIBO" className={inp} />
+              </div>
+              <input value={f.concepto} onChange={e => setReembolsoForm(p => ({ ...p, concepto: e.target.value }))} placeholder="MOTIVO DEL REEMBOLSO" className={inp} />
+              {Number.isFinite(origen) && (
+                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
+                  <p className="text-red-400">− {fmtMonto(origen, f.moneda)} · Bóveda {f.moneda}</p>
+                  <p className={cajaSel ? 'text-red-400' : 'text-zinc-600'}>{cajaSel ? `− ${fmtMonto(origen, f.moneda)} · Caja ${cajaSel.nombre}` : 'Falta la caja'}</p>
+                  <p className="text-teal-400">− {usd(montoUsd)} · Billetera (cancela anticipo, no es gasto)</p>
+                </div>
+              )}
+              <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
+              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-red-500 text-white hover:bg-red-400" label={<><KeyRound size={13} /> Registrar reembolso</>} />
+            </form>
+          </ModalShell>
+        );
+      })()}
+
+      {/* [NEW v17] MOTIVO: revertir movimiento / anular consumo */}
+      {motivoAccion && (
+        <ModalShell accent="border-t-red-500" z="z-[96]">
+          <ModalHeader icon={Undo2} tone={TONE.red} title={motivoAccion.titulo} subtitle="Contra-asiento auditado · requiere clave de director" onClose={() => setMotivoAccion(null)} />
+          <p className="text-[10px] text-zinc-300 font-mono mb-4">{motivoAccion.detalle}</p>
+          <textarea value={motivoTexto} onChange={e => setMotivoTexto(e.target.value)} rows={3} placeholder="MOTIVO (obligatorio, mínimo 5 caracteres)"
+            className="w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-red-500/60 resize-none uppercase mb-4" />
+          <ModalActions onCancel={() => setMotivoAccion(null)} onSubmit={confirmarMotivo} busy={false} disabled={motivoTexto.trim().length < 5}
+            submitCls="bg-red-500 text-white hover:bg-red-400" label={<><Undo2 size={13} /> Continuar</>} />
+        </ModalShell>
+      )}
+
+      {/* [NEW v17] SERVICIO DEL TARIFARIO */}
+      {servicioEdit && (
+        <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-xl">
+          <ModalHeader icon={Receipt} tone={TONE.asiento} title={servicioEdit.id ? 'Editar servicio' : 'Nuevo servicio'} subtitle="Tarifa en USD por unidad" onClose={() => setServicioEdit(null)} />
+          <div className="grid grid-cols-2 gap-3">
+            <input value={servicioEdit.codigo} onChange={e => setServicioEdit(p => p && ({ ...p, codigo: e.target.value }))} placeholder="CÓDIGO (ej. VUELO-YV1234)" className={inp} />
+            <input value={servicioEdit.nombre} onChange={e => setServicioEdit(p => p && ({ ...p, nombre: e.target.value }))} placeholder="NOMBRE" className={inp} />
+            <select value={servicioEdit.tipo} onChange={e => { const t = e.target.value as TipoConsumo; setServicioEdit(p => p && ({ ...p, tipo: t, unidad: TIPOS_CONSUMO.find(x => x.k === t)?.unidad ?? p.unidad, clase_servicio: SERVICIO_POR_TIPO[t] })); }} className={inp}>
+              {TIPOS_CONSUMO.map(t => <option key={t.k} value={t.k}>{t.l}</option>)}
+            </select>
+            <select value={servicioEdit.unidad} onChange={e => setServicioEdit(p => p && ({ ...p, unidad: e.target.value }))} className={inp}>
+              {['HORA', 'UNIDAD', 'SESION'].map(u => <option key={u} value={u}>{u}</option>)}
+            </select>
+            <div className="col-span-2"><AmountInput value={servicioEdit.precio} moneda="USDT" onChange={v => setServicioEdit(p => p && ({ ...p, precio: v }))} /></div>
+            <select value={servicioEdit.aeronave_matricula} onChange={e => setServicioEdit(p => p && ({ ...p, aeronave_matricula: e.target.value }))} className={inp}>
+              <option value="">TODAS LAS AERONAVES</option>
+              {flota.map(m => <option key={m} value={m}>{m}</option>)}
+              {servicioEdit.aeronave_matricula && !flota.includes(servicioEdit.aeronave_matricula) && <option value={servicioEdit.aeronave_matricula}>{servicioEdit.aeronave_matricula}</option>}
+            </select>
+            <select value={servicioEdit.sede} onChange={e => setServicioEdit(p => p && ({ ...p, sede: e.target.value }))} className={inp}>
+              <option value="">TODAS LAS SEDES</option>
+              {SEDES_FIN.map(s => <option key={s.k} value={s.k}>{s.l}</option>)}
+            </select>
+            <select value={servicioEdit.clase_servicio} onChange={e => setServicioEdit(p => p && ({ ...p, clase_servicio: e.target.value }))} className={`${inp} col-span-2`}>
+              {SERVICIOS_PL.filter(s => s.n === 'INGRESO').map(s => <option key={s.k} value={s.k}>{s.cod} · {s.l}</option>)}
+            </select>
+            <input value={servicioEdit.notas} onChange={e => setServicioEdit(p => p && ({ ...p, notas: e.target.value }))} placeholder="NOTAS" className={`${inp} col-span-2`} style={noUpper} />
+            <label className="col-span-2 flex items-center gap-3 text-[9px] font-black uppercase text-zinc-400">
+              <input type="checkbox" checked={servicioEdit.activo} onChange={e => setServicioEdit(p => p && ({ ...p, activo: e.target.checked }))} /> Activo (disponible para cobrar)
+            </label>
+          </div>
+          <div className="my-4"><ErrorBanner msg={walletError} onClose={() => setWalletError(null)} /></div>
+          <ModalActions onCancel={() => setServicioEdit(null)} onSubmit={guardarServicio} busy={savingWallet} submitCls="bg-[#E1AD01] text-black hover:bg-white" label={<><ShieldCheck size={13} /> Guardar</>} />
+        </ModalShell>
+      )}
+
+      {/* [NEW v17] CLASE CONTABLE (reclasificación) */}
+      {reclasAccion && (
+        <ModalShell accent="border-t-teal-500" maxW="max-w-lg">
+          <ModalHeader icon={Tag} tone={TONE.fx} title="Clase contable" subtitle={reclasAccion.titulo} onClose={() => setReclasAccion(null)} />
+          <ClaseFields value={reclasForm} onChange={setReclasForm} flota={flota} pilotos={pilotosLista} />
+          <p className="text-[8px] text-zinc-600 font-mono my-3">Solo cambia la clasificación para el P&amp;L por clase. No modifica montos, cajas ni asientos.</p>
+          <ModalActions onCancel={() => setReclasAccion(null)} onSubmit={handleReclasificar} busy={savingWallet} submitCls="bg-teal-500 text-black hover:bg-teal-400" label={<><Tag size={13} /> Guardar clase</>} />
+        </ModalShell>
+      )}
 
       {/* COBRO CxC / PAGO CxP */}
       {cobroModal && (() => {
