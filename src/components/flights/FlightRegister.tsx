@@ -1,5 +1,28 @@
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  VALKYRON FLIGHT SYSTEM — FLIGHT REGISTER v6.2                             ║
+// ║  VALKYRON FLIGHT SYSTEM — FLIGHT REGISTER v7.0                             ║
+// ║  v7.0 EVOLUCIÓN (sobre v6.2) — DESCUENTO DE HORAS ↔ BILLETERA (v18 SQL):   ║
+// ║    — [NEW] Cierre de bitácora en UNA transacción: fn_vuelo_registrar      ║
+// ║      (bitácora + horas alumno + combustible + asignación VOLADO +         ║
+// ║       reserva COMPLETADA + cobro). Antes: 6 escrituras sueltas.           ║
+// ║    — [NEW] Cobro automático: horas de paquete anterior → billetera USD    ║
+// ║      a tarifa del Tarifario → déficit a cuentas por cobrar.               ║
+// ║    — [NEW] Saldo del alumno = paquete + billetera en horas (fn_vuelo_     ║
+// ║      saldos) y vista previa del cargo antes de cerrar.                    ║
+// ║    — [NEW] Misiones confirmadas por Planificación (reservas_slot_vuelo)   ║
+// ║      aparecen en "Misiones del Día" (antes solo asignaciones_vuelo_diario)║
+// ║      con aeronave asignada preseleccionada.                               ║
+// ║    — [NEW] Guardas: vuelo duplicado / TAC solapado / fecha futura.        ║
+// ║    — [FIX] hoy()/manana() en hora LOCAL (toISOString daba la fecha UTC:   ║
+// ║      después de las 20:00 en Venezuela registraba "mañana").              ║
+// ║    — [FIX] Ya no se inserta un INGRESO PAID por vuelo en                  ║
+// ║      transacciones_finanzas (duplicaba el ingreso del paquete/recarga).   ║
+// ║    — [FIX] Saldo heredado: horas de paquetes PARCIAL también cuentan y    ║
+// ║      las horas ya facturadas como deuda no se descuentan dos veces.       ║
+// ║    — [NEW] Estudiantes sin nombre (estrategia C) se completan desde       ║
+// ║      perfiles_estudiantes.                                                ║
+// ║    — PRESERVADO: registro heredado completo como respaldo si la           ║
+// ║      migración v18 aún no está instalada.                                 ║
+// ╠══════════════════════════════════════════════════════════════════════════════╣
 // ║  v6.2 EVOLUCIÓN (sobre v6.1):                                              ║
 // ║    — select('id, nombre_completo, sede') en instructores — sin 'nombre'    ║
 // ║    — Cascada A→B→C en asignaciones: vista con orden_capitan →              ║
@@ -17,7 +40,12 @@ import {
   FileCheck, Activity, AlertTriangle, Fuel, MapPin,
   CloudRain, Calendar, CheckCircle2, ChevronRight, Clock,
   DollarSign, Navigation, ChevronDown, WifiOff, RefreshCw,
+  Wallet, Receipt,   // [NEW v7.0]
 } from 'lucide-react';
+// [NEW v7.0] Contratos de fn_vuelo_saldos / fn_vuelo_registrar (migracion_vuelos_v18_billetera.sql)
+import type {
+  SaldoVueloAlumno, RegistroVueloInput, RegistroVueloResultado, PreviewCargoVuelo, CargoVuelo,
+} from '@/Types/flights';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INTERFACES
@@ -47,6 +75,28 @@ interface AsignacionDia {
   carrera_id:        string;
   saldo_horas:       number;
   orden_capitan?:    number;
+  // ▼ [NEW v7.0] Planificación + billetera
+  /** ASIGNACION = asignaciones_vuelo_diario · RESERVA = reservas_slot_vuelo confirmada por Planificación */
+  origen?:              'ASIGNACION' | 'RESERVA';
+  reserva_id?:          string | null;
+  slot_hora?:           string | null;
+  tipo_vuelo?:          string | null;
+  aeronave_id?:         string | null;
+  saldo_usd?:           number | null;
+  saldo_horas_paquete?: number | null;
+}
+
+/** [NEW v7.0] Fila cruda de reservas_slot_vuelo usada para "Misiones del Día" */
+interface ReservaHoy {
+  id:                 string;
+  student_id:         string | null;
+  aeronave_id:        string | null;
+  aeronave_matricula: string | null;
+  instructor_id:      string | null;
+  fecha:              string;
+  slot_hora:          string | null;
+  tipo_vuelo:         string | null;
+  status:             string | null;
 }
 
 interface RutaVuelo {
@@ -100,11 +150,153 @@ const glass = {
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const hoy    = () => new Date().toISOString().split('T')[0];
+// [FIX v7.0] Fecha LOCAL (America/Caracas). toISOString() devuelve la fecha UTC: después de las 20:00
+// en Venezuela el vuelo y las asignaciones quedaban con la fecha de mañana. Misma regla que
+// FlightPlanningBoard y CalendarioCapitan.
+const pad2       = (n: number) => String(n).padStart(2, '0');
+const toYMDLocal = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const hoy    = () => toYMDLocal(new Date());
 const manana = () => {
   const d = new Date();
   d.setDate(d.getDate() + 1);
-  return d.toISOString().split('T')[0];
+  return toYMDLocal(d);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [NEW v7.0] HELPERS DE COBRO / BILLETERA
+// ─────────────────────────────────────────────────────────────────────────────
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const round2  = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+const usd     = (n: number) => `$${round2(n).toFixed(2)}`;
+const numOr   = (v: unknown, fb = 0) => { const n = Number(v); return Number.isFinite(n) ? n : fb; };
+
+/** La RPC no existe en la base (migración v18 aún no ejecutada) → usar el registro heredado. */
+const esRpcNoInstalada = (err: { code?: string; message?: string } | null | undefined): boolean =>
+  !!err && (err.code === 'PGRST202' || err.code === '42883' ||
+            /could not find the function|function .* does not exist/i.test(err.message ?? ''));
+
+/** Mensajes del servidor (fn_vuelo_registrar / fn_wallet_*) en lenguaje operativo. */
+const ERRORES_VUELO: [RegExp, string][] = [
+  [/NO_AUTORIZADO/,                 'Su usuario no está habilitado para registrar vuelos (capitán activo o administración).'],
+  [/ALUMNO_NO_EXISTE|ALUMNO_REQUERIDO/, 'El alumno seleccionado no existe en el sistema.'],
+  [/AERONAVE_NO_EXISTE/,            'La aeronave seleccionada no existe en la flota.'],
+  [/VUELO_DUPLICADO/,               'Este vuelo ya está registrado (misma aeronave y mismo TAC inicial/final).'],
+  [/TAC_INVALIDO/,                  'TAC inválido: el TAC final debe ser mayor que el inicial.'],
+  [/HORAS_FUERA_DE_RANGO/,          'Delta TAC fuera de rango (más de 12 h en un solo vuelo). Verifique los tacómetros.'],
+  [/FECHA_FUTURA/,                  'La fecha del vuelo no puede ser posterior a hoy.'],
+  [/FECHA_FUERA_DE_VENTANA/,        'Solo se pueden registrar vuelos de los últimos 7 días. Para fechas anteriores consulte a administración.'],
+  [/VUELO_COBRADO/,                 'El vuelo ya fue cobrado: anule primero su consumo en Finanzas → Billeteras.'],
+  [/TARIFA_VUELO_NO_CONFIGURADA/,   'No hay tarifa de vuelo activa: configure el Tarifario en Finanzas → Billeteras.'],
+  [/CREDITO_EXCEDIDO/,              'La deuda del alumno supera el límite de crédito configurado.'],
+];
+const traducirErrorVuelo = (msg: string): string => {
+  const hit = ERRORES_VUELO.find(([re]) => re.test(msg));
+  return hit ? hit[1] : msg;
+};
+
+/** Normaliza una fila de fn_vuelo_saldos. */
+const normSaldo = (raw: unknown): SaldoVueloAlumno | null => {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (!r.student_id) return null;
+  const tarifa = r.tarifa_hora == null ? null : numOr(r.tarifa_hora, 0);
+  return {
+    student_id:             String(r.student_id),
+    horas_paquete:          numOr(r.horas_paquete),
+    saldo_usd:              numOr(r.saldo_usd),
+    deuda_usd:              numOr(r.deuda_usd),
+    tarifa_hora:            tarifa !== null && tarifa > 0 ? tarifa : null,
+    servicio:               r.servicio == null ? null : String(r.servicio),
+    horas_billetera:        numOr(r.horas_billetera),
+    horas_disponibles:      numOr(r.horas_disponibles),
+    credito_maximo_usd:     r.credito_maximo_usd == null ? null : numOr(r.credito_maximo_usd),
+    credito_disponible_usd: r.credito_disponible_usd == null ? null : numOr(r.credito_disponible_usd),
+  };
+};
+
+/**
+ * Misma regla que fn_vuelo_registrar:
+ *   h_paq = min(max(paquete,0), ΔT) · h_bill = ΔT − h_paq · monto = h_bill × tarifa
+ *   billetera = min(saldo, monto) · CxC = monto − billetera
+ */
+const calcularPreviewCargo = (s: SaldoVueloAlumno | null, horasTac: number): PreviewCargoVuelo | null => {
+  if (!s || horasTac <= 0) return null;
+  const horasPaquete   = round2(Math.min(Math.max(s.horas_paquete, 0), horasTac));
+  const horasBilletera = round2(horasTac - horasPaquete);
+  const tarifa         = s.tarifa_hora;
+  const monto          = tarifa ? round2(horasBilletera * tarifa) : 0;
+  const desdeBilletera = round2(Math.min(Math.max(s.saldo_usd, 0), monto));
+  return {
+    horasPaquete, horasBilletera, tarifa, monto, desdeBilletera,
+    aCxc: round2(monto - desdeBilletera),
+    sinTarifa: horasBilletera > 0 && !tarifa,
+  };
+};
+
+/** Texto del cobro aplicado por el servidor. */
+const resumenCargo = (c: CargoVuelo): string => {
+  if (c.modo === 'PAQUETE_LEGACY') return `Cubierto por paquete anterior (${numOr(c.horas_paquete).toFixed(2)}h)`;
+  const partes = [
+    numOr(c.horas_paquete) > 0 ? `${numOr(c.horas_paquete).toFixed(2)}h de paquete` : '',
+    `${numOr(c.horas_billetera).toFixed(2)}h × ${usd(numOr(c.tarifa))} = ${usd(numOr(c.monto_total))}`,
+    numOr(c.desde_billetera) > 0 ? `billetera ${usd(numOr(c.desde_billetera))}` : '',
+    numOr(c.a_cxc) > 0 ? `cuentas por cobrar ${usd(numOr(c.a_cxc))}` : '',
+  ].filter(Boolean);
+  return `${partes.join(' · ')} · saldo ${usd(numOr(c.saldo))}`;
+};
+
+/** Horas ya facturadas como deuda en el régimen anterior ("DEUDA VUELO … — 0.70h × $…"). */
+const horasDeudaLegacy = (concepto: string | null | undefined): number => {
+  const c = String(concepto ?? '');
+  if (!/^DEUDA VUELO/i.test(c)) return 0;
+  const m = c.match(/—\s*([0-9]+(?:\.[0-9]+)?)\s*h\s*×/i);
+  return m ? numOr(m[1]) : 0;
+};
+
+/**
+ * Integra las reservas CONFIRMADAS/COMPLETADAS de hoy (Planificación) con las asignaciones del día.
+ * Un alumno con asignación conserva su fila (se le adjunta la reserva); si no, la reserva crea su fila.
+ */
+const fusionarReservas = (asig: AsignacionDia[], reservas: ReservaHoy[], sedeDb: string, instructorNombre: string): AsignacionDia[] => {
+  const out = asig.map(a => ({ ...a }));
+  const porAlumno = new Map<string, AsignacionDia>();
+  out.forEach(a => { if (a.student_id) porAlumno.set(String(a.student_id), a); });
+  for (const r of reservas) {
+    const sid = r.student_id ? String(r.student_id) : '';
+    if (!sid) continue;
+    const confirmada = String(r.status ?? '').toUpperCase() === 'CONFIRMADA';
+    const existente  = porAlumno.get(sid);
+    if (existente) {
+      if (existente.origen !== 'RESERVA' && !existente.reserva_id && confirmada) {
+        existente.reserva_id  = String(r.id);
+        existente.slot_hora   = r.slot_hora ? String(r.slot_hora).slice(0, 5) : null;
+        existente.tipo_vuelo  = r.tipo_vuelo ?? null;
+        existente.aeronave_id = r.aeronave_id ? String(r.aeronave_id) : null;
+      }
+      if (existente.origen !== 'RESERVA') continue;
+    }
+    out.push({
+      id:                `RSV-${r.id}`,
+      fecha:             String(r.fecha),
+      estado:            confirmada ? 'PENDIENTE' : 'VOLADO',
+      sede:              sedeDb,
+      instructor_id:     r.instructor_id ? String(r.instructor_id) : '',
+      instructor_nombre: instructorNombre,
+      student_id:        sid,
+      student_nombre:    '',
+      student_serial:    '',
+      carrera_id:        '',
+      saldo_horas:       0,
+      origen:            'RESERVA',
+      reserva_id:        String(r.id),
+      slot_hora:         r.slot_hora ? String(r.slot_hora).slice(0, 5) : null,
+      tipo_vuelo:        r.tipo_vuelo ?? null,
+      aeronave_id:       r.aeronave_id ? String(r.aeronave_id) : null,
+    });
+    if (!existente) porAlumno.set(sid, out[out.length - 1]);
+  }
+  return out;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -300,7 +492,7 @@ const PanelAsignaciones: React.FC<PanelAsignacionesProps> = ({
           <div className="py-10 text-center">
             <Plane size={32} className="mx-auto mb-3 text-zinc-800 opacity-40" />
             <p className="text-zinc-700 text-[10px] font-black uppercase tracking-widest">Sin asignaciones para hoy</p>
-            <p className="text-zinc-800 text-[8px] font-mono mt-1">Verificar RPC generar_asignaciones_del_dia</p>
+            <p className="text-zinc-800 text-[8px] font-mono mt-1">Verificar RPC generar_asignaciones_del_dia y vuelos confirmados por Planificación</p>
           </div>
         ) : (
           asignaciones.map(a => {
@@ -344,11 +536,22 @@ const PanelAsignaciones: React.FC<PanelAsignacionesProps> = ({
                     <p className={`font-black uppercase text-sm transition-colors ${yaVolo ? 'text-zinc-500' : 'text-white'}`}>
                       {a.student_nombre}
                     </p>
-                    <div className="flex items-center gap-3 mt-0.5">
+                    <div className="flex items-center gap-3 mt-0.5 flex-wrap">
                       <span className="text-[8px] text-zinc-600 font-black uppercase font-mono">{a.student_serial}</span>
                       <span className={`text-[8px] font-black uppercase ${a.saldo_horas > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                         {Number(a.saldo_horas).toFixed(1)}h disponibles
                       </span>
+                      {/* [NEW v7.0] billetera y origen de la misión */}
+                      {a.saldo_usd != null && a.saldo_usd > 0 && (
+                        <span className="text-[8px] font-black uppercase text-teal-400 flex items-center gap-1">
+                          <Wallet size={9} /> {usd(a.saldo_usd)}
+                        </span>
+                      )}
+                      {a.reserva_id && (
+                        <span className="text-[8px] font-black uppercase text-purple-400 px-1.5 py-0.5 rounded-md bg-purple-500/10 border border-purple-500/20">
+                          Planificación{a.slot_hora ? ` · ${a.slot_hora}` : ''}{a.tipo_vuelo ? ` · ${a.tipo_vuelo}` : ''}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -404,6 +607,11 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   const [evidence, setEvidence] = useState<{ inicial: File | null; final: File | null }>({
     inicial: null, final: null,
   });
+  // ▼ [NEW v7.0] billetera / registro atómico
+  /** null = sin verificar · true = migración v18 instalada · false = usar registro heredado */
+  const [v18,            setV18]            = useState<boolean | null>(null);
+  const [saldoVuelo,     setSaldoVuelo]     = useState<SaldoVueloAlumno | null>(null);
+  const [ultimoRegistro, setUltimoRegistro] = useState<RegistroVueloResultado | null>(null);
   const [form, setForm] = useState({
     aircraft_id:        '',
     matricula:          '',
@@ -418,7 +626,40 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     precioHoraCostoTac: RATE_HORA_ACADEMIA,
     precioCobrado:      0,
     observacion:        '',
+    // ▼ [NEW v7.0] vínculo con la misión seleccionada
+    asignacion_id:      '',
+    reserva_id:         '',
+    instructor_sel_id:  '',
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // [NEW v7.0] SALDO COMBINADO DEL PANEL (fn_vuelo_saldos)
+  // Horas disponibles = horas de paquete anterior + saldo de billetera ÷ tarifa de la sede.
+  // Sin migración v18 → conserva el saldo_horas de la vista (régimen anterior).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const aplicarSaldosPanel = useCallback(async (lista: AsignacionDia[], sedeDb: string): Promise<AsignacionDia[]> => {
+    const ids = Array.from(new Set(lista.map(a => String(a.student_id)).filter(id => UUID_RE.test(id))));
+    if (ids.length === 0) return lista;
+    try {
+      const { data, error } = await supabase.rpc('fn_vuelo_saldos', { p_students: ids, p_matricula: null, p_sede: sedeDb });
+      if (error) {
+        if (esRpcNoInstalada(error)) setV18(false);
+        else console.warn('[v7.0] fn_vuelo_saldos:', error.message);
+        return lista;
+      }
+      setV18(true);
+      const mapa = new Map<string, SaldoVueloAlumno>();
+      (Array.isArray(data) ? (data as unknown[]) : []).forEach(r => { const s = normSaldo(r); if (s) mapa.set(s.student_id, s); });
+      return lista.map(a => {
+        const s = mapa.get(String(a.student_id));
+        return s ? { ...a, saldo_horas: s.horas_disponibles, saldo_usd: s.saldo_usd, saldo_horas_paquete: s.horas_paquete } : a;
+      });
+    } catch (e) {
+      console.warn('[v7.0] fn_vuelo_saldos:', e instanceof Error ? e.message : e);
+      return lista;
+    }
+  }, []);
 
   // ─────────────────────────────────────────────────────────────────────────
   // [v6.2] INICIALIZAR
@@ -551,6 +792,50 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
           }
         }
 
+        // ── 4b. [v7.0] MISIONES CONFIRMADAS POR PLANIFICACIÓN (reservas_slot_vuelo de hoy)
+        //        Alumnos con vuelo confirmado que generar_asignaciones_del_dia no incluyó
+        //        (p. ej. alumnos con saldo solo en billetera) también aparecen aquí.
+        if (signal.aborted) return;
+        asigData = asigData.map(a => ({ ...a, origen: 'ASIGNACION' as const }));
+        try {
+          const qRes = supabase
+            .from('reservas_slot_vuelo')
+            .select('id, student_id, aeronave_id, aeronave_matricula, instructor_id, fecha, slot_hora, tipo_vuelo, status')
+            .eq('fecha', hoy())
+            .in('status', ['CONFIRMADA', 'COMPLETADA']);
+          const { data: resData, error: resErr } = await (
+            esInstructor ? qRes.eq('instructor_id', instData!.id) : qRes
+          ).order('slot_hora', { ascending: true });
+          if (signal.aborted) return;
+          if (resErr) console.warn('[v7.0] reservas_slot_vuelo no disponible:', resErr.message);
+          else asigData = fusionarReservas(asigData, (resData ?? []) as ReservaHoy[], sedeDb, nombre);
+        } catch (e) {
+          console.warn('[v7.0] reservas_slot_vuelo:', e instanceof Error ? e.message : e);
+        }
+
+        // ── 4c. [v7.0] Nombres faltantes (estrategia C y reservas) desde perfiles_estudiantes
+        const sinNombre = Array.from(new Set(asigData.filter(a => !a.student_nombre && a.student_id).map(a => String(a.student_id))));
+        if (sinNombre.length > 0) {
+          const { data: est } = await supabase
+            .from('perfiles_estudiantes')
+            .select('id, nombre_completo, student_serial')
+            .in('id', sinNombre);
+          if (signal.aborted) return;
+          const porId = new Map<string, { nombre_completo: string | null; student_serial: string | null }>(
+            (est ?? []).map((e: any) => [String(e.id), { nombre_completo: e.nombre_completo ?? null, student_serial: e.student_serial ?? null }]));
+          asigData = asigData.map(a => {
+            const e = porId.get(String(a.student_id));
+            return a.student_nombre || !e ? a : {
+              ...a,
+              student_nombre: e.nombre_completo ?? `ALUMNO ${String(a.student_id).slice(0, 8)}`,
+              student_serial: a.student_serial || e.student_serial || '',
+            };
+          });
+        }
+
+        // ── 4d. [v7.0] Saldo combinado (paquete + billetera en horas a la tarifa de la sede)
+        asigData = await aplicarSaldosPanel(asigData, sedeDb);
+
         if (signal.aborted) return;
         setAsignaciones(asigData);
 
@@ -580,7 +865,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
         }
       }
     }
-  }, [authUserId]);
+  }, [authUserId, aplicarSaldosPanel]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -592,9 +877,18 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
 
   const handleSeleccionarAlumno = useCallback((a: AsignacionDia) => {
     const sedeNorm: Sede = a.sede?.toUpperCase().includes('MATUR') ? 'MATURÍN' : 'BARQUISIMETO';
-    setForm(prev => ({ ...prev, student_id: a.student_id, student_nombre: a.student_nombre, sede_vuelo: sedeNorm }));
+    // [NEW v7.0] aeronave asignada por Planificación (si existe en la flota) + vínculo con la misión
+    const avionPlan = a.aeronave_id ? fleet.find(f => f.id === a.aeronave_id) : undefined;
+    setForm(prev => ({
+      ...prev, student_id: a.student_id, student_nombre: a.student_nombre, sede_vuelo: sedeNorm,
+      asignacion_id:     a.origen === 'RESERVA' ? '' : a.id,
+      reserva_id:        a.reserva_id ?? '',
+      instructor_sel_id: a.instructor_id ?? '',
+      ...(avionPlan ? { aircraft_id: avionPlan.id, matricula: avionPlan.matricula } : {}),
+    }));
     setRutaSeleccionada(null);
-  }, []);
+    setUltimoRegistro(null);
+  }, [fleet]);
 
   // ── SALDO COMBUSTIBLE ────────────────────────────────────────────────────
 
@@ -623,22 +917,52 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   // ── SALDO HORAS ALUMNO ───────────────────────────────────────────────────
 
   useEffect(() => {
+    let cancelado = false;   // [NEW v7.0] evita pisar el saldo si el capitán cambia de alumno/aeronave rápido
     const fetchBalance = async () => {
-      if (!form.student_id) { setStudentBalance(null); return; }
+      if (!form.student_id) { setStudentBalance(null); setSaldoVuelo(null); return; }
       try {
+        // ▼ [NEW v7.0] saldo combinado a la tarifa de ESTA aeronave (paquete + billetera)
+        if (v18 !== false && UUID_RE.test(form.student_id)) {
+          const { data, error } = await supabase.rpc('fn_vuelo_saldos', {
+            p_students: [form.student_id], p_matricula: form.matricula || null, p_sede: normalizarSedeDB(form.sede_vuelo),
+          });
+          if (cancelado) return;
+          if (!error) {
+            const s = normSaldo(Array.isArray(data) ? (data as unknown[])[0] : null);
+            if (s) {
+              if (v18 !== true) setV18(true);
+              setSaldoVuelo(s);
+              setStudentBalance(s.horas_disponibles);
+              return;
+            }
+          } else if (esRpcNoInstalada(error)) {
+            setV18(false);
+          } else {
+            console.warn('[v7.0] fn_vuelo_saldos:', error.message);
+          }
+        }
+        setSaldoVuelo(null);
+
+        // ▼ Régimen anterior (sin migración v18)
         const asig = asignaciones.find(a => a.student_id === form.student_id);
         if (asig && asig.saldo_horas > 0) { setStudentBalance(asig.saldo_horas); return; }
+        // [FIX v7.0] Sin filtro estatus='COBRADO': un paquete PARCIAL ya acredita horas_compradas proporcionales
+        //            (igual que Finanzas y "Horas y Facturación"). Las horas ya facturadas como deuda
+        //            ("DEUDA VUELO … h ×") no se descuentan dos veces.
         const [pagosRes, vuelosRes] = await Promise.all([
-          supabase.from('cuentas_por_cobrar').select('horas_compradas').eq('student_id', form.student_id).eq('estatus', 'COBRADO'),
+          supabase.from('cuentas_por_cobrar').select('horas_compradas, horas_prometidas, concepto').eq('student_id', form.student_id),
           supabase.from('bitacora_vuelos').select('horas_tac').eq('student_id', form.student_id),
         ]);
-        const compradas = (pagosRes.data || []).reduce((a, p) => a + (Number(p.horas_compradas) || 0), 0);
+        if (cancelado) return;
+        const compradas = (pagosRes.data || []).reduce((a, p) => a + Math.max(Number(p.horas_compradas) || 0, 0), 0);
+        const deudaH    = (pagosRes.data || []).reduce((a, p) => a + ((Number(p.horas_prometidas) || 0) === 0 ? horasDeudaLegacy(p.concepto) : 0), 0);
         const voladas   = (vuelosRes.data || []).reduce((a, v) => a + (Number(v.horas_tac) || 0), 0);
-        setStudentBalance(Math.max(0, compradas - voladas));
-      } catch { setStudentBalance(null); }
+        setStudentBalance(Math.max(0, compradas - Math.max(voladas - deudaH, 0)));
+      } catch { if (!cancelado) setStudentBalance(null); }
     };
     fetchBalance();
-  }, [form.student_id, asignaciones]);
+    return () => { cancelado = true; };
+  }, [form.student_id, form.matricula, form.sede_vuelo, asignaciones, v18]);
 
   // ── CÁLCULOS ─────────────────────────────────────────────────────────────
 
@@ -654,15 +978,28 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     return { horasTac, pagoCapitan, pagoGasolina, costoOperacional, produccionNeta, litersToBurn, burnRate };
   }, [form.tacFinal, form.tacInicial, form.horasCobrada, form.precioCobrado, form.aircraft_id, fleet]);
 
+  // [NEW v7.0] Tarifa real del Tarifario para esta aeronave/sede (respaldo: tarifa histórica $180/h)
+  const tarifaHora = saldoVuelo?.tarifa_hora ?? RATE_HORA_ACADEMIA;
+
+  // [NEW v7.0] Vista previa del cobro (misma regla que fn_vuelo_registrar)
+  const preview = useMemo(() => calcularPreviewCargo(saldoVuelo, stats.horasTac), [saldoVuelo, stats.horasTac]);
+  const excedeCredito = !!preview && !!saldoVuelo && saldoVuelo.credito_disponible_usd !== null
+    && preview.aCxc > saldoVuelo.credito_disponible_usd;
+
   useEffect(() => {
-    if (!instructorId) setForm(prev => ({ ...prev, precioCobrado: form.horasCobrada * RATE_HORA_ACADEMIA }));
-  }, [form.horasCobrada, instructorId]);
+    if (!instructorId) setForm(prev => ({ ...prev, precioCobrado: round2(form.horasCobrada * tarifaHora) }));   // [v7.0] tarifa vigente
+  }, [form.horasCobrada, instructorId, tarifaHora]);
 
   // ── POSPONER DÍA ─────────────────────────────────────────────────────────
 
   const handlePosponer = useCallback(async () => {
-    const pendientesCount = asignaciones.filter(a => a.estado === 'PENDIENTE').length;
-    if (!window.confirm(`¿Posponer ${pendientesCount} misiones pendientes al ${manana()}?`)) return;
+    // [v7.0] Solo se posponen asignaciones del día; los vuelos de Planificación se reprograman en su tablero
+    const pendientesCount = asignaciones.filter(a => a.estado === 'PENDIENTE' && a.origen !== 'RESERVA').length;
+    const reservasPend    = asignaciones.filter(a => a.estado === 'PENDIENTE' && a.origen === 'RESERVA').length;
+    if (!window.confirm(
+      `¿Posponer ${pendientesCount} misiones pendientes al ${manana()}?` +
+      (reservasPend > 0 ? `\n\n${reservasPend} vuelo(s) confirmados por Planificación no se mueven aquí: Planificación debe reprogramarlos.` : '')
+    )) return;
     setPosponiendo(true);
     try {
       const sede = asignaciones[0]?.sede ?? 'BARQUISIMETO';
@@ -690,6 +1027,41 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     return publicUrl;
   };
 
+  // ── [NEW v7.0] REGISTRO ATÓMICO (fn_vuelo_registrar) ────────────────────
+  // Devuelve null si la migración v18 no está instalada (→ registro heredado).
+  // TAC_SOLAPADO: pide confirmación consciente y reintenta con confirmar_solape.
+
+  const registrarVueloV18 = async (payload: RegistroVueloInput): Promise<RegistroVueloResultado | null> => {
+    let { data, error } = await supabase.rpc('fn_vuelo_registrar', { p: payload });
+    if (error && /TAC_SOLAPADO/.test(error.message ?? '')) {
+      if (!window.confirm(
+        `⚠️ TAC SOLAPADO\n\nEl intervalo TAC ${payload.tac_inicial} → ${payload.tac_final} de ${form.matricula} se cruza con otro vuelo ya registrado.\n\n` +
+        `¿Confirma que los tacómetros son correctos?`
+      )) throw new Error('Registro cancelado: verifique los tacómetros.');
+      ({ data, error } = await supabase.rpc('fn_vuelo_registrar', { p: { ...payload, confirmar_solape: true } }));
+    }
+    if (error) {
+      if (esRpcNoInstalada(error)) { setV18(false); return null; }
+      throw new Error(traducirErrorVuelo(error.message ?? 'Error del servidor'));
+    }
+    setV18(true);
+    const r = (data ?? {}) as Record<string, unknown>;
+    return {
+      vuelo_id:        String(r.vuelo_id ?? ''),
+      fecha:           String(r.fecha ?? form.fecha),
+      horas:           numOr(r.horas, stats.horasTac),
+      litros:          numOr(r.litros),
+      matricula:       String(r.matricula ?? form.matricula),
+      capitan_id:      r.capitan_id == null ? null : String(r.capitan_id),
+      asignacion_id:   r.asignacion_id == null ? null : String(r.asignacion_id),
+      reserva_id:      r.reserva_id == null ? null : String(r.reserva_id),
+      cargo:           r.cargo && typeof r.cargo === 'object' ? (r.cargo as CargoVuelo) : null,
+      cobro_pendiente: r.cobro_pendiente === true,
+      cobro_error:     r.cobro_error == null ? null : String(r.cobro_error),
+      avisos:          Array.isArray(r.avisos) ? (r.avisos as unknown[]).map(String) : [],
+    };
+  };
+
   // ── CERRAR BITÁCORA ──────────────────────────────────────────────────────
 
   const handleProcessFlight = async () => {
@@ -699,9 +1071,43 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
       return alert('CRITICAL: Se requiere evidencia visual de tacómetros para MRO.');
     if (!rutaSeleccionada)
       return alert('SISTEMA: Seleccione la ruta del vuelo antes de cerrar bitácora.');
+    if (form.fecha > hoy())   // [NEW v7.0] el servidor también lo bloquea (FECHA_FUTURA)
+      return alert('SISTEMA: La fecha del vuelo no puede ser posterior a hoy.');
 
     const deficit = studentBalance !== null ? Math.max(0, stats.horasTac - studentBalance) : null;
-    if (deficit !== null && deficit > 0) {
+    let autorizarSobreLimite = false;   // [NEW v7.0] solo administración
+
+    if (v18 !== false && preview && saldoVuelo) {
+      // ▼ [NEW v7.0] Aviso en USD con la tarifa real (paquete → billetera → cuentas por cobrar)
+      if (preview.sinTarifa) {
+        if (!window.confirm(
+          `⚠️ SIN TARIFA DE VUELO\n\nNo hay tarifa activa para ${form.matricula}.\n` +
+          `El vuelo se registrará y el cobro de ${preview.horasBilletera.toFixed(2)}h quedará pendiente en ` +
+          `Finanzas → Billeteras → Vuelos por cargar.\n\n¿Continuar?`
+        )) return;
+      } else if (preview.aCxc > 0) {
+        if (!window.confirm(
+          `⚠️ SALDO INSUFICIENTE\n\n` +
+          (preview.horasPaquete > 0 ? `Paquete anterior: ${preview.horasPaquete.toFixed(2)}h\n` : '') +
+          `Billetera: ${usd(saldoVuelo.saldo_usd)} · Cargo: ${preview.horasBilletera.toFixed(2)}h × ${usd(preview.tarifa ?? 0)} = ${usd(preview.monto)}\n` +
+          `Pasará a cuentas por cobrar del alumno: ${usd(preview.aCxc)}\n\n¿Continuar?`
+        )) return;
+        if (excedeCredito) {
+          if (instructorId !== null) {
+            if (!window.confirm(
+              `⚠️ LÍMITE DE CRÉDITO\n\nLa deuda del alumno supera el límite autorizado.\n` +
+              `El vuelo se registrará y el cobro quedará pendiente de autorización de administración.\n\n¿Continuar?`
+            )) return;
+          } else {
+            autorizarSobreLimite = window.confirm(
+              `⚠️ LÍMITE DE CRÉDITO (${usd(saldoVuelo.credito_maximo_usd ?? 0)})\n\n` +
+              `La nueva deuda (${usd(preview.aCxc)}) supera el crédito disponible (${usd(saldoVuelo.credito_disponible_usd ?? 0)}).\n\n` +
+              `Aceptar = autorizar el cobro · Cancelar = registrar el vuelo con cobro pendiente`
+            );
+          }
+        }
+      }
+    } else if (deficit !== null && deficit > 0) {
       if (!window.confirm(
         `⚠️ SALDO INSUFICIENTE\n\nSaldo: ${(studentBalance ?? 0).toFixed(1)}h · Vuelo: ${stats.horasTac.toFixed(2)}h\n` +
         `Déficit: ${deficit.toFixed(2)}h = $${(deficit * form.precioHoraCostoTac).toFixed(2)}\n\nSe registrará una deuda. ¿Continuar?`
@@ -724,7 +1130,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     }
 
     const horasCobradas    = instructorId ? stats.horasTac : form.horasCobrada;
-    const montoCobrado     = instructorId ? parseFloat((stats.horasTac * RATE_HORA_ACADEMIA).toFixed(2)) : form.precioCobrado;
+    const montoCobrado     = instructorId ? parseFloat((stats.horasTac * tarifaHora).toFixed(2)) : form.precioCobrado;   // [v7.0] tarifa vigente
     const pagoCapFinal     = horasCobradas * RATE_HORA_CAPITAN;
     const pagoGasFinal     = (stats.horasTac * 23) * 3.3;
     const costoOpFinal     = horasCobradas * 20;
@@ -735,102 +1141,163 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
       const urlInicial = await uploadToMIAStorage(evidence.inicial!, 'START');
       const urlFinal   = await uploadToMIAStorage(evidence.final!,   'END');
 
-      const { error: dbError } = await supabase.from('bitacora_vuelos').insert([{
-        fecha:                form.fecha,
-        aircraft_id:          form.aircraft_id,
-        aeronave_matricula:   form.matricula,
-        ruta:                 rutaSeleccionada.destino.toUpperCase(),
-        ruta_id:              rutaSeleccionada.id,
-        destino:              rutaSeleccionada.destino,
-        sede_vuelo:           form.sede_vuelo,
-        tac_inicial:          form.tacInicial,
-        tac_final:            form.tacFinal,
-        horas_tac:            stats.horasTac,
-        horas_cobradas:       horasCobradas,
-        alumno:               form.student_nombre,
-        student_id:           form.student_id,
-        instructor:           form.instructor.toUpperCase(),
-        produccion_neta:      produccionFinal,
-        pago_capitan:         pagoCapFinal,
-        pago_gasolina:        pagoGasFinal,
-        costo_operacional:    costoOpFinal,
-        url_foto_tac_inicial: urlInicial,
-        url_foto_tac_final:   urlFinal,
-        observacion:          form.observacion.toUpperCase(),
-      }]);
-      if (dbError) throw dbError;
+      // ═══ [NEW v7.0] UNA transacción en el servidor ═══════════════════════
+      let resultado: RegistroVueloResultado | null = null;
+      if (v18 !== false) {
+        resultado = await registrarVueloV18({
+          student_id:           form.student_id,
+          aircraft_id:          form.aircraft_id,
+          matricula:            form.matricula,
+          fecha:                form.fecha,
+          sede_vuelo:           form.sede_vuelo,
+          tac_inicial:          form.tacInicial,
+          tac_final:            form.tacFinal,
+          ruta:                 rutaSeleccionada.destino.toUpperCase(),
+          ruta_id:              rutaSeleccionada.id,
+          destino:              rutaSeleccionada.destino,
+          tipo_mision:          rutaSeleccionada.destino.toUpperCase(),
+          alumno:               form.student_nombre,
+          instructor:           form.instructor.toUpperCase(),
+          instructor_id:        form.instructor_sel_id || null,
+          horas_cobradas:       horasCobradas,
+          produccion_neta:      round2(produccionFinal),
+          pago_capitan:         round2(pagoCapFinal),
+          pago_gasolina:        round2(pagoGasFinal),
+          costo_operacional:    round2(costoOpFinal),
+          url_foto_tac_inicial: urlInicial,
+          url_foto_tac_final:   urlFinal,
+          observacion:          form.observacion.toUpperCase(),
+          asignacion_id:        form.asignacion_id && UUID_RE.test(form.asignacion_id) ? form.asignacion_id : null,
+          reserva_id:           form.reserva_id || null,
+          autorizar_sobre_limite: autorizarSobreLimite,
+        });
+      }
 
-      await supabase.from('horas_vuelo_estudiante').insert([{
-        student_id:      form.student_id,
-        fecha:           form.fecha,
-        horas:           stats.horasTac,
-        matricula_avion: form.matricula,
-        tipo_mision:     rutaSeleccionada.destino.toUpperCase(),
-      }]);
+      if (resultado) {
+        // ▼ Estado local: misión completada + saldos frescos del panel
+        const selId = asignaciones.find(a => a.student_id === form.student_id && a.estado === 'PENDIENTE' &&
+                        ((form.asignacion_id !== '' && a.id === form.asignacion_id) || (form.reserva_id !== '' && a.reserva_id === form.reserva_id)))?.id
+                   ?? asignaciones.find(a => a.student_id === form.student_id && a.estado === 'PENDIENTE')?.id;
+        const nuevas = asignaciones.map(a => a.id === selId ? { ...a, estado: 'VOLADO' as const } : a);
+        setAsignaciones(nuevas);
+        void aplicarSaldosPanel(nuevas, normalizarSedeDB(sedePrincipal)).then(conSaldo => {
+          const porId = new Map(conSaldo.map(a => [a.id, a]));
+          setAsignaciones(prev => prev.map(a => {
+            const s = porId.get(a.id);
+            return s ? { ...a, saldo_horas: s.saldo_horas, saldo_usd: s.saldo_usd, saldo_horas_paquete: s.saldo_horas_paquete } : a;
+          }));
+        });
 
-      await supabase.from('transacciones_finanzas').insert([{
-        type:        'INCOME',
-        entity_name: `VUELO ${form.matricula} - ${form.student_nombre}`,
-        amount:       montoCobrado,
-        description: `BITÁCORA | TAC: ${stats.horasTac} | RUTA: ${rutaSeleccionada.destino} | SEDE: ${form.sede_vuelo}`,
-        status:      'PAID',
-        category:    'Vuelos',
-        issue_date:   form.fecha,
-        student_id:   form.student_id,
-      }]);
+        if (onFlightLogUpdate) onFlightLogUpdate(form.aircraft_id, stats.horasTac);
 
-      if (stats.litersToBurn > 0) {
-        await (supabase as any).from('registros_combustible').insert([{
-          operation_type:          'OUT',
-          aircraft_id:             form.matricula,
-          destination_aircraft_id: null,
-          liters:                  stats.litersToBurn,
-          fuel_type:               'AVGAS 100LL',
-          location:                form.sede_vuelo,
-          ticket_number:           `BRN-${form.fecha}-${form.matricula}`,
-          technician:              form.student_nombre.toUpperCase(),
-          hobbs_at_charge:         form.tacFinal,
+        setUltimoRegistro(resultado);
+        const otrosAvisos = resultado.avisos.filter(a => !a.startsWith('COBRO_PENDIENTE'));
+        const lineaCobro  = resultado.cargo
+          ? `\n\nCOBRO: ${resumenCargo(resultado.cargo)}`
+          : `\n\n⚠️ COBRO PENDIENTE: ${traducirErrorVuelo(resultado.cobro_error ?? '')}\nQueda en Finanzas → Billeteras → Vuelos por cargar.`;
+        alert(
+          `MIA: BITÁCORA SINCRONIZADA — ${rutaSeleccionada.destino} · ${resultado.horas.toFixed(2)}h TAC.${lineaCobro}` +
+          (otrosAvisos.length ? `\n\nAvisos: ${otrosAvisos.join(' · ')}` : '')
+        );
+      } else {
+        // ═══ REGISTRO HEREDADO v6.2 — respaldo mientras la migración v18 no esté instalada ═══
+        const { error: dbError } = await supabase.from('bitacora_vuelos').insert([{
+          fecha:                form.fecha,
+          aircraft_id:          form.aircraft_id,
+          aeronave_matricula:   form.matricula,
+          ruta:                 rutaSeleccionada.destino.toUpperCase(),
+          ruta_id:              rutaSeleccionada.id,
+          destino:              rutaSeleccionada.destino,
+          sede_vuelo:           form.sede_vuelo,
+          tac_inicial:          form.tacInicial,
+          tac_final:            form.tacFinal,
+          horas_tac:            stats.horasTac,
+          horas_cobradas:       horasCobradas,
+          alumno:               form.student_nombre,
+          student_id:           form.student_id,
+          instructor:           form.instructor.toUpperCase(),
+          produccion_neta:      produccionFinal,
+          pago_capitan:         pagoCapFinal,
+          pago_gasolina:        pagoGasFinal,
+          costo_operacional:    costoOpFinal,
+          url_foto_tac_inicial: urlInicial,
+          url_foto_tac_final:   urlFinal,
+          observacion:          form.observacion.toUpperCase(),
         }]);
-      }
+        if (dbError) throw dbError;
 
-      if (deficit !== null && deficit > 0) {
-        const montoDeuda = parseFloat((deficit * form.precioHoraCostoTac).toFixed(2));
-        await supabase.from('cuentas_por_cobrar').insert([{
-          alumno_id:        form.student_id,
-          student_id:       form.student_id,
-          nombre_alumno:    form.student_nombre.toUpperCase(),
-          monto_total:      montoDeuda,
-          monto_pagado:     0,
-          monto_pendiente:  montoDeuda,
-          concepto:         `DEUDA VUELO ${form.matricula} — ${deficit.toFixed(2)}h × $${form.precioHoraCostoTac}/h — ${rutaSeleccionada.destino} — ${form.fecha}`,
-          fecha_emision:    form.fecha,
-          estatus:          'PENDIENTE',
-          horas_compradas:  0,
-          horas_prometidas: 0,
+        await supabase.from('horas_vuelo_estudiante').insert([{
+          student_id:      form.student_id,
+          fecha:           form.fecha,
+          horas:           stats.horasTac,
+          matricula_avion: form.matricula,
+          tipo_mision:     rutaSeleccionada.destino.toUpperCase(),
         }]);
+
+        // [FIX v7.0] Eliminado el INSERT de un INGRESO 'PAID' (categoría 'Vuelos') en transacciones_finanzas:
+        //            sin método de pago ni asiento, contaba el ingreso dos veces (venta del paquete/recarga
+        //            y vuelo) en el Estado de Resultados. El ingreso del vuelo lo reconoce Finanzas al
+        //            cobrarlo (Billeteras → Vuelos por cargar) o el paquete al venderse.
+
+        if (stats.litersToBurn > 0) {
+          await (supabase as any).from('registros_combustible').insert([{
+            operation_type:          'OUT',
+            aircraft_id:             form.matricula,
+            destination_aircraft_id: null,
+            liters:                  stats.litersToBurn,
+            fuel_type:               'AVGAS 100LL',
+            location:                form.sede_vuelo,
+            ticket_number:           `BRN-${form.fecha}-${form.matricula}`,
+            technician:              form.student_nombre.toUpperCase(),
+            hobbs_at_charge:         form.tacFinal,
+          }]);
+        }
+
+        if (deficit !== null && deficit > 0) {
+          const montoDeuda = parseFloat((deficit * form.precioHoraCostoTac).toFixed(2));
+          await supabase.from('cuentas_por_cobrar').insert([{
+            alumno_id:        form.student_id,
+            student_id:       form.student_id,
+            nombre_alumno:    form.student_nombre.toUpperCase(),
+            monto_total:      montoDeuda,
+            monto_pagado:     0,
+            monto_pendiente:  montoDeuda,
+            concepto:         `DEUDA VUELO ${form.matricula} — ${deficit.toFixed(2)}h × $${form.precioHoraCostoTac}/h — ${rutaSeleccionada.destino} — ${form.fecha}`,
+            fecha_emision:    form.fecha,
+            estatus:          'PENDIENTE',
+            horas_compradas:  0,
+            horas_prometidas: 0,
+          }]);
+        }
+
+        const asig = asignaciones.find(a => a.student_id === form.student_id && a.estado === 'PENDIENTE')
+                  ?? asignaciones.find(a => a.student_id === form.student_id);
+        if (asig) {
+          // [v7.0] las filas que vienen de Planificación (RSV-…) no existen en asignaciones_vuelo_diario
+          if (asig.origen !== 'RESERVA') {
+            await supabase.from('asignaciones_vuelo_diario').update({ estado: 'VOLADO' }).eq('id', asig.id);
+          }
+          setAsignaciones(prev => prev.map(a => a.id === asig.id ? { ...a, estado: 'VOLADO' } : a));
+        }
+
+        if (onFlightLogUpdate) onFlightLogUpdate(form.aircraft_id, stats.horasTac);
+
+        const debtMsg = deficit && deficit > 0 ? `\n\nDeuda: $${(deficit * form.precioHoraCostoTac).toFixed(2)}` : '';
+        alert(`MIA: BITÁCORA SINCRONIZADA — ${rutaSeleccionada.destino} · ${stats.horasTac.toFixed(2)}h TAC.${debtMsg}`);
       }
-
-      const asig = asignaciones.find(a => a.student_id === form.student_id);
-      if (asig) {
-        await supabase.from('asignaciones_vuelo_diario').update({ estado: 'VOLADO' }).eq('id', asig.id);
-        setAsignaciones(prev => prev.map(a => a.id === asig.id ? { ...a, estado: 'VOLADO' } : a));
-      }
-
-      if (onFlightLogUpdate) onFlightLogUpdate(form.aircraft_id, stats.horasTac);
-
-      const debtMsg = deficit && deficit > 0 ? `\n\nDeuda: $${(deficit * form.precioHoraCostoTac).toFixed(2)}` : '';
-      alert(`MIA: BITÁCORA SINCRONIZADA — ${rutaSeleccionada.destino} · ${stats.horasTac.toFixed(2)}h TAC.${debtMsg}`);
 
       setForm(prev => ({
         ...prev, tacInicial: prev.tacFinal, tacFinal: 0,
         horasCobrada: 0, precioCobrado: 0, student_id: '', student_nombre: '',
+        asignacion_id: '', reserva_id: '', instructor_sel_id: '',   // [v7.0]
       }));
       setEvidence({ inicial: null, final: null });
       setStudentBalance(null);
+      setSaldoVuelo(null);   // [v7.0]
       setRutaSeleccionada(null);
 
     } catch (e: any) {
-      alert('SISTEMA MIA ERROR CRÍTICO: ' + e.message);
+      alert('SISTEMA MIA ERROR CRÍTICO: ' + (e?.message ?? String(e)));
     } finally {
       setIsProcessing(false);
     }
@@ -912,7 +1379,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
             <div>
               <h1 className="font-black text-sm tracking-[0.3em] uppercase text-white">MRO Flight Operations</h1>
               <p className="text-[#E1AD01]/60 text-[9px] font-bold uppercase tracking-widest">
-                Valkyron OS v6.2 · {instructorNombre || 'Sistema de Vuelo'}
+                Valkyron OS v7.0 · {instructorNombre || 'Sistema de Vuelo'}
               </p>
             </div>
           </div>
@@ -931,6 +1398,19 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
         {/* BODY */}
         <div className={`${glass.dark} border-t-0 rounded-b-[2.5rem] overflow-hidden shadow-[0_40px_80px_rgba(0,0,0,0.6)] p-8 space-y-8`}>
 
+          {/* [NEW v7.0] Aviso de modo heredado */}
+          {v18 === false && (
+            <div className={`${glass.amber} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
+              <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-[9px] text-amber-400 font-black uppercase tracking-widest">Modo heredado — billetera no conectada</p>
+                <p className="text-[8px] text-amber-300/60 font-mono mt-0.5">
+                  Ejecute migracion_vuelos_v18_billetera.sql en Supabase para descontar horas de la billetera al cerrar la bitácora.
+                </p>
+              </div>
+            </div>
+          )}
+
           <PanelAsignaciones
             asignaciones={asignaciones}
             seleccionado={form.student_id}
@@ -939,6 +1419,26 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
             posponiendo={posponiendo}
             instructorNombre={instructorNombre}
           />
+
+          {/* [NEW v7.0] Resultado del último cierre de bitácora */}
+          {ultimoRegistro && !form.student_id && (
+            <div className={`${ultimoRegistro.cobro_pendiente ? glass.orange : glass.emerald} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
+              {ultimoRegistro.cobro_pendiente
+                ? <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
+                : <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />}
+              <div className="min-w-0">
+                <p className={`text-[9px] font-black uppercase tracking-widest ${ultimoRegistro.cobro_pendiente ? 'text-orange-400' : 'text-emerald-400'}`}>
+                  Último vuelo · {ultimoRegistro.matricula} · {numOr(ultimoRegistro.horas).toFixed(2)}h TAC · {numOr(ultimoRegistro.litros).toFixed(1)} LTS
+                  {ultimoRegistro.reserva_id ? ' · reserva completada' : ''}
+                </p>
+                <p className="text-[8px] text-zinc-400 font-mono mt-0.5">
+                  {ultimoRegistro.cargo
+                    ? resumenCargo(ultimoRegistro.cargo)
+                    : `Cobro pendiente: ${traducirErrorVuelo(ultimoRegistro.cobro_error ?? '')} — Finanzas → Billeteras → Vuelos por cargar`}
+                </p>
+              </div>
+            </div>
+          )}
 
           {form.student_id ? (
             <>
@@ -951,6 +1451,17 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
                   <div>
                     <p className="text-white font-black uppercase text-sm">{form.student_nombre}</p>
                     <p className="text-zinc-500 text-[9px] font-black uppercase tracking-widest mt-0.5">Cadete en misión activa</p>
+                    {/* [NEW v7.0] desglose del saldo */}
+                    {saldoVuelo && (
+                      <p className="text-[8px] font-black uppercase tracking-widest mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+                        <span className="text-zinc-400">Paquete {Math.max(saldoVuelo.horas_paquete, 0).toFixed(1)}h</span>
+                        <span className="text-teal-400 flex items-center gap-1">
+                          <Wallet size={9} /> {usd(saldoVuelo.saldo_usd)}
+                          {saldoVuelo.tarifa_hora ? ` ≈ ${saldoVuelo.horas_billetera.toFixed(1)}h a ${usd(saldoVuelo.tarifa_hora)}/h` : ' · sin tarifa'}
+                        </span>
+                        {saldoVuelo.deuda_usd > 0 && <span className="text-red-400">Deuda {usd(saldoVuelo.deuda_usd)}</span>}
+                      </p>
+                    )}
                   </div>
                 </div>
                 {studentBalance !== null && (
@@ -958,8 +1469,27 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
                 )}
               </div>
 
-              {/* ALERTA SALDO */}
-              {studentBalance !== null && studentBalance < stats.horasTac && stats.horasTac > 0 && (
+              {/* ALERTA SALDO — [v7.0] con billetera: cálculo en USD a la tarifa real */}
+              {preview && (preview.aCxc > 0 || preview.sinTarifa) && (
+                <div className={`${glass.orange} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
+                  <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-[9px] text-orange-400 font-black uppercase tracking-widest">
+                      {preview.sinTarifa
+                        ? 'Sin tarifa de vuelo activa — el cobro quedará pendiente en Finanzas'
+                        : excedeCredito
+                          ? 'Saldo insuficiente y límite de crédito excedido — cobro pendiente de autorización'
+                          : 'Saldo insuficiente — el excedente pasará a cuentas por cobrar'}
+                    </p>
+                    <p className="text-[8px] text-orange-300/60 font-mono mt-0.5">
+                      {preview.sinTarifa
+                        ? `${preview.horasBilletera.toFixed(2)}h sin tarifa · configure el Tarifario`
+                        : `Billetera ${usd(preview.desdeBilletera)} · A cuentas por cobrar ${usd(preview.aCxc)}`}
+                    </p>
+                  </div>
+                </div>
+              )}
+              {!preview && studentBalance !== null && studentBalance < stats.horasTac && stats.horasTac > 0 && (
                 <div className={`${glass.orange} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
                   <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
                   <div>
@@ -1152,7 +1682,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
               {!esCapitan && (
                 <>
                   <div className={`${glass.dark} grid grid-cols-1 md:grid-cols-2 gap-6 p-8 rounded-[2rem]`}>
-                    <InputGroup id="mro_horas_facturadas" label="Horas Facturadas (Rate $180/h)"
+                    <InputGroup id="mro_horas_facturadas" label={`Horas Facturadas (Rate ${usd(tarifaHora)}/h)`}
                       type="number" value={form.horasCobrada}
                       onChange={(v: number) => setForm(prev => ({ ...prev, horasCobrada: Number(v) }))} />
                     <InputGroup id="mro_monto_cobrado" label="Monto Total a Cobrar ($)"
@@ -1169,7 +1699,38 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
                       <span className="text-2xl font-mono text-black font-black leading-none mt-1">${stats.produccionNeta.toFixed(2)}</span>
                     </div>
                   </div>
+                  {/* [NEW v7.0] Los campos de arriba alimentan la producción de la bitácora; el cobro al alumno sale del Tarifario */}
+                  {v18 !== false && (
+                    <p className="text-[8px] text-zinc-600 font-mono -mt-4 ml-1">
+                      Producción de la bitácora. El cobro al alumno se calcula con el Tarifario (horas TAC × tarifa), ver "Cargo al alumno".
+                    </p>
+                  )}
                 </>
+              )}
+
+              {/* [NEW v7.0] CARGO AL ALUMNO — vista previa (el servidor aplica la misma regla al cerrar) */}
+              {preview && (
+                <div className={`${glass.base} rounded-[2rem] p-6 space-y-4`}>
+                  <div className="flex items-center justify-between">
+                    <p className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest flex items-center gap-2">
+                      <Receipt className="h-3.5 w-3.5" /> Cargo al alumno
+                    </p>
+                    <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">
+                      {saldoVuelo?.servicio ?? 'Sin tarifa'}{preview.tarifa ? ` · ${usd(preview.tarifa)}/h` : ''}
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <StatBox label="Paquete anterior" value={`${preview.horasPaquete.toFixed(2)}h`} color="text-blue-400" />
+                    <StatBox label="A billetera (h)"  value={`${preview.horasBilletera.toFixed(2)}h`} />
+                    <StatBox label="Desde billetera"  value={preview.sinTarifa ? 'Pendiente' : usd(preview.desdeBilletera)} color="text-teal-400" />
+                    <StatBox label="A cuentas por cobrar" value={preview.sinTarifa ? 'Pendiente' : usd(preview.aCxc)}
+                      color={preview.aCxc > 0 || preview.sinTarifa ? 'text-red-400' : 'text-zinc-500'} />
+                  </div>
+                  <p className="text-[8px] text-zinc-600 font-mono">
+                    Saldo de billetera después del vuelo: {usd(Math.max((saldoVuelo?.saldo_usd ?? 0) - preview.desdeBilletera, 0))}
+                    {preview.horasPaquete > 0 ? ` · paquete restante ${Math.max((saldoVuelo?.horas_paquete ?? 0) - preview.horasPaquete, 0).toFixed(2)}h` : ''}
+                  </p>
+                </div>
               )}
 
               {/* OBSERVACIÓN */}

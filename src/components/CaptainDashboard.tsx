@@ -1,6 +1,15 @@
 // src/components/CaptainDashboard.tsx
-// NÚCLEO DE OPERACIONES: HUD PERSONAL DE CAPITANES Y PILOTOS v2.0
+// NÚCLEO DE OPERACIONES: HUD PERSONAL DE CAPITANES Y PILOTOS v2.1
 // Evolución: Conexión Real-Time a Supabase y Telemetría Financiera
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v2.1 (FlightRegister v7.0 · migración v18):
+//   [FIX] El logbook filtraba solo por capitan_id, que FlightRegister v6.2 nunca
+//         escribía: los vuelos registrados no aparecían. Ahora: capitan_id (v18 lo
+//         escribe en cada vuelo) O nombre del capitán en bitacora_vuelos.instructor.
+//   [FIX] Columnas con respaldo: horas_hobbs → horas_tac · monto_pago → pago_capitan ·
+//         tipo_mision → ruta/destino (FlightRegister escribe las segundas).
+//   [NEW] Al cambiar una reserva (p. ej. COMPLETADA al cerrar la bitácora) se recargan
+//         en silencio misiones y logbook.
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v2.0:
 //   [NEW] "Próximas misiones asignadas": vuelos CONFIRMADOS por Planificación
@@ -49,15 +58,17 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
   const [isLoading, setIsLoading] = useState(true);
 
   // --- MOTOR DE SINCRONIZACIÓN TÁCTICA ---
-  const fetchCaptainLogbook = useCallback(async (capitanId: string, silent = false) => {
+  const fetchCaptainLogbook = useCallback(async (capitanId: string, silent = false, nombreCapitan: string | null = null) => {
     if (!silent) setIsLoading(true);
     try {
       // Extraemos exclusivamente los vuelos de este Capitán
-      const { data, error } = await supabase
-        .from('bitacora_vuelos')
-        .select('*')
-        .eq('capitan_id', capitanId)
-        .order('created_at', { ascending: false });
+      // [FIX v2.1] capitan_id O nombre del capitán (vuelos registrados antes de la migración v18)
+      const nombre = (nombreCapitan ?? '').trim();
+      const base = supabase.from('bitacora_vuelos').select('*');
+      const { data, error } = await (nombre
+        ? base.or(`capitan_id.eq.${capitanId},instructor.ilike."${nombre.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`)
+        : base.eq('capitan_id', capitanId)
+      ).order('created_at', { ascending: false });
 
       if (error) throw error;
 
@@ -68,10 +79,10 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
           date: flight.fecha || flight.created_at?.split('T')[0] || 'Desconocida',
           student: flight.alumno || 'Por Asignar',
           aircraft: flight.aeronave_matricula || 'N/A',
-          type: flight.tipo_mision || 'Instrucción',
-          hobbs: Number(flight.horas_hobbs || 0),
+          type: flight.tipo_mision || flight.ruta || flight.destino || 'Instrucción',          // [v2.1] respaldo
+          hobbs: Number(flight.horas_hobbs ?? flight.horas_tac ?? 0) || 0,                       // [v2.1] respaldo TAC
           status: flight.estatus_pago || 'PENDING',
-          amount: Number(flight.monto_pago || 0)
+          amount: Number(flight.monto_pago ?? flight.pago_capitan ?? 0) || 0                     // [v2.1] respaldo
         }));
         setLogbook(formattedData);
       }
@@ -80,6 +91,16 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
     } finally {
       setIsLoading(false);
     }
+  }, []);
+
+  // [NEW v2.1] Nombre del capitán (instructores.nombre_completo) para el filtro del logbook
+  const fetchNombreCapitan = useCallback(async (userId: string): Promise<string | null> => {
+    const { data } = await supabase
+      .from('instructores')
+      .select('nombre_completo')
+      .eq('perfil_id', userId)
+      .maybeSingle();
+    return (data?.nombre_completo as string | undefined) ?? null;
   }, []);
 
   // [NEW v2.0] Misiones confirmadas por Planificación. Devuelve instructor.id para realtime.
@@ -139,7 +160,9 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user || cancelled) { setIsLoading(false); return; }
 
-      await fetchCaptainLogbook(user.id);
+      const nombreCapitan = await fetchNombreCapitan(user.id);   // [v2.1]
+      if (cancelled) return;
+      await fetchCaptainLogbook(user.id, false, nombreCapitan);
       const instructorId = await fetchMisiones(user.id);
       if (cancelled) return;
 
@@ -149,13 +172,13 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
         .channel(`captain-hud-${user.id}`)
         .on('postgres_changes',
           { event: '*', schema: 'public', table: 'bitacora_vuelos', filter: `capitan_id=eq.${user.id}` },
-          () => fetchCaptainLogbook(user.id, true));
+          () => fetchCaptainLogbook(user.id, true, nombreCapitan));
 
       // [NEW v2.0] misiones confirmadas/reprogramadas por Planificación
       if (instructorId) {
         channel = channel.on('postgres_changes',
           { event: '*', schema: 'public', table: 'reservas_slot_vuelo', filter: `instructor_id=eq.${instructorId}` },
-          () => fetchMisiones(user.id));
+          () => { void fetchMisiones(user.id); void fetchCaptainLogbook(user.id, true, nombreCapitan); });   // [v2.1]
       }
 
       channel.subscribe();
@@ -167,7 +190,7 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
       cancelled = true;
       if (channel) supabase.removeChannel(channel);
     };
-  }, [fetchCaptainLogbook, fetchMisiones]);
+  }, [fetchCaptainLogbook, fetchMisiones, fetchNombreCapitan]);
 
   // --- CÁLCULOS DE INTELIGENCIA DEL PILOTO ---
   const totalHours = logbook.reduce((acc, flight) => acc + flight.hobbs, 0);
@@ -320,7 +343,7 @@ export const CaptainDashboard = ({ userProfile }: { userProfile: any }) => {
                 <th className="pb-4 font-black">Alumno</th>
                 <th className="pb-4 font-black">Aeronave</th>
                 <th className="pb-4 font-black">Misión</th>
-                <th className="pb-4 font-black text-center">Hobbs</th>
+                <th className="pb-4 font-black text-center">Hobbs / TAC</th>
                 <th className="pb-4 font-black text-right">Estatus Pago</th>
               </tr>
             </thead>
