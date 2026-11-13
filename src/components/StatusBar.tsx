@@ -1,50 +1,45 @@
 // src/components/StatusBar.tsx
-// NÚCLEO DE IDENTIDAD VISUAL - ÁGUILAS PILOT
-// FIX v2.1: .maybeSingle() — evita 406 cuando la fila no existe en perfiles
-// Fallback a user_metadata si perfiles no tiene la fila aún
+// NÚCLEO DE IDENTIDAD VISUAL — B&M MANTENIMIENTO AERONÁUTICO v3.0
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v3.0 — REBRAND B&M + CONEXIONES:
+//   [FIX] Identidad y rol desde AuthContext (mismo origen que Index y App:
+//         roles_operativos > app_metadata). Antes se leían de `perfiles` y de
+//         user_metadata (editable por el usuario), así que la barra podía mostrar
+//         un rol distinto al que realmente autoriza los módulos.
+//   [FIX] "Alta de personal" visible solo si Index entrega onOpenRegister
+//         (CEO, ADMIN, DIRECTOR). Antes se mostraba únicamente al CEO, por lo
+//         que ADMIN y DIRECTOR no tenían forma de abrir el alta que Index sí les
+//         permite.
+//   [FIX] Cerrar sesión usa AuthContext.signOut (con respaldo local sin red),
+//         igual que el menú lateral. Antes llamaba supabase.auth.signOut directo.
+//   [UI]  Barra B&M clara de 40 px: conexión, sede, alta de personal, hora,
+//         ficha de usuario (solo tablet; en escritorio está en la barra lateral
+//         y en móvil en el menú) y cerrar sesión. Se retiran el logo duplicado y
+//         los textos decorativos (OS v4.17, Sist_Live, AES-256 Protocol).
+// PRESERVADO: detección online/offline con listeners, reloj de 1 s con formato
+//   es-VE, limpieza de listeners e intervalo, prop onOpenRegister, export default.
+// HISTORIAL: v2.1 .maybeSingle() en perfiles (reemplazado por AuthContext en v3.0).
+// ─────────────────────────────────────────────────────────────────────────────
 import { useState, useEffect } from 'react';
-import { supabase } from '@/lib/supabaseClient';
 import { useNavigate } from 'react-router-dom';
-import { 
-  Wifi, WifiOff, Shield, Clock, 
-  MapPin, User, LogOut, Activity, UserPlus 
+import { useAuth } from '@/context/AuthContext';
+import {
+  Wifi, WifiOff, Shield, Clock,
+  MapPin, User, LogOut, UserPlus,
 } from 'lucide-react';
 
 const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [currentTime, setCurrentTime] = useState(new Date());
-  const [profile, setProfile] = useState<{nombre_completo: string, rol: string, sede: string} | null>(null);
   const navigate = useNavigate();
+  const { role, profile, signOut } = useAuth();
+
+  // [v3.0] Identidad desde AuthContext (sin consulta propia a `perfiles`)
+  const nombre = profile?.nombre_completo || 'Operador';
+  const sede = profile?.sede || '';
+  const isCEO = role === 'CEO';
 
   useEffect(() => {
-    const fetchUserIdentity = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) return;
-
-      // FIX: .maybeSingle() — devuelve null sin lanzar 406 si la fila no existe
-      const { data } = await supabase
-        .from('perfiles')
-        .select('nombre_completo, rol, sede')
-        .eq('id', user.id)
-        .maybeSingle();
-
-      if (data) {
-        setProfile(data);
-      } else {
-        // Fallback a user_metadata cuando perfiles aún no tiene la fila
-        const meta = user.user_metadata;
-        if (meta) {
-          setProfile({
-            nombre_completo: meta.nombre_completo || user.email || 'Operador',
-            rol:             (meta.rol || meta.role || 'MECANICO').toString().toUpperCase(),
-            sede:            meta.sede || 'LARA',
-          });
-        }
-      }
-    };
-
-    fetchUserIdentity();
-
     const handleOnline  = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
     window.addEventListener('online',  handleOnline);
@@ -59,95 +54,71 @@ const StatusBar = ({ onOpenRegister }: { onOpenRegister?: () => void }) => {
   }, []);
 
   const handleLogout = async () => {
-    await supabase.auth.signOut();
-    navigate('/login');
+    await signOut();
+    navigate('/login', { replace: true });
   };
 
   return (
-    <header className="status-bar flex items-center justify-between px-6 py-2 bg-black/40 backdrop-blur-md border-b border-white/5 text-sm font-medium z-[100] font-mono">
-      
-      {/* SECCIÓN IZQUIERDA: IDENTIDAD CORPORATIVA */}
-      <div className="flex items-center gap-4">
-        <div className="flex items-center gap-3">
-          <img 
-            src="/logoblanco.png" 
-            alt="Águilas Pilot" 
-            className="h-7 w-auto object-contain drop-shadow-[0_0_8px_rgba(255,255,255,0.15)]"
-          />
-          <span className="hidden sm:block text-[9px] text-[#E1AD01] font-black uppercase tracking-[0.4em] border-l border-white/10 pl-3">
-            OS v4.17
-          </span>
-        </div>
-        <div className="hidden md:flex items-center gap-3 text-[9px] text-slate-500 font-bold uppercase tracking-widest border-l border-white/10 pl-4">
-          <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> Sist_Live</span>
-          <span className="text-white/20">|</span>
-          <span className="text-[#E1AD01]">AES-256 Protocol</span>
-        </div>
-      </div>
+    <header className="bm-app relative z-[60] flex h-10 shrink-0 items-center justify-between gap-3 border-b border-bm-line bg-white px-4 text-[13px] text-bm-ink sm:px-6 lg:px-8">
 
-      {/* SECCIÓN CENTRAL: FICHA DE USUARIO */}
-      <div className="flex items-center gap-4">
-        {profile ? (
-          <div className="flex items-center gap-4 bg-white/5 border border-white/10 pl-4 pr-1 py-1 rounded-full group hover:border-[#E1AD01]/50 transition-all">
-            <div className="text-right hidden sm:block">
-              <p className="text-[9px] font-black text-white leading-none uppercase tracking-tighter">
-                {profile.nombre_completo}
-              </p>
-              <div className="flex items-center justify-end gap-1 mt-0.5">
-                <MapPin className="h-2 w-2 text-[#E1AD01]" />
-                <span className="text-[7px] font-bold text-[#E1AD01] uppercase tracking-widest">{profile.sede}</span>
-              </div>
-            </div>
-            
-            <div className={`px-3 py-1.5 rounded-full flex items-center gap-2 ${
-              profile.rol === 'CEO'
-                ? 'bg-[#E1AD01] text-black shadow-[0_0_15px_rgba(225,173,1,0.3)]'
-                : 'bg-white/10 text-white'
-            }`}>
-              {profile.rol === 'CEO' ? <Shield className="h-3 w-3" /> : <User className="h-3 w-3" />}
-              <span className="text-[8px] font-black uppercase tracking-[0.2em]">{profile.rol}</span>
-            </div>
-          </div>
-        ) : (
-          <div className="h-8 w-32 bg-white/5 animate-pulse rounded-full border border-white/5" />
+      {/* IZQUIERDA: conexión y sede */}
+      <div className="flex min-w-0 items-center gap-3">
+        <span
+          role="status"
+          className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ${
+            isOnline ? 'bg-bm-ok-tint text-bm-ok' : 'bg-bm-red-tint text-bm-red-deep'
+          }`}
+        >
+          {isOnline
+            ? <Wifi className="h-3.5 w-3.5" />
+            : <WifiOff className="h-3.5 w-3.5 motion-safe:animate-pulse" />}
+          {isOnline ? 'En línea' : 'Sin conexión'}
+        </span>
+        {sede && (
+          <span className="hidden min-w-0 items-center gap-1 truncate text-bm-steel sm:inline-flex">
+            <MapPin className="h-3.5 w-3.5 shrink-0" /> Sede {sede}
+          </span>
         )}
       </div>
 
-      {/* SECCIÓN DERECHA: STATUS, REGISTRO Y CIERRE */}
-      <div className="flex items-center gap-5">
-        
-        {/* PRIVILEGIO CEO: ALTA DE PERSONAL */}
-        {profile?.rol === 'CEO' && (
-          <button 
+      {/* DERECHA: alta, hora, usuario, cierre */}
+      <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
+
+        {/* Alta de personal: Index la entrega solo a CEO, ADMIN y DIRECTOR */}
+        {onOpenRegister && (
+          <button
+            type="button"
             onClick={onOpenRegister}
-            className="flex items-center gap-2 px-3 py-1.5 bg-[#E1AD01]/10 text-[#E1AD01] border border-[#E1AD01]/20 hover:bg-[#E1AD01] hover:text-black rounded-lg transition-all text-[9px] font-black uppercase tracking-widest"
-            title="Alta de Operadores"
+            title="Alta de personal"
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-bm-line px-2.5 text-[13px] font-semibold text-bm-ink transition-colors hover:border-bm-red hover:text-bm-red"
           >
             <UserPlus className="h-3.5 w-3.5" />
-            <span className="hidden lg:inline">Alta de Personal</span>
+            <span className="hidden sm:inline">Alta de personal</span>
           </button>
         )}
 
-        <div className="hidden md:flex items-center gap-2 text-xs">
-          <Clock className="h-3.5 w-3.5 text-slate-500" />
-          <span className="font-mono text-white/70">
-            {currentTime.toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        <span className="bm-num hidden items-center gap-1.5 text-bm-steel md:inline-flex">
+          <Clock className="h-3.5 w-3.5" />
+          {currentTime.toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        </span>
+
+        {/* Ficha de usuario: solo tablet (escritorio la muestra en la barra lateral) */}
+        <span className="hidden items-center gap-2 border-l border-bm-line pl-3 md:flex lg:hidden">
+          <span className="max-w-[160px] truncate font-medium">{nombre}</span>
+          <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+            isCEO ? 'bg-bm-red text-white' : 'bg-bm-canvas text-bm-steel'
+          }`}>
+            {isCEO ? <Shield className="h-3 w-3" /> : <User className="h-3 w-3" />}
+            {role ?? 'Sin rol'}
           </span>
-        </div>
+        </span>
 
-        <div className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-[9px] font-black uppercase tracking-widest transition-all ${
-          isOnline 
-            ? 'bg-green-500/10 text-green-500 border border-green-500/20' 
-            : 'bg-red-500/10 text-red-500 border border-red-500/20'
-        }`}>
-          {isOnline ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3 animate-pulse" />}
-          <span className="hidden xs:inline">{isOnline ? 'ONLINE' : 'OFFLINE'}</span>
-        </div>
-
-        <button 
-          onClick={handleLogout}
-          className="p-2 text-slate-500 hover:text-red-500 hover:bg-red-500/5 rounded-lg transition-all"
-          title="Cerrar Terminal"
+        <button
+          type="button"
+          onClick={() => void handleLogout()}
+          aria-label="Cerrar sesión"
+          title="Cerrar sesión"
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-bm-steel transition-colors hover:bg-bm-red-tint hover:text-bm-red"
         >
           <LogOut className="h-4 w-4" />
         </button>

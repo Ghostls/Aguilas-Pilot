@@ -1,5 +1,24 @@
 // src/components/ControlHub.tsx
-// VALKYRON OS v5.6 — Fusión integral v5.4 + v5.5: sincronización MRO segura
+// VALKYRON OS v5.7 — Hangar MRO · B&M MANTENIMIENTO AERONÁUTICO
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v5.7 — REBRAND B&M + CONEXIONES:
+//   [FIX] Cierre de OT con modal propio en lugar de window.prompt(). Varios
+//         navegadores embebidos y modos app (PWA) bloquean prompt() y devuelven
+//         null en silencio: la orden no podía cerrarse. Misma validación (mecánico
+//         asignado + observaciones obligatorias) y misma RPC fn_mro_cerrar_orden.
+//   [FIX] Ruta directa /control-hub (App.tsx) no entrega tasks/setTasks: las
+//         órdenes se cargaban en un setter vacío y la vista quedaba siempre sin
+//         órdenes. Ahora, sin setTasks, el componente usa su propio estado.
+//   [FIX] Edición: "sin cambios" compara mecánico con null normalizado ('' vs
+//         null contaba como cambio).
+//   [UI]  Estética B&M (bm-ui): tarjetas blancas por orden con estado legible,
+//         resumen por estado, modales como hoja inferior en móvil, campos de
+//         48 px / 16 px, etiquetas en español para los estados.
+// PRESERVADO ÍNTEGRO (v5.6): fetchOrders (neq Completed), creación con trigger
+//   transaccional y verificación de flota en 'maintenance', mensajes de error,
+//   edición con hallazgos + timestamp, flujo de 2 pasos Formulario → Confirmación,
+//   razones predefinidas, extractRazon / contarHallazgos, onFleetChange, setFleet,
+//   valores de estado en BD ('In Progress' | 'Pending Parts' | 'On Hold').
 // ─────────────────────────────────────────────────────────────────────────────
 // v5.6: conserva todos los formularios, tarjetas y funciones originales.
 // La orden se crea con trigger transaccional y se verifica estado MRO.
@@ -31,10 +50,15 @@ import type { SparePart } from '../Types/Maintenance';
 import { Card, CardHeader, CardContent } from './ui/card';
 import { supabase } from '../lib/supabaseClient';
 import {
+  BmModal, BmField, BmSelect, BmBadge, BmEmpty, BmNotice,
+  bmInput, bmTextarea, bmBtn, type BmTone,
+} from './brand/bm-ui';
+import {
   PlusCircle, X, Wrench, AlertCircle,
   PackageCheck, Loader2, ShieldAlert, ShieldCheck,
   Plane, MapPin, ClipboardList, Pencil,
   PlusCircle as PlusCircleIcon, CheckCircle2,
+  UserRound, // [v5.7]
 } from 'lucide-react';
 
 // ─── INTERFACES ───────────────────────────────────────────────────────────────
@@ -72,29 +96,43 @@ const RAZONES_PREDEFINIDAS = [
   'Otra (especificar)',
 ];
 
-const SELECT_CLS = `w-full bg-[#0d0d0d] border border-white/10 rounded-xl p-4 text-white text-xs
-  outline-none focus:border-[#E1AD01] transition-all
-  [&>option]:bg-[#0d0d0d] [&>option]:text-white`;
+// [v5.7] Clases B&M (antes: campos negros con borde dorado)
+const SELECT_CLS = ''; // BmSelect aplica sus propias clases
+const INPUT_CLS = `${bmInput} uppercase placeholder:normal-case`;
 
-const INPUT_CLS = `w-full bg-black border border-white/10 rounded-xl p-4 text-white text-xs
-  uppercase outline-none focus:border-[#E1AD01] transition-all
-  placeholder:text-white/20 font-mono`;
+// [v5.7] Etiqueta y tono por estado de OT (los valores en BD no cambian)
+const ESTADO_OT: Record<string, { label: string; tone: BmTone }> = {
+  'In Progress':   { label: 'En progreso',         tone: 'info'    },
+  'Pending Parts': { label: 'Esperando repuestos', tone: 'warn'    },
+  'On Hold':       { label: 'En espera',           tone: 'neutral' },
+  'Completed':     { label: 'Completada',          tone: 'ok'      },
+};
+const estadoOT = (estado: string) => ESTADO_OT[estado] ?? { label: estado || 'Sin estado', tone: 'neutral' as BmTone };
 
 // Setter estable para que el efecto inicial no se repita indefinidamente
 // si ControlHub se utiliza sin las propiedades opcionales tasks/setTasks.
+// [v5.7] Ya no se usa para tasks (ver estado interno); se conserva por compatibilidad.
 const noopSetTasks: React.Dispatch<React.SetStateAction<any[]>> = () => {};
 const noopSetFleet: React.Dispatch<React.SetStateAction<any[]>> = () => {};
+void noopSetTasks;
 
 // ─── COMPONENTE ───────────────────────────────────────────────────────────────
 
 export const ControlHub: React.FC<ControlHubProps> = ({
-  tasks: externalTasks = [],
-  setTasks: setExternalTasks = noopSetTasks,
+  tasks: tasksProp,
+  setTasks: setTasksProp,
   fleet = [],
   setFleet = noopSetFleet,
   inventory = [],
   onFleetChange,
 }) => {
+  // [FIX v5.7] Sin setTasks (ruta directa /control-hub) se usa estado propio;
+  // dentro de Index se siguen usando tasks/setTasks del padre.
+  const [internalTasks, setInternalTasks] = useState<any[]>([]);
+  const externalTasks: any[] = setTasksProp ? (tasksProp ?? []) : internalTasks;
+  const setExternalTasks: React.Dispatch<React.SetStateAction<any[]>> = setTasksProp ?? setInternalTasks;
+  void inventory;
+
   const [isFormOpen,    setIsFormOpen]    = useState(false);
   const [isConfirmOpen, setIsConfirmOpen] = useState(false);
   const [isEditOpen,    setIsEditOpen]    = useState(false);
@@ -102,6 +140,10 @@ export const ControlHub: React.FC<ControlHubProps> = ({
   const [loadingEdit,   setLoadingEdit]   = useState(false);
   const [pendingTask,   setPendingTask]   = useState<typeof newTask | null>(null);
   const [editingTask,   setEditingTask]   = useState<any | null>(null);
+
+  // [v5.7] Cierre de OT con modal (reemplaza window.prompt)
+  const [closingTask,   setClosingTask]   = useState<any | null>(null);
+  const [closeObs,      setCloseObs]      = useState('');
 
   const [editForm, setEditForm] = useState<EditForm>({
     nuevosHallazgos: '',
@@ -150,6 +192,11 @@ export const ControlHub: React.FC<ControlHubProps> = ({
   // Eliminado el .filter(t => t.estado !== 'Completed') redundante.
   const activeTasks = externalTasks;
 
+  // [v5.7] Resumen por estado (solo presentación)
+  const resumenEstados = ['In Progress', 'Pending Parts', 'On Hold']
+    .map(estado => ({ estado, total: activeTasks.filter(t => t.estado === estado).length }))
+    .filter(r => r.total > 0);
+
   // ─── ABRIR MODAL DE EDICIÓN ───────────────────────────────────────────────
 
   const handleAbrirEdicion = (task: any) => {
@@ -168,9 +215,10 @@ export const ControlHub: React.FC<ControlHubProps> = ({
     e.preventDefault();
     if (!editingTask) return;
 
+    // [FIX v5.7] null y '' cuentan como el mismo mecánico
     const sinCambios =
       !editForm.nuevosHallazgos.trim() &&
-      editForm.mecanico === editingTask.nombre_mecanico &&
+      editForm.mecanico.trim() === String(editingTask.nombre_mecanico ?? '').trim() &&
       editForm.estado   === editingTask.estado;
 
     if (sinCambios) {
@@ -318,19 +366,25 @@ export const ControlHub: React.FC<ControlHubProps> = ({
 
   // Cerrar una orden NO autoriza el retorno al servicio.
   // Las aeronaves permanecen en maintenance hasta liberación autorizada.
-  const handleFinalCertification = async (task: any) => {
+  // [v5.7] Paso 1: validar mecánico y abrir el modal de observaciones.
+  const handleFinalCertification = (task: any) => {
     if (loading) return;
     const mecanico = String(task.nombre_mecanico ?? '').trim();
     if (!mecanico || mecanico === 'POR ASIGNAR') {
       alert('Asigna un mecánico a la orden antes de cerrarla.');
       return;
     }
-    const observaciones = window.prompt(
-      `Cierre de OT: ${task.matricula}\n` +
-      'Describe el trabajo efectuado, los repuestos instalados y las comprobaciones.\n' +
-      'Cerrar esta OT NO libera la aeronave.'
-    );
-    if (observaciones === null) return;
+    setCloseObs('');
+    setClosingTask(task);
+  };
+
+  // [v5.7] Paso 2: observaciones obligatorias → RPC fn_mro_cerrar_orden
+  const handleConfirmClose = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const task = closingTask;
+    if (!task || loading) return;
+    const mecanico = String(task.nombre_mecanico ?? '').trim();
+    const observaciones = closeObs;
     if (!observaciones.trim()) {
       alert('Las observaciones de cierre son obligatorias.');
       return;
@@ -346,6 +400,8 @@ export const ControlHub: React.FC<ControlHubProps> = ({
       if (error) throw error;
       setExternalTasks(prev => prev.filter(t => t.id !== task.id));
       await onFleetChange?.();
+      setClosingTask(null);
+      setCloseObs('');
       alert(`Orden cerrada: ${task.matricula}.\nLa aeronave sigue fuera de servicio hasta su liberación autorizada.`);
     } catch (err: any) {
       alert('Error al cerrar la orden: ' + (err?.message ?? 'Desconocido'));
@@ -370,484 +426,431 @@ export const ControlHub: React.FC<ControlHubProps> = ({
   // ─── RENDER ───────────────────────────────────────────────────────────────
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-700 text-left font-sans text-white">
+    <div className="bm-app space-y-4 text-left sm:space-y-5">
 
-      {/* Toolbar */}
-      <div className="flex justify-between items-center bg-white/5 p-5 rounded-2xl border border-white/10
-                      backdrop-blur-md text-left">
-        <div className="flex items-center gap-3">
-          <Wrench className="h-5 w-5 text-[#E1AD01]" />
-          <div className="text-left">
-            <h2 className="text-white font-black text-xs uppercase tracking-[0.3em]">
-              Hangar Operations Hub
-            </h2>
-            <p className="text-[9px] text-slate-500 font-mono uppercase tracking-tighter italic">
-              VALKYRON v5.5 // MRO Sincronizado
-            </p>
+      {/* Barra de herramientas */}
+      <div className="flex flex-col gap-4 rounded-[24px] border border-bm-line bg-white p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+        <div className="flex min-w-0 items-center gap-3.5">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-bm-red-tint text-bm-red">
+            <Wrench className="h-5 w-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="bm-heading text-lg leading-tight sm:text-xl">Órdenes de trabajo</h2>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <span className="text-[13px] text-bm-steel">
+                {activeTasks.length === 1 ? '1 orden abierta' : `${activeTasks.length} órdenes abiertas`}
+              </span>
+              {resumenEstados.map(r => (
+                <BmBadge key={r.estado} tone={estadoOT(r.estado).tone}>
+                  {estadoOT(r.estado).label}: {r.total}
+                </BmBadge>
+              ))}
+            </div>
           </div>
         </div>
-        <button onClick={() => setIsFormOpen(true)}
-          className="bg-[#E1AD01] text-black px-6 py-3 rounded-xl font-black text-[10px]
-                     hover:bg-white transition-all uppercase tracking-widest shadow-xl
-                     flex items-center gap-2">
-          <PlusCircle className="h-4 w-4" /> Abrir Tarjeta
+        <button type="button" onClick={() => setIsFormOpen(true)} className={`${bmBtn.primary} w-full sm:w-auto`}>
+          <PlusCircle className="h-5 w-5" /> Abrir orden
         </button>
       </div>
 
       {/* ════════════════════════════════════════════════════════════
           MODAL — EDITAR ORDEN DE TRABAJO
       ════════════════════════════════════════════════════════════ */}
-      {isEditOpen && editingTask && (
-        <div className="fixed inset-0 bg-black/98 backdrop-blur-xl z-[120] flex items-center
-                        justify-center p-4 animate-in fade-in duration-200">
-          <div className="bg-[#0a0a0a] border border-[#E1AD01]/40 w-full max-w-lg
-                          rounded-[2.5rem] shadow-[0_0_80px_rgba(225,173,1,0.12)] overflow-hidden">
+      <BmModal
+        open={isEditOpen && !!editingTask}
+        onClose={() => { setIsEditOpen(false); setEditingTask(null); }}
+        busy={loadingEdit}
+        title="Actualizar orden de trabajo"
+        subtitle={editingTask ? `${editingTask.matricula} · ${editingTask.modelo ?? ''}` : undefined}
+        icon={<ClipboardList className="h-5 w-5" />}
+        tone="neutral"
+        z={120}
+      >
+        {editingTask && (
+          <form onSubmit={handleGuardarEdicion} className="space-y-5">
 
-            <div className="bg-[#E1AD01]/10 border-b border-[#E1AD01]/20 px-7 py-5
-                            flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                <div className="w-10 h-10 rounded-xl bg-[#E1AD01] flex items-center justify-center shrink-0">
-                  <ClipboardList size={18} className="text-black" />
+            <div className="space-y-3 rounded-2xl bg-bm-canvas p-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <p className="text-xs text-bm-steel">Tarea principal</p>
+                  <p className="mt-0.5 text-sm font-semibold leading-snug">{editingTask.descripcion_tarea}</p>
                 </div>
                 <div>
-                  <p className="text-[11px] font-black text-white uppercase tracking-wider">
-                    Actualizar Orden de Trabajo
-                  </p>
-                  <p className="text-[9px] text-[#E1AD01]/70 font-mono uppercase tracking-widest mt-0.5">
-                    {editingTask.matricula} · {editingTask.modelo}
-                  </p>
+                  <p className="text-xs text-bm-steel">Razón de entrada</p>
+                  <p className="mt-0.5 text-sm font-semibold text-bm-red-deep">{extractRazon(editingTask.observaciones)}</p>
                 </div>
               </div>
-              <button
-                onClick={() => { setIsEditOpen(false); setEditingTask(null); }}
-                className="text-zinc-600 hover:text-white hover:rotate-90 transition-all">
-                <X size={20} />
-              </button>
+              {contarHallazgos(editingTask.observaciones) > 0 && (
+                <div className="border-t border-bm-line pt-3">
+                  <p className="mb-1 text-xs text-bm-steel">Hallazgos adicionales registrados</p>
+                  <p className="max-h-28 overflow-y-auto whitespace-pre-line font-data text-xs leading-relaxed text-bm-ink">
+                    {editingTask.observaciones
+                      .split('\n')
+                      .filter((l: string) => l.includes('NUEVO HALLAZGO:'))
+                      .join('\n')}
+                  </p>
+                </div>
+              )}
             </div>
 
-            <form onSubmit={handleGuardarEdicion} className="p-7 space-y-5 font-mono">
+            <BmField
+              label={<><PlusCircleIcon className="h-4 w-4 text-bm-red" /> Daños adicionales</>}
+              htmlFor="ot-hallazgos"
+              hint="Se registra con fecha y hora en el historial de la orden."
+            >
+              <textarea
+                id="ot-hallazgos"
+                rows={3}
+                className={`${bmTextarea} uppercase placeholder:normal-case`}
+                placeholder="Describa daños o hallazgos adicionales"
+                value={editForm.nuevosHallazgos}
+                onChange={e => setEditForm(prev => ({ ...prev, nuevosHallazgos: e.target.value }))}
+              />
+            </BmField>
 
-              <div className="bg-white/[0.02] border border-white/[0.07] rounded-2xl p-4 space-y-3">
-                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">
-                  Estado actual de la orden
-                </p>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <p className="text-[8px] text-zinc-600 uppercase tracking-widest">Tarea principal</p>
-                    <p className="text-[10px] text-white font-black uppercase mt-0.5 leading-snug">
-                      {editingTask.descripcion_tarea}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-[8px] text-zinc-600 uppercase tracking-widest">Razón de entrada</p>
-                    <p className="text-[10px] text-[#E1AD01] font-black uppercase mt-0.5">
-                      {extractRazon(editingTask.observaciones)}
-                    </p>
-                  </div>
-                </div>
-                {contarHallazgos(editingTask.observaciones) > 0 && (
-                  <div className="border-t border-white/5 pt-3">
-                    <p className="text-[8px] text-zinc-600 uppercase tracking-widest mb-1">
-                      Hallazgos adicionales registrados
-                    </p>
-                    <p className="text-[9px] text-zinc-400 font-mono leading-relaxed whitespace-pre-line
-                                  max-h-24 overflow-y-auto">
-                      {editingTask.observaciones
-                        .split('\n')
-                        .filter((l: string) => l.includes('NUEVO HALLAZGO:'))
-                        .join('\n')}
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[9px] font-black text-[#E1AD01] uppercase tracking-widest
-                                  flex items-center gap-2">
-                  <PlusCircleIcon size={12} /> Daños Adicionales
-                </label>
-                <textarea
-                  rows={3}
-                  className="w-full bg-black border border-[#E1AD01]/30 rounded-xl p-4 text-white
-                             text-xs resize-none outline-none focus:border-[#E1AD01] transition-all
-                             placeholder:text-white/20 uppercase font-mono"
-                  placeholder="Describir daños o hallazgos adicionales..."
-                  value={editForm.nuevosHallazgos}
-                  onChange={e => setEditForm(prev => ({ ...prev, nuevosHallazgos: e.target.value }))}
-                />
-                <p className="text-[8px] text-zinc-700 font-mono">
-                  Se registrará con timestamp automático en el historial de la orden.
-                </p>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[9px] font-black text-zinc-400 uppercase tracking-widest block">
-                  Técnico Asignado
-                </label>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <BmField label="Técnico asignado" htmlFor="ot-mecanico">
                 <input
+                  id="ot-mecanico"
                   className={INPUT_CLS}
                   placeholder="Nombre del técnico"
                   value={editForm.mecanico}
                   onChange={e => setEditForm(prev => ({ ...prev, mecanico: e.target.value }))}
                 />
-              </div>
+              </BmField>
 
-              <div className="space-y-1.5">
-                <label className="text-[9px] font-black text-zinc-400 uppercase tracking-widest block">
-                  Estado de la Orden
-                </label>
-                <select
+              <BmField label="Estado de la orden" htmlFor="ot-estado">
+                <BmSelect
+                  id="ot-estado"
                   className={SELECT_CLS}
                   value={editForm.estado}
                   onChange={e => setEditForm(prev => ({ ...prev, estado: e.target.value }))}
                 >
-                  <option value="In Progress">EN PROGRESO</option>
-                  <option value="Pending Parts">ESPERANDO REPUESTOS</option>
-                  <option value="On Hold">EN ESPERA</option>
-                </select>
-                <p className="text-[8px] text-zinc-700 font-mono">
-                  Para cerrar la orden usa "Cerrar Orden" desde la tarjeta.
-                </p>
-              </div>
+                  <option value="In Progress">En progreso</option>
+                  <option value="Pending Parts">Esperando repuestos</option>
+                  <option value="On Hold">En espera</option>
+                </BmSelect>
+              </BmField>
+            </div>
 
-              <div className="flex items-start gap-2 bg-[#E1AD01]/5 border border-[#E1AD01]/15
-                              rounded-xl p-3">
-                <AlertCircle size={13} className="text-[#E1AD01] shrink-0 mt-0.5" />
-                <p className="text-[9px] text-[#E1AD01]/70 leading-relaxed">
-                  Los nuevos hallazgos se{' '}
-                  <span className="font-black text-[#E1AD01]">agregan al historial</span>{' '}
-                  con fecha y hora. No se crea una orden nueva.
-                </p>
-              </div>
+            <BmNotice tone="info" icon={<AlertCircle className="h-4 w-4" />}>
+              Los nuevos hallazgos se <strong>agregan al historial</strong> con fecha y hora; no se crea
+              una orden nueva. Para cerrar la orden use <strong>Cerrar orden</strong> en la tarjeta.
+            </BmNotice>
 
-              <div className="flex gap-3 pt-1">
-                <button
-                  type="button"
-                  onClick={() => { setIsEditOpen(false); setEditingTask(null); }}
-                  className="flex-1 py-4 rounded-xl border border-white/10 text-zinc-400
-                             text-[10px] font-black uppercase hover:bg-white/5 transition-all"
-                >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  disabled={loadingEdit}
-                  className="flex-1 py-4 rounded-xl bg-[#E1AD01] text-black text-[10px] font-black
-                             uppercase hover:bg-white transition-all disabled:opacity-40
-                             flex items-center justify-center gap-2"
-                >
-                  {loadingEdit
-                    ? <Loader2 size={14} className="animate-spin" />
-                    : <CheckCircle2 size={14} />
-                  }
-                  {loadingEdit ? 'Guardando...' : 'Guardar Cambios'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+            <div className="flex flex-col-reverse gap-3 sm:flex-row">
+              <button
+                type="button"
+                onClick={() => { setIsEditOpen(false); setEditingTask(null); }}
+                disabled={loadingEdit}
+                className={`${bmBtn.secondary} sm:flex-1`}
+              >
+                Cancelar
+              </button>
+              <button type="submit" disabled={loadingEdit} className={`${bmBtn.primary} sm:flex-[2]`}>
+                {loadingEdit
+                  ? <Loader2 className="h-4 w-4 animate-spin" />
+                  : <CheckCircle2 className="h-4 w-4" />
+                }
+                {loadingEdit ? 'Guardando…' : 'Guardar cambios'}
+              </button>
+            </div>
+          </form>
+        )}
+      </BmModal>
 
       {/* ════════════════════════════════════════════════════════════
           MODAL PASO 1 — FORMULARIO DE REGISTRO
       ════════════════════════════════════════════════════════════ */}
-      {isFormOpen && (
-        <div className="fixed inset-0 bg-black/95 backdrop-blur-md z-[100] flex items-center
-                        justify-center p-4">
-          <div className="bg-[#0a0a0a] border border-[#E1AD01]/30 w-full max-w-md rounded-3xl
-                          overflow-hidden shadow-2xl">
-            <div className="bg-[#E1AD01] p-5 flex justify-between items-center text-black font-black
-                            uppercase text-xs tracking-widest">
-              <div className="flex items-center gap-2 italic">
-                <Wrench className="h-4 w-4" /> Registrar Intervención
-              </div>
-              <button onClick={() => setIsFormOpen(false)} className="hover:rotate-90 transition-all">
-                <X className="h-6 w-6" />
-              </button>
-            </div>
+      <BmModal
+        open={isFormOpen}
+        onClose={() => setIsFormOpen(false)}
+        title="Abrir orden de trabajo"
+        subtitle="Paso 1 de 2: datos de la intervención"
+        icon={<Wrench className="h-5 w-5" />}
+        tone="red"
+        z={100}
+      >
+        <form onSubmit={handleFormSubmit} className="space-y-5">
 
-            <form onSubmit={handleFormSubmit} className="p-8 space-y-5 text-left font-mono">
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block mb-2">
-                    Unidad *
-                  </label>
-                  <select required className={SELECT_CLS}
-                    value={newTask.matricula}
-                    onChange={e => setNewTask({ ...newTask, matricula: e.target.value })}>
-                    <option value="">— SELECCIONAR —</option>
-                    {fleet.map(ac => (
-                      <option key={ac.id} value={ac.tailNumber ?? ac.matricula}>
-                        {ac.tailNumber ?? ac.matricula}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block mb-2">
-                    Sede
-                  </label>
-                  <select className={SELECT_CLS}
-                    value={newTask.sede}
-                    onChange={e => setNewTask({ ...newTask, sede: e.target.value as any })}>
-                    <option value="Lara">Lara</option>
-                    <option value="Maturín">Maturín</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest block mb-2">
-                  Razón de Entrada a Hangar *
-                </label>
-                <select required className={SELECT_CLS}
-                  value={newTask.razon}
-                  onChange={e => setNewTask({ ...newTask, razon: e.target.value, razonCustom: '' })}>
-                  <option value="">— SELECCIONAR MOTIVO —</option>
-                  {RAZONES_PREDEFINIDAS.map(r => (
-                    <option key={r} value={r}>{r}</option>
-                  ))}
-                </select>
-              </div>
-
-              {newTask.razon === 'Otra (especificar)' && (
-                <div>
-                  <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest block mb-2">
-                    Especificar Razón *
-                  </label>
-                  <input required
-                    className="w-full bg-black border border-[#E1AD01]/30 rounded-xl p-4 text-white
-                               text-xs uppercase outline-none focus:border-[#E1AD01] placeholder:text-white/20"
-                    placeholder="DESCRIBIR LA RAZÓN..."
-                    value={newTask.razonCustom}
-                    onChange={e => setNewTask({ ...newTask, razonCustom: e.target.value })}
-                  />
-                </div>
-              )}
-
-              <div>
-                <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block mb-2">
-                  Descripción Técnica Detallada *
-                </label>
-                <textarea required rows={3}
-                  className="w-full bg-black border border-white/10 rounded-xl p-4 text-white
-                             text-xs resize-none outline-none focus:border-[#E1AD01]
-                             placeholder:text-white/20 uppercase transition-all font-mono"
-                  placeholder="Detalle técnico de la intervención..."
-                  value={newTask.descripcion}
-                  onChange={e => setNewTask({ ...newTask, descripcion: e.target.value })}
-                />
-              </div>
-
-              <div>
-                <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block mb-2">
-                  Técnico Asignado
-                </label>
-                <input
-                  className="w-full bg-black border border-white/10 rounded-xl p-4 text-white
-                             text-xs uppercase outline-none focus:border-[#E1AD01]
-                             placeholder:text-white/20 transition-all font-mono"
-                  placeholder="Nombre del técnico (opcional)"
-                  value={newTask.mecanico}
-                  onChange={e => setNewTask({ ...newTask, mecanico: e.target.value })}
-                />
-              </div>
-
-              <button type="submit"
-                className="w-full bg-[#E1AD01] text-black font-black py-5 rounded-2xl uppercase
-                           text-[10px] tracking-[0.4em] hover:bg-white transition-all shadow-xl
-                           flex items-center justify-center gap-2">
-                <ShieldAlert className="h-4 w-4" /> Revisar y Confirmar
-              </button>
-            </form>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <BmField label="Aeronave" htmlFor="ot-unidad" required>
+              <BmSelect
+                id="ot-unidad"
+                required
+                value={newTask.matricula}
+                onChange={e => setNewTask({ ...newTask, matricula: e.target.value })}
+              >
+                <option value="">Seleccione la matrícula</option>
+                {fleet.map(ac => (
+                  <option key={ac.id} value={ac.tailNumber ?? ac.matricula}>
+                    {ac.tailNumber ?? ac.matricula}
+                  </option>
+                ))}
+              </BmSelect>
+            </BmField>
+            <BmField label="Sede" htmlFor="ot-sede">
+              <BmSelect
+                id="ot-sede"
+                value={newTask.sede}
+                onChange={e => setNewTask({ ...newTask, sede: e.target.value as any })}
+              >
+                <option value="Lara">Lara</option>
+                <option value="Maturín">Maturín</option>
+              </BmSelect>
+            </BmField>
           </div>
-        </div>
-      )}
+
+          <BmField label="Razón de entrada a hangar" htmlFor="ot-razon" required>
+            <BmSelect
+              id="ot-razon"
+              required
+              value={newTask.razon}
+              onChange={e => setNewTask({ ...newTask, razon: e.target.value, razonCustom: '' })}
+            >
+              <option value="">Seleccione el motivo</option>
+              {RAZONES_PREDEFINIDAS.map(r => (
+                <option key={r} value={r}>{r}</option>
+              ))}
+            </BmSelect>
+          </BmField>
+
+          {newTask.razon === 'Otra (especificar)' && (
+            <BmField label="Especifique la razón" htmlFor="ot-razon-custom" required>
+              <input
+                id="ot-razon-custom"
+                required
+                className={INPUT_CLS}
+                placeholder="Describa la razón"
+                value={newTask.razonCustom}
+                onChange={e => setNewTask({ ...newTask, razonCustom: e.target.value })}
+              />
+            </BmField>
+          )}
+
+          <BmField label="Descripción técnica detallada" htmlFor="ot-descripcion" required>
+            <textarea
+              id="ot-descripcion"
+              required
+              rows={3}
+              className={`${bmTextarea} uppercase placeholder:normal-case`}
+              placeholder="Detalle técnico de la intervención"
+              value={newTask.descripcion}
+              onChange={e => setNewTask({ ...newTask, descripcion: e.target.value })}
+            />
+          </BmField>
+
+          <BmField label="Técnico asignado" htmlFor="ot-tecnico" hint="Opcional. Si queda vacío, la orden se crea como POR ASIGNAR.">
+            <input
+              id="ot-tecnico"
+              className={INPUT_CLS}
+              placeholder="Nombre del técnico"
+              value={newTask.mecanico}
+              onChange={e => setNewTask({ ...newTask, mecanico: e.target.value })}
+            />
+          </BmField>
+
+          <button type="submit" className={`${bmBtn.primary} w-full`}>
+            <ShieldAlert className="h-4 w-4" /> Revisar y confirmar
+          </button>
+        </form>
+      </BmModal>
 
       {/* ════════════════════════════════════════════════════════════
-          MODAL PASO 2 — CONFIRMACIÓN TÁCTICA
+          MODAL PASO 2 — CONFIRMACIÓN
       ════════════════════════════════════════════════════════════ */}
-      {isConfirmOpen && pendingTask && (
-        <div className="fixed inset-0 bg-black/98 backdrop-blur-xl z-[110] flex items-center
-                        justify-center p-4">
-          <div className="bg-[#0a0a0a] border border-amber-500/40 w-full max-w-sm rounded-3xl
-                          overflow-hidden shadow-[0_0_60px_rgba(225,173,1,0.15)]">
-
-            <div className="bg-amber-500/10 border-b border-amber-500/20 p-5">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-[#E1AD01] flex items-center justify-center shrink-0">
-                  <ShieldAlert className="h-5 w-5 text-black" />
-                </div>
-                <div>
-                  <p className="text-[12px] font-black text-white uppercase tracking-wider">
-                    Confirmar Entrada a Hangar
-                  </p>
-                  <p className="text-[9px] text-amber-400/70 font-mono uppercase tracking-widest">
-                    Esta acción cambia el estatus de la aeronave
-                  </p>
-                </div>
-              </div>
+      <BmModal
+        open={isConfirmOpen && !!pendingTask}
+        onClose={handleCancelConfirm}
+        busy={loading}
+        title="Confirmar entrada a hangar"
+        subtitle="Paso 2 de 2: esta acción cambia el estado de la aeronave"
+        icon={<ShieldAlert className="h-5 w-5" />}
+        tone="warn"
+        size="sm"
+        z={110}
+      >
+        {pendingTask && (
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-bm-line p-4">
+              <p className="flex items-center gap-2 text-xs text-bm-steel">
+                <Plane className="h-4 w-4 text-bm-red" /> Aeronave afectada
+              </p>
+              <p className="bm-heading mt-1 text-3xl tracking-tight">
+                {pendingTask.matricula.toUpperCase()}
+              </p>
+              {targetAircraft && (
+                <p className="mt-0.5 text-sm text-bm-steel">
+                  {targetAircraft.model ?? targetAircraft.modelo}
+                </p>
+              )}
+              <p className="mt-2 flex items-center gap-1.5 text-[13px] text-bm-steel">
+                <MapPin className="h-3.5 w-3.5" /> Base {pendingTask.sede}
+              </p>
             </div>
 
-            <div className="p-6 space-y-4">
-              <div className="bg-white/[0.03] border border-white/[0.07] rounded-2xl p-4">
-                <div className="flex items-center gap-3 mb-3">
-                  <Plane className="h-4 w-4 text-[#E1AD01]" />
-                  <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">
-                    Aeronave Afectada
-                  </p>
-                </div>
-                <p className="text-2xl font-black text-white font-mono uppercase tracking-tighter">
-                  {pendingTask.matricula.toUpperCase()}
-                </p>
-                {targetAircraft && (
-                  <p className="text-[10px] text-[#E1AD01] font-mono mt-1 italic">
-                    {targetAircraft.model ?? targetAircraft.modelo}
-                  </p>
-                )}
-                <div className="flex items-center gap-1.5 mt-2">
-                  <MapPin className="h-3 w-3 text-zinc-600" />
-                  <p className="text-[9px] text-zinc-500 uppercase font-mono">Base {pendingTask.sede}</p>
-                </div>
-              </div>
+            <div className="rounded-2xl bg-bm-canvas p-4">
+              <p className="text-xs text-bm-steel">Razón de entrada</p>
+              <p className="mt-0.5 text-[15px] font-semibold">
+                {pendingTask.razon === 'Otra (especificar)'
+                  ? pendingTask.razonCustom
+                  : pendingTask.razon}
+              </p>
+              <p className="mt-3 text-xs text-bm-steel">Descripción técnica</p>
+              <p className="mt-0.5 line-clamp-3 text-sm uppercase leading-relaxed">
+                {pendingTask.descripcion}
+              </p>
+            </div>
 
-              <div className="bg-[#E1AD01]/5 border border-[#E1AD01]/25 rounded-2xl p-4">
-                <div className="flex items-center gap-2 mb-2">
-                  <ShieldAlert className="h-3.5 w-3.5 text-[#E1AD01]" />
-                  <p className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest">
-                    Razón de Entrada
-                  </p>
-                </div>
-                <p className="text-[12px] font-black text-white uppercase">
-                  {pendingTask.razon === 'Otra (especificar)'
-                    ? pendingTask.razonCustom
-                    : pendingTask.razon}
-                </p>
-              </div>
+            <BmNotice tone="danger" icon={<AlertCircle className="h-4 w-4" />}>
+              La aeronave pasará a <strong>mantenimiento</strong> de inmediato y dejará de estar
+              disponible para vuelos.
+            </BmNotice>
 
-              <div className="bg-white/[0.02] rounded-xl p-3 border border-white/[0.05]">
-                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">
-                  Descripción Técnica
-                </p>
-                <p className="text-[10px] text-zinc-400 font-mono uppercase leading-relaxed line-clamp-3">
-                  {pendingTask.descripcion}
-                </p>
-              </div>
-
-              <div className="flex items-start gap-2 bg-red-500/5 border border-red-500/15 rounded-xl p-3">
-                <AlertCircle className="h-3.5 w-3.5 text-red-400 shrink-0 mt-0.5" />
-                <p className="text-[9px] text-red-400/80 leading-relaxed">
-                  La aeronave cambiará a estado{' '}
-                  <span className="font-black text-red-400">MANTENIMIENTO</span> inmediatamente
-                  y dejará de estar disponible para vuelos.
-                </p>
-              </div>
-
-              <div className="flex gap-3 pt-1">
-                <button onClick={handleCancelConfirm}
-                  className="flex-1 py-4 rounded-xl border border-white/10 text-zinc-400
-                             text-[10px] font-black uppercase hover:bg-white/5 transition-all">
-                  Corregir
-                </button>
-                <button onClick={handleConfirmAndSend} disabled={loading}
-                  className="flex-1 py-4 rounded-xl bg-[#E1AD01] text-black text-[10px] font-black
-                             uppercase hover:bg-white transition-all shadow-lg disabled:opacity-40
-                             flex items-center justify-center gap-2">
-                  {loading
-                    ? <Loader2 className="animate-spin h-4 w-4" />
-                    : <ShieldCheck className="h-4 w-4" />}
-                  {loading ? 'Procesando...' : 'Confirmar'}
-                </button>
-              </div>
+            <div className="flex flex-col-reverse gap-3 sm:flex-row">
+              <button type="button" onClick={handleCancelConfirm} disabled={loading} className={`${bmBtn.secondary} sm:flex-1`}>
+                Corregir
+              </button>
+              <button type="button" onClick={handleConfirmAndSend} disabled={loading} className={`${bmBtn.primary} sm:flex-[1.4]`}>
+                {loading
+                  ? <Loader2 className="h-4 w-4 animate-spin" />
+                  : <ShieldCheck className="h-4 w-4" />}
+                {loading ? 'Procesando…' : 'Confirmar ingreso'}
+              </button>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </BmModal>
+
+      {/* ════════════════════════════════════════════════════════════
+          [v5.7] MODAL — CERRAR ORDEN (reemplaza window.prompt)
+      ════════════════════════════════════════════════════════════ */}
+      <BmModal
+        open={!!closingTask}
+        onClose={() => { setClosingTask(null); setCloseObs(''); }}
+        busy={loading}
+        title={closingTask ? `Cerrar orden: ${closingTask.matricula}` : 'Cerrar orden'}
+        subtitle={closingTask ? `Mecánico: ${closingTask.nombre_mecanico}` : undefined}
+        icon={<PackageCheck className="h-5 w-5" />}
+        tone="dark"
+        z={130}
+      >
+        {closingTask && (
+          <form onSubmit={handleConfirmClose} className="space-y-5">
+            <BmField
+              label="Observaciones de cierre"
+              htmlFor="ot-cierre"
+              required
+              hint="Trabajo efectuado, repuestos instalados y comprobaciones realizadas."
+            >
+              <textarea
+                id="ot-cierre"
+                rows={5}
+                required
+                autoFocus
+                className={bmTextarea}
+                placeholder="Describa el trabajo efectuado"
+                value={closeObs}
+                onChange={e => setCloseObs(e.target.value)}
+              />
+            </BmField>
+
+            <BmNotice tone="warn" icon={<AlertCircle className="h-4 w-4" />}>
+              Cerrar esta orden <strong>no libera la aeronave</strong>. Sigue fuera de servicio hasta su
+              liberación autorizada.
+            </BmNotice>
+
+            <div className="flex flex-col-reverse gap-3 sm:flex-row">
+              <button
+                type="button"
+                onClick={() => { setClosingTask(null); setCloseObs(''); }}
+                disabled={loading}
+                className={`${bmBtn.secondary} sm:flex-1`}
+              >
+                Cancelar
+              </button>
+              <button type="submit" disabled={loading || !closeObs.trim()} className={`${bmBtn.dark} sm:flex-[1.4]`}>
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <PackageCheck className="h-4 w-4" />}
+                {loading ? 'Cerrando…' : 'Cerrar orden'}
+              </button>
+            </div>
+          </form>
+        )}
+      </BmModal>
 
       {/* ── TARJETAS ACTIVAS ─────────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 gap-3 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
         {activeTasks.map(task => {
           const hallazgos = contarHallazgos(task.observaciones);
+          const est = estadoOT(task.estado);
+          const asignado = task.nombre_mecanico && task.nombre_mecanico !== 'POR ASIGNAR';
           return (
             <Card key={task.id}
-              className="bg-[#0f0f0f] border border-white/10 shadow-2xl transition-all relative overflow-hidden">
-              <div className="absolute left-0 top-0 bottom-0 w-1 bg-[#E1AD01]
-                              shadow-[0_0_15px_#E1AD01]" />
+              className="flex flex-col overflow-hidden rounded-[20px] border border-bm-line bg-white text-bm-ink shadow-none">
 
-              <CardHeader className="border-b border-white/5 pb-4">
-                <div className="flex justify-between items-start">
-                  <div className="flex flex-col">
-                    <span className="font-black text-white text-2xl font-mono uppercase">
+              <CardHeader className="space-y-0 p-4 pb-3 sm:p-5 sm:pb-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <span className="bm-heading block truncate text-2xl leading-tight tracking-tight">
                       {task.matricula}
                     </span>
-                    <span className="text-[9px] text-[#E1AD01] font-black uppercase italic tracking-widest">
+                    <span className="block truncate text-[13px] text-bm-steel">
                       {task.modelo}
                     </span>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[8px] px-2 py-0.5 rounded border border-[#E1AD01]/20
-                                     text-[#E1AD01] font-black uppercase">
-                      {task.estado}
-                    </span>
-                    <button
-                      onClick={() => handleAbrirEdicion(task)}
-                      title="Agregar hallazgos o actualizar orden"
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-white/10
-                                 text-zinc-500 text-[8px] font-black uppercase tracking-wider
-                                 hover:border-[#E1AD01]/40 hover:text-[#E1AD01] hover:bg-[#E1AD01]/5
-                                 transition-all"
-                    >
-                      <Pencil size={10} /> Editar
-                    </button>
-                  </div>
+                  <BmBadge tone={est.tone} dot>{est.label}</BmBadge>
                 </div>
               </CardHeader>
 
-              <CardContent className="pt-5 space-y-4 text-left font-mono">
+              <CardContent className="flex flex-1 flex-col gap-3 p-4 pt-0 sm:p-5 sm:pt-0">
 
-                <div className="bg-[#E1AD01]/5 border border-[#E1AD01]/15 rounded-xl px-3 py-2.5">
-                  <p className="text-[8px] text-[#E1AD01]/60 font-black uppercase tracking-widest mb-0.5">
-                    Razón de Entrada
-                  </p>
-                  <p className="text-[10px] text-[#E1AD01] font-black uppercase">
+                <div className="rounded-xl bg-bm-red-tint/60 px-3 py-2.5">
+                  <p className="text-xs text-bm-red-deep/80">Razón de entrada</p>
+                  <p className="text-sm font-semibold text-bm-red-deep">
                     {extractRazon(task.observaciones)}
                   </p>
                 </div>
 
                 <div className="flex items-start gap-2">
-                  <ClipboardList className="h-3 w-3 text-slate-600 mt-0.5 shrink-0" />
-                  <p className="text-[10px] text-slate-300 uppercase leading-relaxed line-clamp-3">
+                  <ClipboardList className="mt-0.5 h-4 w-4 shrink-0 text-bm-hint" />
+                  <p className="line-clamp-3 text-sm uppercase leading-relaxed text-bm-steel">
                     {task.descripcion_tarea}
                   </p>
                 </div>
 
                 {hallazgos > 0 && (
-                  <div className="flex items-center gap-2 px-3 py-1.5 bg-orange-500/5
-                                  border border-orange-500/20 rounded-xl">
-                    <AlertCircle size={11} className="text-orange-400 shrink-0" />
-                    <p className="text-[8px] text-orange-400 font-black uppercase tracking-widest">
-                      {hallazgos} hallazgo{hallazgos !== 1 ? 's' : ''} adicional{hallazgos !== 1 ? 'es' : ''} registrado{hallazgos !== 1 ? 's' : ''}
-                    </p>
-                  </div>
+                  <BmBadge tone="warn" icon={<AlertCircle className="h-3.5 w-3.5" />} className="self-start">
+                    {hallazgos} hallazgo{hallazgos !== 1 ? 's' : ''} adicional{hallazgos !== 1 ? 'es' : ''}
+                  </BmBadge>
                 )}
 
-                <div className="border-t border-white/5 pt-4 space-y-3">
-                  <div className="flex items-center justify-between text-[9px] text-slate-500
-                                  uppercase font-black tracking-widest">
+                <div className="mt-auto space-y-3 border-t border-bm-line pt-3">
+                  <div className="flex items-center justify-between gap-3 text-[13px] text-bm-steel">
                     <span className="flex items-center gap-1.5">
-                      <MapPin className="h-3 w-3 text-[#E1AD01]/50" /> {task.sede}
+                      <MapPin className="h-3.5 w-3.5" /> {task.sede}
                     </span>
-                    {task.nombre_mecanico && task.nombre_mecanico !== 'POR ASIGNAR' && (
-                      <span className="text-zinc-600 italic">{task.nombre_mecanico}</span>
-                    )}
+                    <span className={`flex min-w-0 items-center gap-1.5 ${asignado ? '' : 'text-bm-warn'}`}>
+                      <UserRound className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{asignado ? task.nombre_mecanico : 'Sin mecánico'}</span>
+                    </span>
                   </div>
-                  <button onClick={() => handleFinalCertification(task)}
-                    className="w-full bg-[#E1AD01] text-black font-black py-4 rounded-xl hover:bg-white
-                               transition-all text-[10px] tracking-[0.2em]
-                               flex items-center justify-center gap-2">
-                    <PackageCheck className="h-4 w-4" /> Cerrar Orden
-                  </button>
+                  <div className="grid grid-cols-[auto_1fr] gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleAbrirEdicion(task)}
+                      title="Agregar hallazgos o actualizar orden"
+                      className={`${bmBtn.secondary} ${bmBtn.sm}`}
+                    >
+                      <Pencil className="h-4 w-4" /> Editar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleFinalCertification(task)}
+                      className={`${bmBtn.dark} ${bmBtn.sm}`}
+                    >
+                      <PackageCheck className="h-4 w-4" /> Cerrar orden
+                    </button>
+                  </div>
                 </div>
               </CardContent>
             </Card>
@@ -855,11 +858,17 @@ export const ControlHub: React.FC<ControlHubProps> = ({
         })}
 
         {activeTasks.length === 0 && (
-          <div className="col-span-3 text-center py-20 text-zinc-700">
-            <Wrench className="h-10 w-10 mx-auto mb-4 opacity-20" />
-            <p className="text-[10px] font-black uppercase tracking-widest">
-              Sin intervenciones activas
-            </p>
+          <div className="col-span-full rounded-[24px] border border-dashed border-bm-line bg-white">
+            <BmEmpty
+              icon={<Wrench className="h-5 w-5" />}
+              title="Sin intervenciones activas"
+              text="Cuando una aeronave entre a hangar, su orden de trabajo aparecerá aquí."
+              action={
+                <button type="button" onClick={() => setIsFormOpen(true)} className={bmBtn.primary}>
+                  <PlusCircle className="h-5 w-5" /> Abrir orden
+                </button>
+              }
+            />
           </div>
         )}
       </div>

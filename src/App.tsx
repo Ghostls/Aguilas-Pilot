@@ -1,6 +1,39 @@
-// NÚCLEO DE INTELIGENCIA OPERATIVA - VALKYRON OS v7.1
+// NÚCLEO DE INTELIGENCIA OPERATIVA - VALKYRON OS v7.3
+// B&M MANTENIMIENTO AERONÁUTICO (ex Águilas Pilot) — Inventario & MRO
 // ─────────────────────────────────────────────────────────────────────────────
-// FUSIÓN v5.0 + v7.0
+// FUSIÓN v5.0 + v7.0 + v7.1 + rebrand B&M
+//
+// CHANGELOG v7.3 — RUTAS DIRECTAS CON MARCO:
+//   [FIX] Las rutas directas (/control-hub, /inventory-checkout,
+//         /flight-register, /planificacion, /inventory-archive) pintaban el
+//         módulo suelto sobre el lienzo claro de B&M: los módulos aún con
+//         estética Águilas (texto blanco, sin fondo propio) quedaban ilegibles
+//         y los ya migrados quedaban pegados a los bordes, sin forma de volver.
+//         ProtectedRoute acepta `frame`:
+//           'bm'     → cabecera B&M (logo, nombre del módulo, Centro de mando)
+//                      y contenedor con márgenes. Módulos ya migrados.
+//           'legacy' → fondo oscuro de la estética anterior hasta migrarlos.
+//           'none'   → sin marco (páginas con cabecera propia, como el
+//                      Archivo histórico OMA v2.0). Valor por defecto.
+//         El marco envuelve DESPUÉS de cloneElement: el módulo sigue
+//         recibiendo userRole / userProfile / fleet igual que antes.
+//
+// CHANGELOG v7.2 — REBRAND B&M (solo presentación):
+//   [UI]  AccessDenied y ModuleErrorBoundary con identidad B&M: lienzo claro,
+//         tarjeta blanca, logo <BmLogo>, rojo B&M en la acción principal.
+//         Usan los colores semánticos del tema (bg-card, text-primary,
+//         bg-muted…), así que también funcionan dentro de .dark.
+//   [UI]  Mobile-first: tarjeta a ancho completo en móvil (máx. 448 px),
+//         botones de 48 px, min-h-[100dvh] en lugar de h-screen (barra de
+//         direcciones de iOS/Android).
+//   [UI]  Textos sin marca Águilas: "Sincronizando B&M", "nueva versión del
+//         sistema", "Volver al inicio".
+//   [UI]  Toasts de Sonner fijados en tema claro (theme="light").
+// PRESERVADO ÍNTEGRO (v7.1): lazyWithRetry y su control por sessionStorage,
+//   ModuleErrorBoundary (detección de chunk, Reintentar / Recargar con limpieza
+//   de claves), ROUTE_ROLES, FLEET_ROLES, useGlobalFleet (abort, debounce 400 ms,
+//   canal único, limpieza por usuario), ProtectedRoute, rutas, AuthProvider
+//   único, QueryClient, re-exports.
 //
 // CHANGELOG v7.1 (sobre v7.0):
 //   [NEW] lazyWithRetry: si un módulo lazy falla al descargarse (típico tras un
@@ -52,6 +85,8 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from
 import { supabase } from "@/lib/supabaseClient";
 import { AuthProvider, useAuth, PLANNER_ROLES, type UserRole } from "@/context/AuthContext";
 import { AuthLoader, AuthRecoveryPanel } from "@/components/AuthRecoveryPanel";
+import { BmLogo } from "@/components/brand/BmLogo"; // [v7.2] identidad B&M
+import { Lock, LogOut, RefreshCw, AlertTriangle, RotateCcw, ArrowLeft } from "lucide-react"; // [v7.2] · [v7.3] ArrowLeft
 
 import Index from "./pages/Index";
 import Login from "./pages/Login";
@@ -134,8 +169,21 @@ const FLEET_ROLES: UserRole[] = ['CEO', 'ADMIN', 'DIRECTOR', 'MECANICO', 'OPERAC
 
 // ─── UI AUXILIAR ─────────────────────────────────────────────────────────────
 
+/** [v7.2] Estilos compartidos de las pantallas de estado (acceso, error). */
+const statusScreenClass =
+  'bm-app min-h-[100dvh] w-full bg-muted text-foreground flex items-center justify-center px-5 py-10';
+const statusCardClass =
+  'w-full max-w-md rounded-[24px] border border-border bg-card p-6 sm:p-8 shadow-bm-pop';
+const primaryButtonClass =
+  'h-12 w-full rounded-xl bg-primary text-primary-foreground text-[15px] font-semibold ' +
+  'inline-flex items-center justify-center gap-2 hover:brightness-[0.85] active:scale-[0.99] transition';
+const secondaryButtonClass =
+  'h-12 w-full rounded-xl border border-border bg-card text-foreground text-[15px] font-semibold ' +
+  'inline-flex items-center justify-center gap-2 hover:bg-muted transition-colors ' +
+  'disabled:opacity-60 disabled:cursor-not-allowed';
+
 /** [KEEP v5.0] NodeLoader → ahora con recuperación automática si tarda (AuthLoader). */
-const NodeLoader: React.FC<{ label?: string }> = ({ label = 'Sincronizando Nodo Águila' }) => (
+const NodeLoader: React.FC<{ label?: string }> = ({ label = 'Sincronizando B&M' }) => (
   <AuthLoader label={label} />
 );
 
@@ -145,35 +193,45 @@ const AccessDenied: React.FC<{ role: UserRole | null; modulo: string }> = ({ rol
   const [closing, setClosing] = useState(false);
 
   return (
-    <div className="h-screen w-full bg-[#020202] flex items-center justify-center p-6">
-      <div className="max-w-md w-full rounded-3xl border border-red-500/20 bg-red-500/[0.04] p-8 text-center">
-        <p className="text-red-400 font-black text-[11px] uppercase tracking-[0.3em]">Acceso restringido</p>
-        <p className="text-white font-black text-lg uppercase italic mt-3">{modulo}</p>
-        <p className="text-zinc-500 text-[11px] font-mono mt-3">
-          Tu rango actual ({role ?? 'SIN ROL'}) no tiene autorización para este módulo.
-          Solicita el alta a Dirección.
+    <main className={statusScreenClass}>
+      <div className={statusCardClass}>
+        <BmLogo variant="compact" className="h-9 w-auto text-primary" />
+
+        <div className="mt-8 h-12 w-12 rounded-full bg-primary-tint text-primary flex items-center justify-center">
+          <Lock className="h-5 w-5" />
+        </div>
+
+        <h1 className="bm-heading mt-4 text-2xl leading-tight">Acceso restringido</h1>
+        <p className="mt-1 text-[15px] font-semibold">{modulo}</p>
+        <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
+          Su cargo actual (<span className="font-data text-[13px] text-foreground">{role ?? 'sin rol asignado'}</span>) no
+          tiene autorización para este módulo. Solicite el acceso a dirección.
         </p>
-        <button
-          type="button"
-          onClick={() => navigate('/', { replace: true })}
-          className="mt-6 w-full py-4 rounded-2xl bg-[#E1AD01] text-black text-[10px] font-black uppercase tracking-widest hover:bg-white transition-all"
-        >
-          Volver al centro de mando
-        </button>
-        {/* [NEW v7.1] Cambio de cuenta en equipos compartidos */}
-        <button
-          type="button"
-          disabled={closing}
-          onClick={async () => {
-            setClosing(true);
-            try { await signOut(); } finally { setClosing(false); }
-          }}
-          className="mt-3 w-full py-3 rounded-2xl border border-white/10 text-zinc-400 text-[10px] font-black uppercase tracking-widest hover:bg-white/5 transition-all disabled:opacity-50"
-        >
-          {closing ? 'Cerrando sesión...' : 'Cerrar sesión'}
-        </button>
+
+        <div className="mt-7 grid gap-2.5">
+          <button
+            type="button"
+            onClick={() => navigate('/', { replace: true })}
+            className={primaryButtonClass}
+          >
+            Volver al inicio
+          </button>
+          {/* [NEW v7.1] Cambio de cuenta en equipos compartidos */}
+          <button
+            type="button"
+            disabled={closing}
+            onClick={async () => {
+              setClosing(true);
+              try { await signOut(); } finally { setClosing(false); }
+            }}
+            className={secondaryButtonClass}
+          >
+            <LogOut className="h-4 w-4" />
+            {closing ? 'Cerrando sesión…' : 'Cerrar sesión'}
+          </button>
+        </div>
       </div>
-    </div>
+    </main>
   );
 };
 
@@ -211,24 +269,38 @@ class ModuleErrorBoundary extends React.Component<ModuleErrorBoundaryProps, Modu
       .test(error.message);
 
     return (
-      <div className="h-screen w-full bg-[#020202] flex items-center justify-center p-6">
-        <div role="alert" className="max-w-md w-full rounded-3xl border border-amber-500/25 bg-[#0a0a0a] p-8 text-center">
-          <p className="text-amber-400 font-black text-[11px] uppercase tracking-[0.3em]">
+      <main className={statusScreenClass}>
+        <div role="alert" className={statusCardClass}>
+          <BmLogo variant="compact" className="h-9 w-auto text-primary" />
+
+          <div
+            className={`mt-8 h-12 w-12 rounded-full flex items-center justify-center ${
+              isChunkError ? 'bg-warning-tint text-warning' : 'bg-primary-tint text-primary'
+            }`}
+          >
+            {isChunkError ? <RefreshCw className="h-5 w-5" /> : <AlertTriangle className="h-5 w-5" />}
+          </div>
+
+          <h1 className="bm-heading mt-4 text-2xl leading-tight">
             {isChunkError ? 'Actualización disponible' : 'Error del módulo'}
-          </p>
-          <p className="text-white font-black text-lg uppercase italic mt-3">{this.props.modulo}</p>
-          <p className="text-zinc-500 text-[11px] font-mono mt-3">
+          </h1>
+          <p className="mt-1 text-[15px] font-semibold">{this.props.modulo}</p>
+          <p className="mt-3 text-sm leading-relaxed text-muted-foreground">
             {isChunkError
-              ? 'Se publicó una nueva versión de Águilas OS o la conexión se interrumpió al descargar el módulo. Recargue para continuar.'
+              ? 'Se publicó una nueva versión del sistema o la conexión se interrumpió al descargar el módulo. Recargue para continuar.'
               : 'El módulo no pudo mostrarse. Puede reintentar o recargar la página. Su sesión se mantiene.'}
           </p>
-          <p className="text-zinc-700 text-[9px] font-mono mt-2 break-words">{error.message}</p>
-          <div className="mt-6 grid grid-cols-2 gap-2">
+          <p className="mt-4 rounded-xl bg-muted px-3 py-2.5 font-data text-xs leading-relaxed text-muted-foreground break-words">
+            {error.message}
+          </p>
+
+          <div className="mt-7 grid grid-cols-2 gap-2.5">
             <button
               type="button"
               onClick={() => this.setState({ error: null })}
-              className="py-4 rounded-2xl border border-white/10 text-zinc-300 text-[10px] font-black uppercase tracking-widest hover:bg-white/5 transition-all"
+              className={secondaryButtonClass}
             >
+              <RotateCcw className="h-4 w-4" />
               Reintentar
             </button>
             <button
@@ -241,13 +313,14 @@ class ModuleErrorBoundary extends React.Component<ModuleErrorBoundaryProps, Modu
                 } catch { /* almacenamiento bloqueado */ }
                 window.location.reload();
               }}
-              className="py-4 rounded-2xl bg-[#E1AD01] text-black text-[10px] font-black uppercase tracking-widest hover:bg-white transition-all"
+              className={primaryButtonClass}
             >
+              <RefreshCw className="h-4 w-4" />
               Recargar
             </button>
           </div>
         </div>
-      </div>
+      </main>
     );
   }
 }
@@ -329,18 +402,58 @@ const useGlobalFleet = (enabled: boolean, userId: string | null): any[] => {
 // La autorización real vive en PostgreSQL (RLS + RPC); esto solo evita mostrar
 // módulos que el servidor rechazaría.
 
+// ─── [v7.3] MARCO DE RUTA DIRECTA ────────────────────────────────────────────
+
+type RouteFrameVariant = 'bm' | 'legacy' | 'none';
+
+const RouteFrame: React.FC<{ variant: RouteFrameVariant; modulo: string; children: React.ReactNode }> = ({ variant, modulo, children }) => {
+  const navigate = useNavigate();
+  if (variant === 'none') return <>{children}</>;
+  if (variant === 'legacy') {
+    // Módulo aún con estética Águilas: fondo oscuro propio hasta migrarlo.
+    return (
+      <div className="dark min-h-[100dvh] bg-[#050505] text-white">
+        <div className="mx-auto max-w-7xl p-3 sm:p-6">{children}</div>
+      </div>
+    );
+  }
+  return (
+    <div className="bm-app min-h-[100dvh] bg-bm-canvas text-bm-ink">
+      <header className="sticky top-0 z-30 border-b border-bm-line bg-white/95 backdrop-blur">
+        <div className="mx-auto flex h-14 max-w-6xl items-center justify-between gap-3 px-4 sm:h-16 sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <BmLogo variant="compact" className="h-7 w-auto shrink-0 text-bm-red sm:h-8" />
+            <span className="hidden h-6 w-px bg-bm-line min-[420px]:block" aria-hidden="true" />
+            <span className="hidden truncate text-sm font-semibold min-[420px]:block">{modulo}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => navigate('/')}
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-xl px-3 text-sm font-semibold text-bm-steel transition-colors hover:bg-bm-canvas hover:text-bm-ink"
+          >
+            <ArrowLeft className="h-4 w-4" /> Centro de mando
+          </button>
+        </div>
+      </header>
+      <main className="mx-auto max-w-6xl px-4 py-5 sm:px-6 sm:py-8">{children}</main>
+    </div>
+  );
+};
+
 const ProtectedRoute = ({
   children,
   globalFleet,
   allowedRoles,
   requirePlanner = false,
   modulo = 'Módulo',
+  frame = 'none', // [v7.3]
 }: {
   children: React.ReactElement;
   globalFleet: any[];
   allowedRoles?: UserRole[];
   requirePlanner?: boolean;
   modulo?: string;
+  frame?: RouteFrameVariant;
 }) => {
   const auth = useAuth();
   const location = useLocation();
@@ -367,11 +480,13 @@ const ProtectedRoute = ({
   return (
     <ModuleErrorBoundary key={location.pathname} modulo={modulo}>
       <Suspense fallback={<NodeLoader label="Cargando módulo" />}>
-        {cloneElement(children, {
-          userRole:    auth.role,
-          userProfile: auth.profile,
-          fleet:       globalFleet,
-        })}
+        <RouteFrame variant={frame} modulo={modulo}>
+          {cloneElement(children, {
+            userRole:    auth.role,
+            userProfile: auth.profile,
+            fleet:       globalFleet,
+          })}
+        </RouteFrame>
       </Suspense>
     </ModuleErrorBoundary>
   );
@@ -400,7 +515,7 @@ const AppRoutes = () => {
         <Route
           path="/control-hub"
           element={
-            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.controlHub} modulo="Control Hub MRO">
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.controlHub} modulo="Hangar MRO" frame="bm">
               <ControlHub />
             </ProtectedRoute>
           }
@@ -408,7 +523,7 @@ const AppRoutes = () => {
         <Route
           path="/inventory-checkout"
           element={
-            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryCheckout} modulo="Inventario">
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryCheckout} modulo="Salidas de inventario" frame="bm">
               <InventoryCheckout />
             </ProtectedRoute>
           }
@@ -424,7 +539,7 @@ const AppRoutes = () => {
         <Route
           path="/inventory-archive"
           element={
-            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryArchive} modulo="Archivo de Inventario">
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryArchive} modulo="Archivo de Inventario" frame="legacy">
               <InventoryArchive />
             </ProtectedRoute>
           }
@@ -432,7 +547,7 @@ const AppRoutes = () => {
         <Route
           path="/flight-register"
           element={
-            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.flightRegister} modulo="Registro de Vuelo">
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.flightRegister} modulo="Registro de vuelo" frame="bm">
               <FlightRegister />
             </ProtectedRoute>
           }
@@ -446,6 +561,7 @@ const AppRoutes = () => {
               allowedRoles={PLANNER_ROLES}
               requirePlanner
               modulo="Planificación de Vuelo"
+              frame="legacy"
             >
               <FlightPlanningBoard />
             </ProtectedRoute>
@@ -463,7 +579,7 @@ const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
       <Toaster />
-      <Sonner />
+      <Sonner theme="light" />
       <AuthProvider onSignedOut={() => queryClient.clear()}>
         <AppRoutes />
       </AuthProvider>

@@ -1,4 +1,37 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+/* ─────────────────────────────────────────────────────────────────────────────
+ * src/index.css — VALKYRON OS · TEMA GLOBAL v2.1 (B&M MANTENIMIENTO AERONÁUTICO)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGELOG v2.1:
+ *   [FIX] @import del tema por alias '@/theme/bm-theme.css' (antes ruta relativa
+ *         './theme/…', que fallaba si index.css no estaba en src/). Única entrada
+ *         del tema para toda la app: los componentes ya no lo importan.
+ *
+ * CHANGELOG v2.0 — REBRAND B&M:
+ *   [UI]  Variables shadcn pasan de "Black & Mustard" (Águilas Pilot) a B&M:
+ *         superficies blancas, texto grafito, rojo B&M #D42125 como primario.
+ *         Todo componente que use bg-background, bg-card, text-primary,
+ *         border-border, ring, etc. cambia de marca sin tocar su código.
+ *   [UI]  Tipografía autoalojada (sin Google Fonts):
+ *         Archivo Variable → texto y títulos (font-sans)
+ *         JetBrains Mono Variable → .font-data / font-mono (P/N, S/N, matrículas)
+ *   [NEW] Variante .dark (B&M nocturno, grafito + rojo). Sirve como modo oscuro
+ *         futuro y como envoltorio temporal para módulos aún no migrados:
+ *         <div className="dark"> … </div>.
+ *   [NEW] color-scheme light/dark: selects, scrollbars y calendarios nativos
+ *         siguen el tema.
+ *   [NEW] Variables --success / --warning con sus tintes para estados.
+ *   [UI]  Clases de componente conservadas con los mismos nombres y reglas,
+ *         re-tonalizadas: glass-panel, status-bar, data-table, fatigue-*, nav-tab.
+ *         data-table th deja las mayúsculas espaciadas (encabezado en gris acero).
+ * PRESERVADO: todas las variables existentes (mismos nombres), alert-*, online /
+ *   offline, sidebar-*, glass-*, .font-data y todas las clases de @layer components.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* Tokens B&M + Archivo Variable (normal e itálica, ejes wght y wdth).
+ * [v2.1] Import por alias @/ → funciona sin importar dónde viva este index.css. */
+@import '@/theme/bm-theme.css';
+/* Monoespaciada para datos técnicos */
+@import '@fontsource-variable/jetbrains-mono/index.css';
 
 @tailwind base;
 @tailwind components;
@@ -6,59 +39,127 @@
 
 @layer base {
   :root {
-    /* Dark mode as default — Black & Mustard */
-    --background: 0 0% 6%;
-    --foreground: 45 20% 92%;
+    /* B&M claro — por defecto */
+    color-scheme: light;
 
-    --card: 0 0% 10%;
-    --card-foreground: 45 20% 92%;
+    --background: 0 0% 100%;              /* #FFFFFF blanco */
+    --foreground: 223 11% 12%;            /* #1B1D22 grafito */
 
-    --popover: 0 0% 10%;
-    --popover-foreground: 45 20% 92%;
+    --card: 0 0% 100%;
+    --card-foreground: 223 11% 12%;
 
-    --primary: 42 90% 50%;
-    --primary-foreground: 0 0% 5%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 223 11% 12%;
 
-    --secondary: 0 0% 18%;
-    --secondary-foreground: 45 20% 92%;
+    --primary: 359 73% 48%;               /* #D42125 rojo B&M */
+    --primary-foreground: 0 0% 100%;
 
-    --muted: 0 0% 15%;
-    --muted-foreground: 42 10% 55%;
+    --secondary: 220 13% 95.5%;           /* #F2F3F5 lienzo */
+    --secondary-foreground: 223 11% 12%;
 
-    --accent: 42 20% 18%;
-    --accent-foreground: 45 20% 92%;
+    --muted: 220 13% 95.5%;               /* #F2F3F5 lienzo */
+    --muted-foreground: 215 8% 40.6%;     /* #5F6670 acero */
 
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 45 20% 92%;
+    --accent: 220 13% 95.5%;              /* hover de menús y filas */
+    --accent-foreground: 223 11% 12%;
 
-    --border: 0 0% 18%;
-    --input: 0 0% 18%;
-    --ring: 42 90% 50%;
+    --destructive: 358 77% 37.5%;         /* #A9161B rojo profundo: distinto del primario */
+    --destructive-foreground: 0 0% 100%;
 
-    --radius: 0.375rem;
+    --border: 220 12% 90.2%;              /* #E3E5E9 línea */
+    --input: 217 12% 86.7%;               /* #D9DCE1 borde de campo */
+    --ring: 359 73% 48%;
+
+    --radius: 0.75rem;
+
+    /* Estados (nuevo v2.0) */
+    --success: 153 67% 28.4%;             /* #18794E */
+    --success-tint: 150 41% 93.3%;        /* #E7F5EE */
+    --warning: 26 90% 37.1%;              /* #B45309 */
+    --warning-tint: 36 93% 94.1%;         /* #FEF3E2 */
+    --primary-tint: 356 74% 95.5%;        /* #FCEBEC */
 
     /* Alert thresholds */
-    --alert-ok: 152 60% 40%;
-    --alert-warning: 38 92% 50%;
-    --alert-critical: 0 72% 51%;
+    --alert-ok: 153 67% 28.4%;
+    --alert-warning: 26 90% 37.1%;
+    --alert-critical: 359 73% 48%;
 
-    /* Glass effect — dark */
-    --glass-bg: 0 0% 10% / 0.92;
-    --glass-border: 0 0% 20% / 0.6;
-    --glass-shadow: 0 4px 24px -2px hsl(0 0% 0% / 0.5);
+    /* Glass effect — claro */
+    --glass-bg: 0 0% 100% / 0.92;
+    --glass-border: 220 12% 90.2% / 1;
+    --glass-shadow: 0 1px 2px hsl(223 11% 12% / 0.04), 0 12px 32px -12px hsl(223 11% 12% / 0.14);
 
     /* Status indicators */
-    --online: 152 60% 40%;
-    --offline: 38 92% 50%;
+    --online: 153 67% 28.4%;
+    --offline: 26 90% 37.1%;
 
-    --sidebar-background: 0 0% 8%;
-    --sidebar-foreground: 45 20% 92%;
-    --sidebar-primary: 42 90% 50%;
-    --sidebar-primary-foreground: 0 0% 5%;
-    --sidebar-accent: 0 0% 14%;
-    --sidebar-accent-foreground: 45 20% 92%;
-    --sidebar-border: 0 0% 16%;
-    --sidebar-ring: 42 90% 50%;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 223 11% 12%;
+    --sidebar-primary: 359 73% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 13% 95.5%;
+    --sidebar-accent-foreground: 223 11% 12%;
+    --sidebar-border: 220 12% 90.2%;
+    --sidebar-ring: 359 73% 48%;
+  }
+
+  /* B&M nocturno — modo oscuro y envoltorio de módulos no migrados */
+  .dark {
+    color-scheme: dark;
+
+    --background: 220 13% 9%;             /* #14161A */
+    --foreground: 220 13% 95.5%;          /* #F2F3F5 */
+
+    --card: 223 11% 12%;                  /* #1B1D22 */
+    --card-foreground: 220 13% 95.5%;
+
+    --popover: 223 11% 12%;
+    --popover-foreground: 220 13% 95.5%;
+
+    --primary: 359 77% 55.9%;             /* #E5383B: rojo con contraste sobre grafito */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 222 12% 16.5%;           /* #25282F */
+    --secondary-foreground: 220 13% 95.5%;
+
+    --muted: 222 12% 16.5%;
+    --muted-foreground: 214 7% 63.1%;     /* #9AA0A8 */
+
+    --accent: 222 12% 16.5%;
+    --accent-foreground: 220 13% 95.5%;
+
+    --destructive: 359 77% 55.9%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 12% 20.4%;              /* #2E323A */
+    --input: 220 12% 20.4%;
+    --ring: 359 77% 55.9%;
+
+    --success: 152 55% 45%;
+    --success-tint: 153 40% 14%;
+    --warning: 38 92% 55%;
+    --warning-tint: 32 50% 14%;
+    --primary-tint: 359 45% 16%;
+
+    --alert-ok: 152 55% 45%;
+    --alert-warning: 38 92% 55%;
+    --alert-critical: 359 77% 55.9%;
+
+    --glass-bg: 223 11% 12% / 0.92;
+    --glass-border: 220 12% 20.4% / 0.8;
+    --glass-shadow: 0 12px 32px -8px hsl(0 0% 0% / 0.5);
+
+    --online: 152 55% 45%;
+    --offline: 38 92% 55%;
+
+    --sidebar-background: 220 13% 9%;
+    --sidebar-foreground: 220 13% 95.5%;
+    --sidebar-primary: 359 77% 55.9%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 222 12% 16.5%;
+    --sidebar-accent-foreground: 220 13% 95.5%;
+    --sidebar-border: 220 12% 20.4%;
+    --sidebar-ring: 359 77% 55.9%;
   }
 }
 
@@ -67,13 +168,24 @@
     @apply border-border;
   }
 
+  html {
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+
   body {
     @apply bg-background text-foreground font-sans antialiased;
-    font-family: 'Inter', system-ui, sans-serif;
+    font-family: 'Archivo Variable', 'Archivo', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.16);
   }
 
   .font-data {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums slashed-zero;
   }
 }
 
@@ -86,14 +198,14 @@
   }
 
   .status-bar {
-    background: hsl(0 0% 3%);
-    color: hsl(42 90% 50%);
+    background: hsl(var(--foreground));
+    color: hsl(var(--background));
   }
 
   .data-table th {
-    @apply px-3 py-2 text-left text-xs font-semibold uppercase tracking-wider;
-    color: hsl(var(--primary));
-    background: hsl(0 0% 8%);
+    @apply px-3 py-2.5 text-left text-xs font-semibold;
+    color: hsl(var(--muted-foreground));
+    background: hsl(var(--muted));
   }
 
   .data-table td {

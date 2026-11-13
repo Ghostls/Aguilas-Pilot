@@ -1,0 +1,163 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+ * src/theme/bm-theme.css
+ * VALKYRON OS — Tema B&M Mantenimiento Aeronáutico v1.1
+ * v1.1: menú lateral móvil (.bm-drawer) y barra de progreso indeterminada
+ *       (.bm-indeterminate) para el cargador de sesión.
+ * Sustituye la identidad Águilas Pilot (#050505 / #E1AD01) por B&M:
+ * superficies blancas, lienzo gris acero y rojo B&M como acento.
+ *
+ * Tipografía: Archivo Variable autoalojada (@fontsource-variable/archivo).
+ *   Sin dependencia de Google Fonts: carga aunque la red del hangar sea inestable.
+ *   Ejes usados: wght 100–900, wdth 62–125 %, itálica.
+ *
+ * Paleta (usar estos hex en clases arbitrarias de Tailwind, p. ej. bg-[#D42125]/10):
+ *   Blanco        #FFFFFF  superficies (tarjetas, formularios)
+ *   Lienzo        #F2F3F5  fondo de la aplicación, bloques secundarios
+ *   Grafito       #1B1D22  texto principal, bloque oscuro de énfasis
+ *   Acero         #5F6670  texto secundario (contraste 5.9:1 sobre blanco)
+ *   Línea         #E3E5E9  bordes y divisores
+ *   Rojo B&M      #D42125  acción primaria, identidad (texto blanco encima: 5.0:1)
+ *   Rojo profundo #A9161B  hover / pressed
+ *   Rojo tinte    #FCEBEC  fondos de énfasis suave
+ *   Operativo     #18794E  / tinte #E7F5EE
+ *   Atención      #B45309  / tinte #FEF3E2
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+@import '@fontsource-variable/archivo/standard.css';
+@import '@fontsource-variable/archivo/standard-italic.css';
+
+:root {
+  --bm-white: #ffffff;
+  --bm-canvas: #f2f3f5;
+  --bm-ink: #1b1d22;
+  --bm-steel: #5f6670;
+  --bm-line: #e3e5e9;
+  --bm-red: #d42125;
+  --bm-red-deep: #a9161b;
+  --bm-red-tint: #fcebec;
+  --bm-ok: #18794e;
+  --bm-ok-tint: #e7f5ee;
+  --bm-warn: #b45309;
+  --bm-warn-tint: #fef3e2;
+  --bm-font: 'Archivo Variable', 'Archivo', ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', Roboto, sans-serif;
+}
+
+/* Raíz de cualquier vista B&M */
+.bm-app {
+  font-family: var(--bm-font);
+  color: var(--bm-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Títulos de sección: ancho levemente expandido, eco del wordmark */
+.bm-heading {
+  font-family: var(--bm-font);
+  font-stretch: 112%;
+  font-weight: 700;
+  letter-spacing: -0.012em;
+}
+
+/* Cifras protagonistas: expandida + itálica 800, como el "B&M" del logo */
+.bm-figure {
+  font-family: var(--bm-font);
+  font-stretch: 125%;
+  font-weight: 800;
+  font-style: italic;
+  letter-spacing: -0.03em;
+  line-height: 0.95;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* Cifras en tablas y listas: alineación tabular */
+.bm-num {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* Foco visible coherente con la marca (solo teclado).
+ * Los campos de formulario usan su propio anillo (borde rojo + ring 10 %). */
+.bm-app :focus-visible:not(input):not(select):not(textarea) {
+  outline: 2px solid var(--bm-red);
+  outline-offset: 2px;
+}
+.bm-app input:focus-visible,
+.bm-app select:focus-visible,
+.bm-app textarea:focus-visible {
+  outline: none;
+}
+
+/* Inputs numéricos sin flechas nativas (contadores Tach/Hobbs) */
+.bm-app input[type='number']::-webkit-outer-spin-button,
+.bm-app input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.bm-app input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* ── Movimiento: solo en respuesta a acciones del usuario ─────────────────── */
+@keyframes bm-sheet-in {
+  from { transform: translateY(32px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+@keyframes bm-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes bm-drawer-in {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+@keyframes bm-indeterminate {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(250%); }
+}
+@keyframes bm-shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+
+.bm-sheet    { animation: bm-sheet-in 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+.bm-backdrop { animation: bm-fade-in 200ms ease-out both; }
+.bm-view     { animation: bm-fade-in 180ms ease-out both; }
+.bm-drawer   { animation: bm-drawer-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+/* Barra de progreso sin porcentaje (cargador de sesión) */
+.bm-indeterminate {
+  position: relative;
+  overflow: hidden;
+}
+.bm-indeterminate::after {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: inherit;
+  background: var(--bm-red);
+  animation: bm-indeterminate 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.bm-skeleton {
+  background: linear-gradient(90deg, #eceef1 0%, #f6f7f8 50%, #eceef1 100%);
+  background-size: 200% 100%;
+  animation: bm-shimmer 1.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bm-sheet,
+  .bm-backdrop,
+  .bm-view,
+  .bm-drawer,
+  .bm-skeleton,
+  .bm-indeterminate::after {
+    animation: none;
+  }
+  .bm-app * {
+    transition-duration: 0.01ms !important;
+  }
+}

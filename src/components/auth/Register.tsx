@@ -1,6 +1,24 @@
 // src/components/auth/Register.tsx
-// VALKYRON OS v3.1 — Alta de Personal Águilas Pilot
-// FUSIÓN v2.3 + v3.0
+// VALKYRON OS v3.2 — Alta de personal · B&M MANTENIMIENTO AERONÁUTICO
+// FUSIÓN v2.3 + v3.0 + v3.1 + rebrand B&M
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v3.2 — REBRAND B&M + CONEXIONES:
+//   [UI]  Modal B&M (BmModal): hoja inferior en móvil, diálogo centrado desde
+//         md. Rangos como tarjetas seleccionables (aria-pressed), sede
+//         segmentada, campos de 48 px con texto de 16 px (sin zoom en iOS).
+//         La pantalla de éxito vive dentro del mismo modal.
+//   [CHG] Escape lo gestiona BmModal con el mismo bloqueo durante el alta
+//         (busy). El listener propio de v3.1 se retira: con los dos activos,
+//         Escape llamaba a onClose dos veces.
+//   [FIX] El temporizador de "Copiada" se cancela al desmontar (antes podía
+//         intentar actualizar estado de un modal ya cerrado).
+//   [UI]  Sin marca Águilas: placeholder de correo neutro, cabecera B&M.
+//         Se muestran etiquetas de rango (Técnico MRO…) junto al código.
+// PRESERVADO ÍNTEGRO (v3.1): cliente aislado para signUp, asignación de rol en
+//   servidor (fn_asignar_rol_operativo), reintento sin duplicar cuenta
+//   (pendingUserId), bloqueo ADMIN/CEO para no-CEO, generador de clave crypto,
+//   mínimo 8 caracteres, upsert de `perfiles` de presentación, avisos no
+//   fatales, cierre automático tras el éxito, props { onClose }.
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v3.1 (sobre v3.0):
 //   [FIX] Usuario huérfano: si la cuenta se creaba pero la asignación de rol
@@ -23,9 +41,8 @@
 //   [CHG] Selector de rangos responsive (2/3 columnas) en lugar del grid inline
 //         de 5 columnas de v2.3 (6 rangos, legible en móvil).
 //
-// PRESERVADO (v2.3): diseño, header, pantalla "Despliegue Exitoso", sedes
-//   Lara / Maturín, resumen táctico, upsert en `perfiles` (compatibilidad de
-//   presentación), pie "Strategic Human Resources Module", props { onClose }.
+// PRESERVADO (v2.3): sedes Lara / Maturín, resumen del perfil a crear, upsert en
+//   `perfiles` (compatibilidad de presentación), pie del módulo, props { onClose }.
 // REGLA DE ORO: CERO OMISIONES. GRADO MILITAR. SIEMPRE EVOLUCIÓN.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -33,10 +50,11 @@ import { useEffect, useRef, useState } from 'react';
 import { supabase, createIsolatedAuthClient } from '@/lib/supabaseClient';
 import { authLog, classifyPostgrestError, promiseWithTimeout, shortId } from '@/lib/authRecovery';
 import { useAuth } from '@/context/AuthContext';
+import { BmModal, BmField, BmNotice, bmInput, bmBtn, bmLabel } from '@/components/brand/bm-ui';
 import {
-  ShieldCheck, UserPlus, Loader2, X,
+  ShieldCheck, UserPlus, Loader2,
   Wrench, Shield, Plane, Landmark, CheckCircle2, AlertTriangle,
-  ClipboardList, CalendarCheck, Eye, EyeOff, KeyRound, Copy, RefreshCw,
+  ClipboardList, CalendarCheck, Eye, EyeOff, KeyRound, Copy, RefreshCw, MapPin,
 } from 'lucide-react';
 
 type Rol  = 'CEO' | 'ADMIN' | 'MECANICO' | 'OPERACIONES' | 'PILOTO' | 'PLANIFICADOR';
@@ -51,14 +69,14 @@ const ROLES: { id: Rol; label: string; desc: string; icon: React.ComponentType<{
   { id: 'CEO',          label: 'CEO',           desc: 'Control Total',          icon: Shield,   soloCeo: true },
 ];
 
-const INPUT_CLS = `w-full bg-black/60 border border-white/10 p-4 rounded-2xl text-white text-xs
-  outline-none focus:border-[#E1AD01] focus:bg-black transition-all placeholder:text-white/20
-  font-mono uppercase tracking-wide`;
+// [v3.2] Campos B&M (antes: negro con borde dorado)
+const INPUT_CLS = `${bmInput} uppercase placeholder:normal-case`;
 
 const SIGNUP_TIMEOUT_MS = 25000;
 const RPC_TIMEOUT_MS = 15000;
 const PASSWORD_MIN = 8;
 const SUCCESS_CLOSE_MS = 2200;
+const COPIED_MS = 2500; // [v3.2]
 
 /** Clave temporal: 12 caracteres sin ambiguos (0/O, 1/l/I), con mayúscula, minúscula, dígito y símbolo. */
 const generateTempPassword = (): string => {
@@ -104,6 +122,7 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
   });
 
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null); // [v3.2]
 
   const set = (key: keyof typeof formData, val: string) => {
     // Cambiar el correo invalida el usuario pendiente (sería otra cuenta).
@@ -111,19 +130,13 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
     setFormData(prev => ({ ...prev, [key]: val }));
   };
 
-  // [v3.1] Limpieza del cierre automático
+  // [v3.1] Limpieza del cierre automático · [v3.2] y del aviso de copiado
   useEffect(() => () => {
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
   }, []);
 
-  // [v3.1] Escape cierra (no durante el alta)
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !loading) onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [loading, onClose]);
+  // [v3.2] Escape: lo atiende BmModal (bloqueado con busy={loading}).
 
   const handleGenerate = () => {
     set('password', generateTempPassword());
@@ -135,7 +148,8 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
     try {
       await navigator.clipboard.writeText(formData.password);
       setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), COPIED_MS);
     } catch {
       setShowPassword(true);
     }
@@ -265,259 +279,221 @@ export const Register = ({ onClose }: { onClose: () => void }) => {
     }
   };
 
+  const rolActual = ROLES.find(r => r.id === formData.rol);
+
   // ── PANTALLA DE ÉXITO ─────────────────────────────────────────────────────
   if (success) {
     return (
-      <div className="fixed inset-0 bg-black/95 backdrop-blur-xl z-[200] flex items-center justify-center p-4">
-        <div className="bg-[#0a0a0a] border border-[#E1AD01]/30 w-full max-w-sm rounded-[2rem]
-                        overflow-hidden shadow-[0_0_80px_rgba(225,173,1,0.2)]
-                        animate-in zoom-in-95 duration-300 text-center p-12 space-y-6">
-          <div className="w-16 h-16 rounded-2xl bg-[#E1AD01] flex items-center justify-center mx-auto
-                          shadow-[0_0_40px_rgba(225,173,1,0.4)]">
-            <CheckCircle2 className="h-8 w-8 text-black" />
-          </div>
+      <BmModal
+        open
+        onClose={onClose}
+        title="Alta completada"
+        subtitle="B&M Mantenimiento Aeronáutico"
+        icon={<CheckCircle2 className="h-5 w-5" />}
+        tone="ok"
+        size="sm"
+        z={200}
+      >
+        <div className="space-y-5 text-center">
+          <span className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-bm-ok-tint text-bm-ok">
+            <CheckCircle2 className="h-8 w-8" />
+          </span>
           <div>
-            <p className="text-white font-black text-sm uppercase tracking-widest">Despliegue Exitoso</p>
-            <p className="text-[#E1AD01] font-mono text-[10px] mt-2 uppercase tracking-[0.3em]">
-              {formData.nombre} · {formData.rol}
+            <p className="bm-heading text-lg uppercase">{formData.nombre}</p>
+            <p className="mt-1 text-sm text-bm-steel">
+              {rolActual?.label ?? formData.rol} · Base {formData.sede}
             </p>
           </div>
           {warning ? (
             <>
-              <p className="text-amber-300 text-[10px] font-mono leading-relaxed">{warning}</p>
-              <button
-                type="button"
-                onClick={onClose}
-                className="w-full rounded-2xl bg-[#E1AD01] py-4 text-[10px] font-black uppercase tracking-widest text-black hover:bg-white"
-              >
+              <BmNotice tone="warn" className="text-left" icon={<AlertTriangle className="h-4 w-4" />}>
+                {warning}
+              </BmNotice>
+              <button type="button" onClick={onClose} className={`${bmBtn.primary} w-full`}>
                 Entendido
               </button>
             </>
           ) : (
-            <p className="text-zinc-600 text-[9px] font-mono uppercase tracking-widest">
-              Redirigiendo...
-            </p>
+            <p className="text-sm text-bm-steel" role="status">Cerrando…</p>
           )}
         </div>
-      </div>
+      </BmModal>
     );
   }
 
   // ── FORMULARIO ────────────────────────────────────────────────────────────
   return (
-    <div className="fixed inset-0 bg-black/95 backdrop-blur-xl z-[200] flex items-center justify-center p-4">
-      <div className="bg-[#0a0a0a] border border-[#E1AD01]/20 w-full max-w-xl rounded-[2.5rem]
-                      overflow-hidden shadow-[0_0_100px_rgba(225,173,1,0.12)]
-                      animate-in zoom-in-95 duration-300 max-h-[95vh] overflow-y-auto">
+    <BmModal
+      open
+      onClose={onClose}
+      busy={loading}
+      title="Alta de personal"
+      subtitle="B&M Mantenimiento Aeronáutico · Valkyron OS"
+      icon={<UserPlus className="h-5 w-5" />}
+      tone="red"
+      size="lg"
+      z={200}
+    >
+      <form onSubmit={handleRegister} className="space-y-6">
 
-        {/* HEADER */}
-        <div className="p-6 bg-[#E1AD01] flex justify-between items-center text-black">
-          <div className="flex items-center gap-3">
-            <UserPlus className="h-5 w-5" />
-            <div>
-              <h3 className="font-black uppercase text-[10px] tracking-[0.3em] italic leading-none">
-                Alta de Personal
-              </h3>
-              <p className="text-[8px] font-bold opacity-60 uppercase tracking-widest mt-0.5">
-                Águilas Pilot · Valkyron OS
-              </p>
+        {/* ERROR */}
+        {error && (
+          <BmNotice tone="danger" role="alert" icon={<AlertTriangle className="h-4 w-4" />}>
+            {error}
+          </BmNotice>
+        )}
+
+        {/* USUARIO CREADO SIN ROL */}
+        {pendingUserId && (
+          <BmNotice tone="warn" icon={<RefreshCw className="h-4 w-4" />}>
+            La cuenta ya fue creada. Solo falta asignar el rol: pulse <strong>Reintentar asignación de rol</strong>.
+          </BmNotice>
+        )}
+
+        {/* SELECTOR DE RANGO */}
+        <fieldset className="space-y-2.5">
+          <legend className={`${bmLabel} mb-2.5`}>Rango de autoridad</legend>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {rolesDisponibles.map(rol => {
+              const Icon   = rol.icon;
+              const active = formData.rol === rol.id;
+              return (
+                <button key={rol.id} type="button"
+                  aria-pressed={active}
+                  onClick={() => set('rol', rol.id)}
+                  className={`relative flex min-h-[88px] flex-col items-start gap-2 rounded-2xl border p-3.5 text-left transition-colors ${
+                    active
+                      ? 'border-bm-red bg-bm-red-tint text-bm-ink ring-4 ring-bm-red/10'
+                      : 'border-bm-line bg-white text-bm-ink hover:border-bm-field'
+                  }`}>
+                  <span className={`flex h-9 w-9 items-center justify-center rounded-xl ${active ? 'bg-bm-red text-white' : 'bg-bm-canvas text-bm-steel'}`}>
+                    <Icon className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-semibold leading-tight">{rol.label}</span>
+                    <span className="mt-0.5 block text-xs leading-tight text-bm-steel">{rol.desc}</span>
+                  </span>
+                  {active && <CheckCircle2 className="absolute right-3 top-3 h-4 w-4 text-bm-red" aria-hidden="true" />}
+                </button>
+              );
+            })}
+          </div>
+          {!esCeo && (
+            <p className="text-[13px] text-bm-steel">
+              Los cargos ADMIN y CEO solo pueden ser asignados por el CEO.
+            </p>
+          )}
+        </fieldset>
+
+        {/* IDENTIDAD + SEDE */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <BmField label="Nombre completo" htmlFor="rg-nombre" required>
+            <input id="rg-nombre" required className={INPUT_CLS}
+              placeholder="Nombre y apellido"
+              autoComplete="off"
+              value={formData.nombre}
+              onChange={e => set('nombre', e.target.value)}
+            />
+          </BmField>
+          <div className="space-y-2">
+            <span className={`${bmLabel} flex items-center gap-1`} id="rg-sede-label">
+              <MapPin className="h-4 w-4 text-bm-steel" /> Sede asignada
+            </span>
+            <div role="group" aria-labelledby="rg-sede-label" className="flex h-12 rounded-xl border border-bm-field bg-white p-1">
+              {(['Lara', 'Maturín'] as Sede[]).map(loc => (
+                <button key={loc} type="button"
+                  aria-pressed={formData.sede === loc}
+                  onClick={() => set('sede', loc)}
+                  className={`flex-1 rounded-lg text-[15px] transition-colors ${
+                    formData.sede === loc
+                      ? 'bg-bm-ink font-semibold text-white'
+                      : 'font-medium text-bm-steel hover:text-bm-ink'}`}>
+                  {loc}
+                </button>
+              ))}
             </div>
           </div>
-          <button type="button" onClick={onClose} disabled={loading}
-            aria-label="Cerrar"
-            className="hover:rotate-90 transition-transform duration-300
-                       w-8 h-8 flex items-center justify-center disabled:opacity-40">
-            <X className="h-5 w-5" />
-          </button>
         </div>
 
-        <form onSubmit={handleRegister} className="p-8 space-y-7 font-mono">
-
-          {/* ERROR */}
-          {error && (
-            <div role="alert" className="flex items-start gap-3 bg-red-500/5 border border-red-500/20 rounded-2xl p-4">
-              <AlertTriangle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
-              <p className="text-[10px] text-red-400 uppercase leading-relaxed">{error}</p>
-            </div>
-          )}
-
-          {/* USUARIO CREADO SIN ROL */}
-          {pendingUserId && (
-            <div className="flex items-start gap-3 bg-amber-500/5 border border-amber-500/25 rounded-2xl p-4">
-              <RefreshCw className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-              <p className="text-[10px] text-amber-300 uppercase leading-relaxed">
-                La cuenta ya fue creada. Solo falta asignar el rol: pulse "Reintentar asignación".
-              </p>
-            </div>
-          )}
-
-          {/* SELECTOR DE RANGO */}
-          <div className="space-y-3">
-            <label className="text-[9px] text-[#E1AD01] font-black uppercase tracking-[0.25em] block">
-              Rango de Autoridad
-            </label>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-              {rolesDisponibles.map(rol => {
-                const Icon   = rol.icon;
-                const active = formData.rol === rol.id;
-                return (
-                  <button key={rol.id} type="button"
-                    onClick={() => set('rol', rol.id)}
-                    className={`relative p-4 rounded-2xl border transition-all flex flex-col items-center
-                                gap-2.5 group overflow-hidden
-                                ${active
-                                  ? 'bg-[#E1AD01] border-[#E1AD01] text-black shadow-[0_0_30px_rgba(225,173,1,0.25)]'
-                                  : 'bg-white/[0.03] border-white/[0.06] text-slate-500 hover:border-white/10 hover:bg-white/[0.06]'
-                                }`}>
-                    {active && (
-                      <div className="absolute inset-0 bg-gradient-to-b from-white/10 to-transparent pointer-events-none" />
-                    )}
-                    <Icon className={`h-5 w-5 relative z-10 ${active ? 'text-black' : 'group-hover:text-[#E1AD01] transition-colors'}`} />
-                    <div className="text-center relative z-10">
-                      <p className={`text-[9px] font-black uppercase leading-none ${active ? 'text-black' : ''}`}>
-                        {rol.label}
-                      </p>
-                      <p className={`text-[7px] mt-1 font-bold leading-tight ${active ? 'text-black/60' : 'text-slate-600'}`}>
-                        {rol.desc}
-                      </p>
-                    </div>
-                    {active && (
-                      <CheckCircle2 className="absolute top-2 right-2 h-3 w-3 text-black/40" />
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-            {!esCeo && (
-              <p className="text-[8px] text-zinc-600 uppercase tracking-wider">
-                Los cargos ADMIN y CEO solo pueden ser asignados por el CEO.
-              </p>
-            )}
-          </div>
-
-          {/* IDENTIDAD + SEDE */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
-                Nombre Completo *
+        {/* CREDENCIALES */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <BmField label="Correo corporativo" htmlFor="rg-email" required>
+            <input id="rg-email" type="email" required className={bmInput}
+              placeholder="nombre.apellido@empresa.com"
+              autoComplete="off"
+              inputMode="email"
+              value={formData.email}
+              onChange={e => set('email', e.target.value)}
+            />
+          </BmField>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="rg-clave" className={`${bmLabel} flex items-center gap-1`}>
+                Clave de acceso <span className="text-bm-red" aria-hidden="true">*</span>
               </label>
-              <input required className={INPUT_CLS}
-                placeholder="NOMBRE DEL OPERADOR"
-                value={formData.nombre}
-                onChange={e => set('nombre', e.target.value)}
+              <button type="button" onClick={handleGenerate} disabled={!!pendingUserId}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg px-2 text-[13px] font-semibold text-bm-red hover:bg-bm-red-tint disabled:opacity-40">
+                <KeyRound className="h-3.5 w-3.5" /> Generar clave
+              </button>
+            </div>
+            <div className="relative">
+              <input id="rg-clave" type={showPassword ? 'text' : 'password'} required minLength={PASSWORD_MIN}
+                className={`${bmInput} font-data pr-24`}
+                placeholder="••••••••"
+                autoComplete="new-password"
+                value={formData.password}
+                disabled={!!pendingUserId}
+                onChange={e => set('password', e.target.value)}
               />
-            </div>
-            <div className="space-y-2">
-              <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
-                Sede Asignada
-              </label>
-              <div className="flex bg-black/60 rounded-2xl p-1 border border-white/10 h-[52px]">
-                {(['Lara', 'Maturín'] as Sede[]).map(loc => (
-                  <button key={loc} type="button"
-                    onClick={() => set('sede', loc)}
-                    className={`flex-1 rounded-xl text-[10px] font-black uppercase transition-all
-                                ${formData.sede === loc
-                                  ? 'bg-[#E1AD01]/15 text-[#E1AD01] border border-[#E1AD01]/30'
-                                  : 'text-slate-600 hover:text-slate-400'}`}>
-                    {loc}
+              <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center">
+                {formData.password && (
+                  <button type="button" onClick={() => void handleCopy()}
+                    aria-label={copied ? 'Clave copiada' : 'Copiar clave'}
+                    className="flex h-9 w-9 items-center justify-center rounded-lg text-bm-steel hover:bg-bm-canvas hover:text-bm-ink">
+                    {copied ? <CheckCircle2 className="h-4 w-4 text-bm-ok" /> : <Copy className="h-4 w-4" />}
                   </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* CREDENCIALES */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
-                Email Corporativo *
-              </label>
-              <input type="email" required className={INPUT_CLS}
-                placeholder="ID@AGUILAS.COM"
-                style={{ textTransform: 'none' }}
-                value={formData.email}
-                onChange={e => set('email', e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-[9px] text-slate-500 font-black uppercase tracking-widest block">
-                  Clave de Acceso *
-                </label>
-                <button type="button" onClick={handleGenerate} disabled={!!pendingUserId}
-                  className="flex items-center gap-1 text-[8px] font-black uppercase tracking-widest text-[#E1AD01]/70 hover:text-[#E1AD01] disabled:opacity-30">
-                  <KeyRound className="h-3 w-3" /> Generar clave
+                )}
+                <button type="button" onClick={() => setShowPassword(v => !v)}
+                  aria-label={showPassword ? 'Ocultar clave' : 'Mostrar clave'}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg text-bm-steel hover:bg-bm-canvas hover:text-bm-ink">
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
               </div>
-              <div className="relative">
-                <input type={showPassword ? 'text' : 'password'} required minLength={PASSWORD_MIN}
-                  className={`${INPUT_CLS} pr-20`}
-                  placeholder="••••••••"
-                  autoComplete="new-password"
-                  style={{ textTransform: 'none' }}
-                  value={formData.password}
-                  disabled={!!pendingUserId}
-                  onChange={e => set('password', e.target.value)}
-                />
-                <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
-                  {formData.password && (
-                    <button type="button" onClick={() => void handleCopy()}
-                      aria-label="Copiar clave"
-                      className="text-slate-600 hover:text-[#E1AD01] transition-colors">
-                      {copied ? <CheckCircle2 className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
-                    </button>
-                  )}
-                  <button type="button" onClick={() => setShowPassword(v => !v)}
-                    aria-label={showPassword ? 'Ocultar clave' : 'Mostrar clave'}
-                    className="text-slate-600 hover:text-[#E1AD01] transition-colors">
-                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
-              </div>
-              <p className="text-[8px] text-zinc-600 uppercase tracking-wider">
-                Mínimo {PASSWORD_MIN} caracteres. Entréguela al operador por un canal seguro.
-              </p>
             </div>
+            <p className="text-[13px] text-bm-steel">
+              Mínimo {PASSWORD_MIN} caracteres. Entréguela al operador por un canal seguro.
+            </p>
           </div>
-
-          {/* RESUMEN TÁCTICO */}
-          <div className="bg-white/[0.02] border border-white/[0.05] rounded-2xl p-4
-                          flex items-center justify-between">
-            <div>
-              <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">
-                Perfil a crear
-              </p>
-              <p className="text-white font-black text-xs uppercase">
-                {formData.nombre || '—'} · <span className="text-[#E1AD01]">{formData.rol}</span>
-              </p>
-              <p className="text-zinc-600 text-[9px] font-mono mt-0.5">
-                BASE {formData.sede.toUpperCase()} · {formData.email || 'sin email'}
-              </p>
-            </div>
-            <ShieldCheck className="h-8 w-8 text-[#E1AD01]/20" />
-          </div>
-
-          {/* SUBMIT */}
-          <button type="submit" disabled={loading}
-            className="w-full bg-[#E1AD01] text-black font-black py-5 rounded-2xl uppercase
-                       text-[10px] tracking-[0.4em] shadow-xl hover:bg-white transition-all
-                       flex items-center justify-center gap-3 disabled:opacity-40
-                       hover:shadow-[0_0_40px_rgba(225,173,1,0.3)]">
-            {loading
-              ? <Loader2 className="h-5 w-5 animate-spin" />
-              : pendingUserId
-                ? <><RefreshCw className="h-4 w-4" /> Reintentar asignación de rol</>
-                : <><UserPlus className="h-4 w-4" /> Ejecutar Alta de Personal</>
-            }
-          </button>
-        </form>
-
-        <div className="border-t border-white/5 p-4 text-center">
-          <p className="text-[7px] text-slate-700 font-black uppercase tracking-[0.4em]">
-            Valkyron OS — Strategic Human Resources Module
-          </p>
         </div>
-      </div>
-    </div>
+
+        {/* RESUMEN DEL PERFIL A CREAR */}
+        <div className="flex items-center justify-between gap-4 rounded-2xl bg-bm-canvas p-4">
+          <div className="min-w-0">
+            <p className="text-xs text-bm-steel">Perfil a crear</p>
+            <p className="mt-0.5 truncate text-sm font-semibold uppercase">
+              {formData.nombre || '—'} · <span className="text-bm-red">{rolActual?.label ?? formData.rol}</span>
+            </p>
+            <p className="mt-0.5 truncate text-[13px] text-bm-steel">
+              Base {formData.sede} · {formData.email || 'sin correo'}
+            </p>
+          </div>
+          <ShieldCheck className="h-8 w-8 shrink-0 text-bm-red/30" aria-hidden="true" />
+        </div>
+
+        {/* SUBMIT */}
+        <button type="submit" disabled={loading} className={`${bmBtn.primary} w-full`}>
+          {loading
+            ? <><Loader2 className="h-5 w-5 animate-spin" /> Procesando alta…</>
+            : pendingUserId
+              ? <><RefreshCw className="h-4 w-4" /> Reintentar asignación de rol</>
+              : <><UserPlus className="h-4 w-4" /> Dar de alta</>
+          }
+        </button>
+
+        <p className="text-center text-xs text-bm-hint">
+          Valkyron OS · Módulo de alta de personal
+        </p>
+      </form>
+    </BmModal>
   );
 };

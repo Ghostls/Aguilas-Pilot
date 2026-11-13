@@ -1,7 +1,48 @@
-﻿// src/pages/Index.tsx
-// VALKYRON OS v7.2 — Archivo OMA + Stock completo + Impresión
-// FUSIÓN v6.1 + v7.0
+// src/pages/Index.tsx
+// VALKYRON OS v7.3.3 — Archivo OMA + Stock completo + Impresión · B&M MANTENIMIENTO AERONÁUTICO
+// FUSIÓN v6.1 + v7.0 + v7.1 + rebrand B&M
 // ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v7.3.3:
+//   [UI]  Registro de vuelo (FlightRegister v7.1) y Alta de personal
+//         (Register v3.2) ya son B&M: se retiran LegacyModuleFrame y el
+//         envoltorio oscuro del modal de alta.
+//
+// CHANGELOG v7.3.2:
+//   [UI]  Flota (FleetDashboard v5.7), Combustible (FuelPanel v4.4) y Proveedores
+//         (VendorPanel v2.0) ya son B&M: se retiran de LegacyModuleFrame.
+//   [FIX] onCheckoutSuccess: un repuesto con P/N nulo rompía la actualización
+//         del stock tras una salida (p.partNumber.toUpperCase()).
+//
+// CHANGELOG v7.3.1:
+//   [FIX] StatusBar recibe onOpenRegister solo si el rol puede dar de alta
+//         (CEO, ADMIN, DIRECTOR). Antes la barra mostraba el botón únicamente al
+//         CEO y ADMIN/DIRECTOR no podían abrir el alta. Misma regla de seguridad.
+//   [UI]  Hangar MRO (ControlHub v5.7), Stock (InventoryPanel v2.5) y Salidas
+//         (InventoryCheckout v2.2) ya son B&M: se retiran de LegacyModuleFrame.
+//
+// CHANGELOG v7.3 — REBRAND B&M (solo presentación):
+//   [UI]  Shell B&M: lienzo #F2F3F5, superficies blancas, rojo B&M como acento.
+//         Escritorio (lg+): barra lateral fija con logo, módulos y tarjeta de
+//         usuario + Cerrar sesión. Móvil: barra superior con logo y botón Menú,
+//         que abre un panel lateral con los mismos módulos.
+//   [UI]  Encabezado de sección con ícono rojo, nombre y operador. En Inicio se
+//         omite (HomeDashboard trae su propio encabezado). Los botones Archivo
+//         Histórico OMA / Imprimir inventario / Archivo de inventario pasan al
+//         encabezado, con las mismas condiciones de rol y estado.
+//   [UI]  ModuleLoading, ModuleError, banner de sincronización y pantalla de
+//         Acceso pendiente con estética B&M. Footer con marca B&M.
+//   [UI]  LegacyModuleFrame: los módulos que aún tienen estética Águilas (fondo
+//         negro fijo y texto blanco heredado) se muestran dentro de un marco
+//         oscuro .dark para que sigan legibles en el shell claro. Se retira
+//         módulo a módulo a medida que se migran. HomeDashboard ya va sin marco.
+//   [UI]  Impresión de inventario con encabezado B&M (rojo en lugar de dorado).
+//   [UX]  Panel móvil: cierra tocando fuera, con la X, con Escape (v7.1) o al
+//         elegir un módulo; bloquea el scroll de fondo mientras está abierto.
+// PRESERVADO ÍNTEGRO (v7.1): matriz de tabs por rol, carga por rol con timeout y
+//   AbortController, aislamiento por usuario, pestaña recordada, navegación
+//   desde archivos, realtime de flota con debounce, guard de módulos, impresión,
+//   handleLogout, todos los módulos con sus props.
+//
 // CHANGELOG v7.1 (sobre v7.0):
 //   [FIX] Cambio de usuario con el mismo rol: la carga no se repetía (mismas
 //         dependencias) y se mostraban flota/stock/proveedores del usuario
@@ -63,6 +104,7 @@ import { FlightCalendar } from '@/components/FlightCalendar';
 import FlightPlanningBoard from '@/components/FlightPlanningboard';
 import PlannerHangar from '@/components/PlannerHangar';
 import { AuthLoader, AuthRecoveryPanel } from '@/components/AuthRecoveryPanel';
+import { BmLogo } from '@/components/brand/BmLogo'; // [v7.3] identidad B&M
 import { useAuth, type UserRole } from '@/context/AuthContext';
 import type { WorkOrder, Vendor, SparePart, Aircraft } from '@/Types/Maintenance';
 import type { LucideIcon } from 'lucide-react';
@@ -93,6 +135,18 @@ const tabs: { key: TabKey; label: string; icon: LucideIcon }[] = [
   { key: 'vendors',         label: 'Aliados',           icon: Truck          },
   { key: 'calendario',      label: 'Calendario',        icon: CalendarDays   },
 ];
+
+// [v7.3] Nombre legible del rol (solo presentación; los permisos no cambian)
+const ROLE_LABELS: Record<string, string> = {
+  CEO: 'CEO',
+  ADMIN: 'Administración',
+  DIRECTOR: 'Dirección',
+  MECANICO: 'Mecánico',
+  OPERACIONES: 'Operaciones',
+  PILOTO: 'Piloto',
+  CAPITAN: 'Capitán',
+  PLANIFICADOR: 'Planificador de vuelo',
+};
 
 // ─── DATOS POR ROL ────────────────────────────────────────────────────────────
 // Solo se consulta lo que el rol puede ver. La autorización real la aplica RLS.
@@ -146,26 +200,49 @@ const normalizeStatus = (raw: string): AircraftStatus => {
 
 // ─── COMPONENTES AUXILIARES ───────────────────────────────────────────────────
 
+// [v7.3] Clases compartidas de botones del shell
+const btnPrimary =
+  'inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-bm-red px-5 text-sm font-semibold text-white ' +
+  'transition hover:bg-bm-red-deep active:scale-[0.99]';
+const btnSecondary =
+  'inline-flex h-11 items-center justify-center gap-2 rounded-xl border border-bm-line bg-white px-4 text-sm font-semibold ' +
+  'text-bm-ink transition-colors hover:border-bm-red hover:text-bm-red ' +
+  'disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-bm-line disabled:hover:text-bm-ink';
+
 const ModuleLoading: React.FC<{ label: string }> = ({ label }) => (
-  <div className="flex flex-col items-center justify-center gap-4 rounded-3xl border border-white/10 bg-[#080808] py-24">
-    <Loader2 className="h-7 w-7 animate-spin text-[#E1AD01]" />
-    <p className="text-[9px] font-black uppercase tracking-[0.3em] text-slate-500">{label}</p>
+  <div className="flex flex-col items-center justify-center gap-3 rounded-[24px] border border-bm-line bg-white py-20" role="status">
+    <Loader2 className="h-7 w-7 animate-spin text-bm-red" />
+    <p className="text-sm font-medium text-bm-steel">{label}</p>
   </div>
 );
 
 const ModuleError: React.FC<{ recurso: string; error: string | null; onRetry: () => void }> = ({ recurso, error, onRetry }) => (
-  <div role="alert" className="rounded-3xl border border-red-500/25 bg-red-500/[0.05] p-8 text-center">
-    <AlertTriangle className="mx-auto h-7 w-7 text-red-400" />
-    <p className="mt-4 text-[11px] font-black uppercase tracking-widest text-red-400">No se pudo cargar {recurso}</p>
-    <p className="mt-2 text-[10px] font-mono text-red-300/70">{error ?? 'Error desconocido'}</p>
-    <p className="mt-2 text-[10px] text-slate-500">Los datos mostrados no están verificados; no se presentan como vacíos.</p>
+  <div role="alert" className="rounded-[24px] border border-bm-red/25 bg-white px-5 py-10 sm:p-10 text-center">
+    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-bm-red-tint text-bm-red">
+      <AlertTriangle className="h-5 w-5" />
+    </div>
+    <p className="mt-4 text-base font-semibold text-bm-ink">No se pudo cargar {recurso}</p>
+    <p className="mx-auto mt-3 max-w-md rounded-xl bg-bm-canvas px-3 py-2 font-data text-xs text-bm-steel break-words">{error ?? 'Error desconocido'}</p>
+    <p className="mx-auto mt-3 max-w-sm text-[13px] leading-relaxed text-bm-steel">Los datos mostrados no están verificados; no se presentan como vacíos.</p>
     <button
       type="button"
       onClick={onRetry}
-      className="mt-6 inline-flex items-center gap-2 rounded-2xl bg-[#E1AD01] px-6 py-3 text-[10px] font-black uppercase tracking-widest text-black hover:bg-white"
+      className={`${btnPrimary} mt-6`}
     >
       <RefreshCw className="h-4 w-4" /> Reintentar
     </button>
+  </div>
+);
+
+/**
+ * [v7.3] Marco temporal para módulos que aún conservan la estética Águilas
+ * (fondo negro fijo y texto blanco heredado del shell anterior). La clase .dark
+ * aplica la variante nocturna B&M a los componentes shadcn internos.
+ * Se elimina de cada módulo cuando ese módulo se migra a B&M.
+ */
+const LegacyModuleFrame: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <div className="dark rounded-[24px] bg-[#050505] p-3 text-white sm:p-5">
+    {children}
   </div>
 );
 
@@ -400,12 +477,13 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
     const w = window.open('', '_blank', 'width=1200,height=900');
     if (!w) { window.alert('Habilita las ventanas emergentes para imprimir.'); return; }
     const rows = partsData.map(p => `<tr><td>${escape(p.partNumber)}</td><td>${escape(p.name)}</td><td>${escape(p.quantity)}</td><td>${escape(p.minStock)}</td><td>${escape(p.location)}</td><td>${escape(p.category)}</td><td>${escape(p.unitPrice)}</td></tr>`).join('');
-    w.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Águilas Pilot — Inventario</title><style>
-      @page{size:A4 landscape;margin:12mm}body{font-family:Arial,sans-serif;padding:18px;color:#111}
-      h1{font-size:20px;border-bottom:3px solid #d6a900;padding-bottom:12px}p{font-size:10px;color:#666}
-      table{width:100%;border-collapse:collapse;font-size:9px}td,th{border:1px solid #bbb;padding:6px;text-align:left;overflow-wrap:anywhere}
-      th{background:#eee}thead{display:table-header-group}tr{break-inside:avoid}</style></head><body>
-      <h1>ÁGUILAS PILOT — INVENTARIO GENERAL</h1><p>Fecha: ${escape(new Date().toLocaleString('es-VE'))} · Referencias: ${partsData.length}</p>
+    // [v7.3] Encabezado de impresión con marca B&M (rojo #D42125 en lugar de dorado)
+    w.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>B&amp;M Mantenimiento Aeronáutico — Inventario</title><style>
+      @page{size:A4 landscape;margin:12mm}body{font-family:Arial,sans-serif;padding:18px;color:#1b1d22}
+      h1{font-size:20px;border-bottom:3px solid #d42125;padding-bottom:12px}p{font-size:10px;color:#5f6670}
+      table{width:100%;border-collapse:collapse;font-size:9px}td,th{border:1px solid #c9ccd2;padding:6px;text-align:left;overflow-wrap:anywhere}
+      th{background:#f2f3f5}thead{display:table-header-group}tr{break-inside:avoid}</style></head><body>
+      <h1>B&amp;M MANTENIMIENTO AERONÁUTICO — INVENTARIO GENERAL</h1><p>Fecha: ${escape(new Date().toLocaleString('es-VE'))} · Referencias: ${partsData.length}</p>
       <p>Existencias registradas en Supabase. Requieren conciliación física para certificar inventario.</p>
       <table><thead><tr><th>P/N</th><th>Descripción</th><th>Cantidad</th><th>Mínimo</th><th>Ubicación</th><th>Categoría</th><th>Precio unitario</th></tr></thead><tbody>${rows}</tbody></table></body></html>`);
     w.document.close(); w.focus(); w.print();
@@ -426,6 +504,14 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
+  }, [isMobileMenuOpen]);
+
+  // [v7.3] Bloquear el scroll del fondo mientras el panel móvil está abierto
+  useEffect(() => {
+    if (!isMobileMenuOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
   }, [isMobileMenuOpen]);
 
   const handleLogout = async () => {
@@ -475,7 +561,7 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
 
   // ── ESTADOS DE SESIÓN ────────────────────────────────────────────────────
   if (status === 'loading' || (status === 'authenticated' && !enriched)) {
-    return <AuthLoader label="Sincronizando Águilas OS..." />;
+    return <AuthLoader label="Sincronizando B&M…" />;
   }
 
   if (status === 'error') {
@@ -485,14 +571,17 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
   if (status !== 'authenticated' || !role) {
     if (issue && issue !== 'PERMISSIONS_PENDING') return <AuthRecoveryPanel fullScreen />;
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[#020202] p-8 text-center text-white">
-        <div className="max-w-md">
-          <h2 className="text-xl font-black">ACCESO PENDIENTE</h2>
-          <p className="mt-3 text-sm text-slate-400">Tu rol debe ser asignado por administración.</p>
-          <p className="mt-2 text-xs text-slate-600">Si ya fue asignado, pulsa Reintentar para volver a verificar.</p>
-          <div className="mt-6 flex flex-wrap justify-center gap-3">
-            <button onClick={retry} className="rounded-lg bg-[#E1AD01] px-5 py-3 text-black font-bold">Reintentar</button>
-            <button onClick={() => void handleLogout()} className="rounded-lg border border-white/15 px-5 py-3 text-slate-300">Cerrar sesión</button>
+      <div className="bm-app flex min-h-[100dvh] items-center justify-center bg-bm-canvas px-5 py-10 text-bm-ink">
+        <div className="w-full max-w-md rounded-[24px] border border-bm-line bg-white p-6 text-left shadow-bm-pop sm:p-8">
+          <BmLogo variant="compact" className="h-9 w-auto text-bm-red" />
+          <h2 className="bm-heading mt-8 text-2xl leading-tight">Acceso pendiente</h2>
+          <p className="mt-3 text-sm leading-relaxed text-bm-steel">Su rol debe ser asignado por administración.</p>
+          <p className="mt-2 text-[13px] leading-relaxed text-bm-steel">Si ya fue asignado, pulse Reintentar para volver a verificar.</p>
+          <div className="mt-7 grid gap-2.5 sm:grid-cols-2">
+            <button onClick={retry} className={`${btnPrimary} h-12 w-full`}>Reintentar</button>
+            <button onClick={() => void handleLogout()} className={`${btnSecondary} h-12 w-full`}>
+              <LogOut className="h-4 w-4" /> Cerrar sesión
+            </button>
           </div>
         </div>
       </div>
@@ -506,333 +595,354 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
   ].filter(d => d.state.status === 'error');
   const loadingLoads = [fleetState, partsState, vendorsState].some(s => s.status === 'loading');
 
-  // ── RENDER ────────────────────────────────────────────────────────────────
-  return (
-    <div className="flex min-h-screen flex-col bg-[#020202] text-white font-sans text-left overflow-x-hidden">
-      {!isPlanner && (
-        <StatusBar onOpenRegister={() => {
-          if (canRegisterStaff) setIsRegisterOpen(true);
-        }} />
-      )}
+  // ── [v7.3] DATOS DE PRESENTACIÓN DEL SHELL ───────────────────────────────
+  const currentTab = tabs.find(t => t.key === safeTab);
+  const CurrentIcon = currentTab?.icon || Home;
+  const operatorName = userProfile?.nombre_completo || 'Root';
+  const roleLabel = userProfile?.rol ? (ROLE_LABELS[userProfile.rol] ?? userProfile.rol) : 'Sin rol';
+  const sedeLabel = userProfile?.sede ? `sede ${userProfile.sede}` : '';
+  const initials = operatorName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(w => w.charAt(0).toUpperCase())
+    .join('') || 'B';
+  const showDataBanner = failedLoads.length > 0 || loadingLoads;
+  const topPad = safeTab === 'home' ? 'pt-3 sm:pt-6' : '';
 
-      {/* NAV v4.23 — COMPACTO Y RESPONSIVE */}
-      <nav className="sticky top-0 z-50 w-full px-2 pt-3">
-        <div className="relative mx-auto flex w-full max-w-[1920px] min-w-0 items-center rounded-2xl border border-white/10 bg-[#0a0a0a]/95 px-1 py-1 shadow-2xl backdrop-blur-2xl">
-
-          {/* BOTÓN MÓVIL */}
+  /** [v7.3] Navegación compartida: barra lateral (escritorio) y panel móvil. */
+  const renderNav = (onAfterSelect?: () => void, inDrawer = false) => (
+    <>
+      <div className="flex h-16 shrink-0 items-center justify-between gap-3 px-5 lg:h-20">
+        <BmLogo variant="compact" className="h-8 w-auto text-bm-red lg:h-9" />
+        {inDrawer && (
           <button
             type="button"
-            aria-label="Abrir menú"
-            aria-expanded={isMobileMenuOpen}
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-            className="flex items-center gap-2 rounded-xl p-3 text-[#E1AD01] lg:hidden"
+            aria-label="Cerrar menú"
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="flex h-10 w-10 items-center justify-center rounded-full bg-bm-canvas text-bm-ink hover:bg-bm-red-tint hover:text-bm-red"
           >
-            {isMobileMenuOpen
-              ? <X className="h-5 w-5" />
-              : <Menu className="h-5 w-5" />}
-            <span className="text-xs font-bold">MENÚ</span>
+            <X className="h-5 w-5" />
           </button>
+        )}
+      </div>
 
-          {/* NAVEGACIÓN ESCRITORIO */}
-          <div className="hidden w-full min-w-0 items-center lg:flex">
+      <nav aria-label="Módulos" className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
+        <ul className="space-y-0.5">
+          {visibleTabs.map(tab => {
+            const Icon = tab.icon;
+            const active = safeTab === tab.key;
 
-            <div className="flex min-w-0 flex-1 items-center justify-between gap-0.5">
-              {visibleTabs.map(tab => {
-                const Icon = tab.icon;
-
-                return (
-                  <button
-                    type="button"
-                    key={tab.key}
-                    onClick={() => setActiveTab(tab.key)}
-                    title={tab.label}
-                    className={`
-                      flex h-10 min-w-0 shrink items-center justify-center
-                      gap-1 whitespace-nowrap rounded-lg border
-                      px-1.5 text-[8px] font-black uppercase
-                      tracking-normal transition-all
-                      xl:px-2 xl:text-[9px]
-                      2xl:gap-1.5 2xl:px-2.5
-                      ${
-                        safeTab === tab.key
-                          ? 'border-[#E1AD01]/25 bg-white/5 text-[#E1AD01]'
-                          : 'border-transparent text-slate-500 hover:bg-white/[0.04] hover:text-white'
-                      }
-                    `}
-                  >
-                    <Icon
-                      className={`h-3 w-3 shrink-0 2xl:h-3.5 2xl:w-3.5 ${
-                        safeTab === tab.key ? '' : 'opacity-50'
-                      }`}
-                    />
-
-                    <span className="whitespace-nowrap">
-                      {tab.label}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* CERRAR SESIÓN */}
-            <div className="mx-1.5 h-5 w-px shrink-0 bg-white/10" />
-
-            <button
-              type="button"
-              onClick={() => void handleLogout()}
-              title="Cerrar sesión"
-              className="flex h-10 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-lg px-1.5 text-[8px] font-black uppercase tracking-normal text-red-500/70 transition-all hover:bg-red-500/5 hover:text-red-400 xl:px-2 xl:text-[9px]"
-            >
-              <LogOut className="h-3 w-3 shrink-0" />
-              <span>Cerrar sesión</span>
-            </button>
-          </div>
-
-          {/* NAVEGACIÓN MÓVIL */}
-          {isMobileMenuOpen && (
-            <div className="absolute left-2 right-2 top-full mt-2 max-h-[80vh] overflow-y-auto rounded-xl border border-white/10 bg-[#0a0a0a] p-3 shadow-2xl lg:hidden">
-
-              <div className="grid grid-cols-2 gap-2">
-                {visibleTabs.map(tab => {
-                  const Icon = tab.icon;
-
-                  return (
-                    <button
-                      type="button"
-                      key={tab.key}
-                      onClick={() => {
-                        setActiveTab(tab.key);
-                        setIsMobileMenuOpen(false);
-                      }}
-                      className={`flex min-h-11 items-center gap-2 rounded-lg border px-3 py-2 text-left text-[10px] font-bold uppercase ${
-                        safeTab === tab.key
-                          ? 'border-[#E1AD01]/25 bg-white/5 text-[#E1AD01]'
-                          : 'border-transparent text-slate-500'
-                      }`}
-                    >
-                      <Icon className="h-4 w-4 shrink-0" />
-                      <span>{tab.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="my-3 h-px bg-white/10" />
-
-              <button
-                type="button"
-                onClick={() => void handleLogout()}
-                className="flex w-full items-center gap-2 rounded-lg px-3 py-3 text-xs font-bold uppercase text-red-400"
-              >
-                <LogOut className="h-4 w-4" />
-                Cerrar sesión
-              </button>
-            </div>
-          )}
-        </div>
+            return (
+              <li key={tab.key}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab(tab.key);
+                    onAfterSelect?.();
+                  }}
+                  aria-current={active ? 'page' : undefined}
+                  className={`flex h-11 w-full items-center gap-3 rounded-xl px-3 text-left text-[14px] transition-colors ${
+                    active
+                      ? 'bg-bm-red-tint font-semibold text-bm-red'
+                      : 'font-medium text-bm-steel hover:bg-bm-canvas hover:text-bm-ink'
+                  }`}
+                >
+                  <Icon className="h-[18px] w-[18px] shrink-0" />
+                  <span className="truncate">{tab.label}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
       </nav>
 
-      {/* HEADER */}
-      <header className="px-6 md:px-8 py-8 flex justify-between items-center gap-6 text-left">
-        <h2 className="text-2xl md:text-3xl font-black text-white tracking-tighter flex items-center gap-4 uppercase italic">
-          <div className="p-3 bg-[#E1AD01] rounded-2xl shadow-[0_10px_30px_rgba(225,173,1,0.2)] flex-shrink-0 text-black">
-            {(() => {
-              const currentTab = tabs.find(t => t.key === safeTab);
-              const Icon = currentTab?.icon || Home;
-              return <Icon className="h-6 w-6" />;
-            })()}
-          </div>
-          <div className="flex flex-col">
-            <span className="leading-none">{tabs.find(t => t.key === safeTab)?.label}</span>
-            <span className="text-[8px] text-[#E1AD01] font-mono tracking-[0.6em] mt-2 opacity-70 uppercase">
-              Terminal: {userProfile?.nombre_completo || 'Root'} — Rango: {userProfile?.rol || 'Unauthorized'}
-            </span>
-          </div>
-        </h2>
-      </header>
-
-      {/* ESTADO DE DATOS */}
-      {(failedLoads.length > 0 || loadingLoads) && (
-        <div className="px-4 md:px-8 pb-4">
-          <div className={`mx-auto max-w-[1750px] flex flex-wrap items-center justify-between gap-3 rounded-2xl border p-4 ${
-            failedLoads.length > 0 ? 'border-red-500/25 bg-red-500/[0.05]' : 'border-white/10 bg-white/[0.02]'
-          }`}>
-            <div className="flex items-center gap-3">
-              {failedLoads.length > 0
-                ? <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
-                : <Loader2 className="h-4 w-4 animate-spin text-[#E1AD01] shrink-0" />}
-              <p className={`text-[10px] font-black uppercase tracking-widest ${failedLoads.length > 0 ? 'text-red-400' : 'text-slate-400'}`}>
-                {failedLoads.length > 0
-                  ? `Sin sincronizar: ${failedLoads.map(f => f.recurso).join(', ')}. Los valores de esos módulos no están verificados.`
-                  : 'Sincronizando datos operativos...'}
-              </p>
-            </div>
-            {failedLoads.length > 0 && (
-              <button
-                type="button"
-                onClick={retryData}
-                className="inline-flex items-center gap-2 rounded-xl bg-[#E1AD01] px-4 py-2 text-[9px] font-black uppercase tracking-widest text-black hover:bg-white"
-              >
-                <RefreshCw className="h-3.5 w-3.5" /> Reintentar
-              </button>
-            )}
+      <div className="shrink-0 border-t border-bm-line p-3">
+        <div className="flex items-center gap-3 px-2 py-2">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-bm-ink text-sm font-semibold text-white">
+            {initials}
+          </span>
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold text-bm-ink">{operatorName}</p>
+            <p className="truncate text-xs text-bm-steel">{roleLabel}{sedeLabel ? `, ${sedeLabel}` : ''}</p>
           </div>
         </div>
-      )}
+        <button
+          type="button"
+          onClick={() => void handleLogout()}
+          className="mt-1 flex h-11 w-full items-center gap-3 rounded-xl px-3 text-[14px] font-medium text-bm-red-deep transition-colors hover:bg-bm-red-tint"
+        >
+          <LogOut className="h-[18px] w-[18px] shrink-0" />
+          Cerrar sesión
+        </button>
+      </div>
+    </>
+  );
 
-      {/* MAIN */}
-      <main className="flex-1 px-4 md:px-8 pb-8 text-left">
-        <div className="max-w-[1750px] mx-auto animate-in fade-in duration-500">
+  // ── RENDER ────────────────────────────────────────────────────────────────
+  return (
+    <div className="bm-app flex min-h-[100dvh] bg-bm-canvas text-left text-bm-ink">
 
-          {safeTab === 'home' && isVisible('home') && (
-            <HomeDashboard
-              fleet={fleetData}
-              inventory={partsData}
-              activeTasks={tasksData}
-              vendors={vendorsData}
-              financeData={aguilasFinance}
-              onNavigate={(key: string) => {
-                if (visibleTabs.some(t => t.key === key)) setActiveTab(key as TabKey);
-              }}
-              userRole={userProfile?.rol}
-            />
-          )}
+      {/* BARRA LATERAL — ESCRITORIO */}
+      <aside className="sticky top-0 hidden h-[100dvh] w-[248px] shrink-0 flex-col border-r border-bm-line bg-white lg:flex xl:w-[264px]">
+        {renderNav()}
+      </aside>
 
-          {safeTab === 'hangar-consulta' && isPlanner && <PlannerHangar />}
+      {/* COLUMNA DE CONTENIDO */}
+      <div className="flex min-w-0 flex-1 flex-col overflow-x-clip">
+        {!isPlanner && (
+          <StatusBar onOpenRegister={canRegisterStaff ? () => setIsRegisterOpen(true) : undefined} />
+        )}
 
-          {safeTab === 'captain-log' && isVisible('captain-log') && (
-            <CaptainDashboard userProfile={userProfile} />
-          )}
+        {/* BARRA SUPERIOR — MÓVIL Y TABLET */}
+        <div className="sticky top-0 z-50 border-b border-bm-line bg-white/95 backdrop-blur lg:hidden">
+          <div className="flex h-14 items-center justify-between gap-3 px-4 sm:px-6">
+            <BmLogo variant="compact" className="h-7 w-auto text-bm-red" />
+            <button
+              type="button"
+              aria-label="Abrir menú"
+              aria-expanded={isMobileMenuOpen}
+              onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+              className="inline-flex h-10 items-center gap-2 rounded-xl border border-bm-line bg-white px-3.5 text-sm font-semibold text-bm-ink"
+            >
+              {isMobileMenuOpen
+                ? <X className="h-5 w-5" />
+                : <Menu className="h-5 w-5" />}
+              <span>Menú</span>
+            </button>
+          </div>
+        </div>
 
-          {safeTab === 'fleet' && isVisible('fleet') && role && ['CEO','ADMIN','DIRECTOR','MECANICO','OPERACIONES'].includes(role) && (
-            <div className="mb-4 flex justify-end">
-              <button type="button" onClick={() => navigate('/aircraft-archive')}
-                className="flex gap-2 items-center rounded-xl border border-[#E1AD01]/30 bg-[#E1AD01]/10 px-5 py-3 text-[#E1AD01] text-[10px] font-black uppercase">
-                <Archive size={15}/> Archivo Histórico OMA
-              </button>
+        {/* HEADER (Inicio usa el encabezado propio de HomeDashboard) */}
+        {safeTab !== 'home' && (
+          <header className="px-4 pb-4 pt-5 sm:px-6 sm:pt-7 lg:px-8">
+            <div className="mx-auto flex max-w-[1750px] flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-center gap-3.5">
+                <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-bm-red text-white sm:h-12 sm:w-12">
+                  <CurrentIcon className="h-5 w-5 sm:h-6 sm:w-6" />
+                </span>
+                <div className="min-w-0">
+                  <h1 className="bm-heading truncate text-[22px] leading-tight sm:text-[28px]">{currentTab?.label}</h1>
+                  <p className="truncate text-[13px] text-bm-steel">
+                    {operatorName}, {roleLabel}{sedeLabel ? `, ${sedeLabel}` : ''}
+                  </p>
+                </div>
+              </div>
+
+              {/* Acciones de sección (mismas condiciones que v7.1) */}
+              {safeTab === 'fleet' && isVisible('fleet') && role && ['CEO','ADMIN','DIRECTOR','MECANICO','OPERACIONES'].includes(role) && (
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" onClick={() => navigate('/aircraft-archive')}
+                    className={`${btnSecondary} w-full sm:w-auto`}>
+                    <Archive className="h-4 w-4" /> Archivo histórico OMA
+                  </button>
+                </div>
+              )}
+
+              {safeTab === 'inventory' && isVisible('inventory') && (
+                <div className="grid gap-2 sm:flex sm:flex-wrap">
+                  <button type="button" disabled={partsState.status !== 'ready'} onClick={printInventory}
+                    className={btnSecondary}>
+                    <Printer className="h-4 w-4" /> Imprimir inventario completo
+                  </button>
+                  {role && ['CEO','MECANICO','OPERACIONES'].includes(role) && (
+                    <button type="button" onClick={() => navigate('/inventory-archive')}
+                      className={btnSecondary}>
+                      <Archive className="h-4 w-4" /> Archivo de inventario
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
-          )}
+          </header>
+        )}
 
-          {safeTab === 'fleet' && isVisible('fleet') && guard(
-            [{ state: fleetState, recurso: 'la flota' }],
-            fleetData.length > 0,
-            <FleetDashboard
-              fleetData={fleetData}
-              setFleetData={setFleetData}
-              onFleetChange={refreshFleet}
-            />,
-          )}
-
-          {safeTab === 'inventory' && isVisible('inventory') && (
-            <div className="mb-4 flex flex-wrap justify-end gap-2">
-              <button type="button" disabled={partsState.status !== 'ready'} onClick={printInventory}
-                className="flex gap-2 items-center rounded-xl border border-white/15 px-5 py-3 text-slate-300 text-[10px] font-black uppercase disabled:opacity-40">
-                <Printer size={15}/> Imprimir Inventario Completo
-              </button>
-              {role && ['CEO','MECANICO','OPERACIONES'].includes(role) && (
-                <button type="button" onClick={() => navigate('/inventory-archive')}
-                  className="flex gap-2 items-center rounded-xl border border-[#E1AD01]/30 bg-[#E1AD01]/10 px-5 py-3 text-[#E1AD01] text-[10px] font-black uppercase">
-                  <Archive size={15}/> Archivo de Inventario
+        {/* ESTADO DE DATOS */}
+        {showDataBanner && (
+          <div className={`px-3 pb-3 sm:px-6 sm:pb-4 lg:px-8 ${topPad}`}>
+            <div
+              className={`mx-auto flex max-w-[1750px] flex-wrap items-center justify-between gap-3 rounded-2xl border px-4 py-3 ${
+                failedLoads.length > 0 ? 'border-bm-red/25 bg-bm-red-tint' : 'border-bm-line bg-white'
+              }`}
+              role={failedLoads.length > 0 ? 'alert' : 'status'}
+            >
+              <div className="flex min-w-0 items-center gap-3">
+                {failedLoads.length > 0
+                  ? <AlertTriangle className="h-4 w-4 shrink-0 text-bm-red" />
+                  : <Loader2 className="h-4 w-4 shrink-0 animate-spin text-bm-red" />}
+                <p className={`text-sm ${failedLoads.length > 0 ? 'font-medium text-bm-red-deep' : 'text-bm-steel'}`}>
+                  {failedLoads.length > 0
+                    ? `Sin sincronizar: ${failedLoads.map(f => f.recurso).join(', ')}. Los valores de esos módulos no están verificados.`
+                    : 'Sincronizando datos operativos…'}
+                </p>
+              </div>
+              {failedLoads.length > 0 && (
+                <button
+                  type="button"
+                  onClick={retryData}
+                  className={`${btnPrimary} h-10 px-4`}
+                >
+                  <RefreshCw className="h-4 w-4" /> Reintentar
                 </button>
               )}
             </div>
-          )}
+          </div>
+        )}
 
-          {safeTab === 'inventory' && isVisible('inventory') && guard(
-            [{ state: partsState, recurso: 'el inventario' }],
-            partsData.length > 0,
-            <InventoryPanel
-              parts={partsData}
-              setParts={setPartsData}
-              transactions={transactionsData}
-              setTransactions={setTransactionsData}
-              vendors={vendorsData}
-              userRole={userProfile?.rol}
-            />,
-          )}
+        {/* MAIN */}
+        <main className={`flex-1 px-3 pb-8 sm:px-6 lg:px-8 ${showDataBanner ? '' : topPad}`}>
+          <div className="mx-auto max-w-[1750px] animate-in fade-in duration-500">
 
-          {safeTab === 'control-hub' && isVisible('control-hub') && guard(
-            [{ state: fleetState, recurso: 'la flota' }, { state: partsState, recurso: 'el inventario' }],
-            fleetData.length > 0 && partsData.length > 0,
-            <ControlHub
-              tasks={tasksData}
-              setTasks={setTasksData}
-              fleet={fleetData}
-              setFleet={setFleetData}
-              inventory={partsData}
-              onPartsUsage={() => {}}
-              onFleetChange={refreshFleet}
-            />,
-          )}
+            {safeTab === 'home' && isVisible('home') && (
+              <HomeDashboard
+                fleet={fleetData}
+                inventory={partsData}
+                activeTasks={tasksData}
+                vendors={vendorsData}
+                financeData={aguilasFinance}
+                onNavigate={(key: string) => {
+                  if (visibleTabs.some(t => t.key === key)) setActiveTab(key as TabKey);
+                }}
+                userRole={userProfile?.rol}
+              />
+            )}
 
-          {safeTab === 'checkout' && isVisible('checkout') && (
-            <InventoryCheckout
-              onCheckoutSuccess={(pn, qty, _aircraftId) => {
-                setPartsData(prev =>
-                  prev.map(p =>
-                    p.partNumber.toUpperCase() === pn
-                      ? { ...p, quantity: p.quantity - qty }
-                      : p
-                  )
-                );
-              }}
-            />
-          )}
+            {safeTab === 'hangar-consulta' && isPlanner && (
+              <LegacyModuleFrame><PlannerHangar /></LegacyModuleFrame>
+            )}
 
-          {safeTab === 'fuel' && isVisible('fuel') && guard(
-            [{ state: fleetState, recurso: 'la flota' }],
-            fleetData.length > 0,
-            <FuelPanel fleet={fleetData} vendors={vendorsData} />,
-          )}
+            {safeTab === 'captain-log' && isVisible('captain-log') && (
+              <LegacyModuleFrame><CaptainDashboard userProfile={userProfile} /></LegacyModuleFrame>
+            )}
 
-          {safeTab === 'finance' && isVisible('finance') && (
-            <FinancePanel
-              vendors={vendorsData}
-              inventory={partsData}
-              userRole={userProfile?.rol as any}
-              setGlobalFinance={setAguilasFinance}
-            />
-          )}
+            {safeTab === 'fleet' && isVisible('fleet') && guard(
+              [{ state: fleetState, recurso: 'la flota' }],
+              fleetData.length > 0,
+              <FleetDashboard
+                fleetData={fleetData}
+                setFleetData={setFleetData}
+                onFleetChange={refreshFleet}
+              />,
+            )}
 
-          {safeTab === 'vendors' && isVisible('vendors') && guard(
-            [{ state: vendorsState, recurso: 'los proveedores' }],
-            vendorsData.length > 0,
-            <VendorPanel vendors={vendorsData} setVendors={setVendorsData} />,
-          )}
+            {safeTab === 'inventory' && isVisible('inventory') && guard(
+              [{ state: partsState, recurso: 'el inventario' }],
+              partsData.length > 0,
+              <InventoryPanel
+                parts={partsData}
+                setParts={setPartsData}
+                transactions={transactionsData}
+                setTransactions={setTransactionsData}
+                vendors={vendorsData}
+                userRole={userProfile?.rol}
+              />,
+            )}
 
-          {safeTab === 'calendario' && isVisible('calendario') && (
-            <FlightCalendar
-              userRole={userProfile?.rol}
-              userProfile={userProfile}
-            />
-          )}
+            {safeTab === 'control-hub' && isVisible('control-hub') && guard(
+              [{ state: fleetState, recurso: 'la flota' }, { state: partsState, recurso: 'el inventario' }],
+              fleetData.length > 0 && partsData.length > 0,
+              <ControlHub
+                tasks={tasksData}
+                setTasks={setTasksData}
+                fleet={fleetData}
+                setFleet={setFleetData}
+                inventory={partsData}
+                onPartsUsage={() => {}}
+                onFleetChange={refreshFleet}
+              />,
+            )}
 
-          {safeTab === 'planificacion' && isVisible('planificacion') && (
-            <FlightPlanningBoard
-              userRole={userProfile?.rol}
-              userProfile={userProfile}
-            />
-          )}
+            {safeTab === 'checkout' && isVisible('checkout') && (
+              <InventoryCheckout
+                onCheckoutSuccess={(pn, qty, _aircraftId) => {
+                  setPartsData(prev =>
+                    prev.map(p =>
+                      String(p.partNumber ?? '').toUpperCase() === pn // [v7.3.2] P/N nulo no rompe
+                        ? { ...p, quantity: p.quantity - qty }
+                        : p
+                    )
+                  );
+                }}
+              />
+            )}
 
-          {safeTab === 'flights' && isVisible('flights') && (
-            <FlightRegister onFlightLogUpdate={() => {}} />
-          )}
+            {safeTab === 'fuel' && isVisible('fuel') && guard(
+              [{ state: fleetState, recurso: 'la flota' }],
+              fleetData.length > 0,
+              <FuelPanel fleet={fleetData} vendors={vendorsData} />,
+            )}
 
+            {safeTab === 'finance' && isVisible('finance') && (
+              <LegacyModuleFrame>
+                <FinancePanel
+                  vendors={vendorsData}
+                  inventory={partsData}
+                  userRole={userProfile?.rol as any}
+                  setGlobalFinance={setAguilasFinance}
+                />
+              </LegacyModuleFrame>
+            )}
+
+            {safeTab === 'vendors' && isVisible('vendors') && guard(
+              [{ state: vendorsState, recurso: 'los proveedores' }],
+              vendorsData.length > 0,
+              <VendorPanel vendors={vendorsData} setVendors={setVendorsData} />,
+            )}
+
+            {safeTab === 'calendario' && isVisible('calendario') && (
+              <LegacyModuleFrame>
+                <FlightCalendar
+                  userRole={userProfile?.rol}
+                  userProfile={userProfile}
+                />
+              </LegacyModuleFrame>
+            )}
+
+            {safeTab === 'planificacion' && isVisible('planificacion') && (
+              <LegacyModuleFrame>
+                <FlightPlanningBoard
+                  userRole={userProfile?.rol}
+                  userProfile={userProfile}
+                />
+              </LegacyModuleFrame>
+            )}
+
+            {safeTab === 'flights' && isVisible('flights') && (
+              <FlightRegister onFlightLogUpdate={() => {}} />
+            )}
+
+          </div>
+        </main>
+
+        {isRegisterOpen && canRegisterStaff && (
+          // [v7.3.3] Register v3.2 es un BmModal B&M: sin envoltorio oscuro
+          <Register onClose={() => setIsRegisterOpen(false)} />
+        )}
+
+        <footer className="mt-auto flex flex-col gap-1 border-t border-bm-line px-4 py-5 text-xs text-bm-steel sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
+          <span>B&amp;M Mantenimiento Aeronáutico</span>
+          <span>Valkyron OS v7.3.3</span>
+        </footer>
+      </div>
+
+      {/* PANEL DE NAVEGACIÓN — MÓVIL Y TABLET */}
+      {isMobileMenuOpen && (
+        <div className="fixed inset-0 z-[150] lg:hidden">
+          <div
+            className="bm-backdrop absolute inset-0 bg-bm-ink/50"
+            onClick={() => setIsMobileMenuOpen(false)}
+            aria-hidden="true"
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Menú de módulos"
+            className="bm-drawer absolute inset-y-0 left-0 flex w-[86%] max-w-[320px] flex-col bg-white shadow-bm-sheet"
+          >
+            {renderNav(() => setIsMobileMenuOpen(false), true)}
+          </div>
         </div>
-      </main>
-
-      {isRegisterOpen && canRegisterStaff && (
-        <Register onClose={() => setIsRegisterOpen(false)} />
       )}
-
-      <footer className="border-t border-white/5 bg-black/80 px-8 py-6 flex justify-between items-center mt-auto">
-        <div className="text-[8px] text-slate-600 font-mono tracking-[0.5em] uppercase">
-          Águilas Pilot — Strategic Division 2026
-        </div>
-        <div className="text-[8px] text-[#E1AD01] font-black uppercase tracking-[0.3em] italic text-right">
-          Valkyron OS v7.1
-        </div>
-      </footer>
     </div>
   );
 };

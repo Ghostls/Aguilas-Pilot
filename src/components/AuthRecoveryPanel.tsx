@@ -1,11 +1,26 @@
 // src/components/AuthRecoveryPanel.tsx
-// VALKYRON OS v7.0 — RECUPERACIÓN CONTROLADA DE SESIÓN
+// VALKYRON OS v7.1 — RECUPERACIÓN CONTROLADA DE SESIÓN · B&M MANTENIMIENTO AERONÁUTICO
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v7.1 — REBRAND B&M (solo presentación):
+//   [UI]   Panel en tarjeta blanca B&M con colores semánticos del tema
+//          (bg-card, text-primary, bg-warning-tint…): se ve correcto en el Login
+//          claro y dentro de módulos envueltos en .dark.
+//   [UI]   Jerarquía de acciones: Reintentar (rojo, principal) · Cerrar sesión
+//          (secundaria) · Reparar sesión (destructiva, contorno rojo profundo).
+//          Botones de 48 px, textos en minúscula de oración.
+//   [UI]   AuthLoader: cóndor B&M + barra de progreso indeterminada en lugar del
+//          spinner dorado. Etiqueta por defecto "Sincronizando B&M…".
+//   [UI]   Pantalla completa sobre lienzo claro con logo; min-h-[100dvh].
+//   [A11Y] AuthLoader con role="status"; textarea de diagnóstico con etiqueta.
+// PRESERVADO ÍNTEGRO (v7.0): props, estados (confirmRepair, busy, copied,
+//   diagText), onRetry / onSignOut / onRepair / onCopy, condiciones de
+//   visibilidad (showSignOut && hasSession, compact, lastError), escapeAfterMs.
 // ─────────────────────────────────────────────────────────────────────────────
 // AuthRecoveryPanel: explica la incidencia detectada por AuthContext y ofrece
 //   · Reintentar                      (no destructivo)
 //   · Cerrar sesión                   (global; respaldo local si no hay red)
 //   · Reparar sesión del dispositivo  (destructivo, requiere confirmación explícita:
-//                                      borra SOLO la sesión de Águilas OS en este
+//                                      borra SOLO la sesión del sistema en este
 //                                      navegador y obliga a iniciar sesión otra vez)
 //   · Copiar diagnóstico              (sin tokens, contraseñas ni correos)
 // AuthLoader: indicador de carga que, pasado un tiempo, muestra las mismas
@@ -18,6 +33,7 @@ import {
   LogOut, RefreshCw, ShieldAlert, WifiOff, Wrench,
 } from 'lucide-react';
 import { ISSUE_MESSAGES, useAuth } from '@/context/AuthContext';
+import { BmLogo } from '@/components/brand/BmLogo'; // [v7.1] identidad B&M
 
 interface AuthRecoveryPanelProps {
   fullScreen?: boolean;
@@ -26,6 +42,14 @@ interface AuthRecoveryPanelProps {
   compact?: boolean;
   showSignOut?: boolean;
 }
+
+// [v7.1] Clases de botón compartidas (tokens semánticos del tema B&M)
+const btnBase =
+  'h-12 w-full rounded-xl px-4 text-[15px] font-semibold inline-flex items-center justify-center gap-2 ' +
+  'transition disabled:opacity-60 disabled:cursor-not-allowed';
+const btnPrimary = `${btnBase} bg-primary text-primary-foreground hover:brightness-[0.85] active:scale-[0.99]`;
+const btnSecondary = `${btnBase} border border-border bg-card text-foreground hover:bg-muted`;
+const btnDanger = `${btnBase} border border-destructive/30 bg-card text-destructive hover:bg-destructive/5`;
 
 export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
   fullScreen = false,
@@ -81,31 +105,33 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
   const panel = (
     <div
       role="alert"
-      className={`w-full ${compact ? 'max-w-md' : 'max-w-lg'} rounded-3xl border border-amber-500/25 bg-[#0a0a0a] p-6 md:p-8 text-left shadow-2xl`}
+      className={`bm-app w-full ${compact ? 'max-w-md' : 'max-w-lg'} rounded-[24px] border border-border bg-card p-5 sm:p-7 text-left text-foreground shadow-bm-pop`}
     >
-      <div className="flex items-start gap-3">
-        <div className="rounded-2xl border border-amber-500/25 bg-amber-500/10 p-3 shrink-0">
+      <div className="flex items-start gap-3.5">
+        <div className="h-11 w-11 shrink-0 rounded-full bg-warning-tint text-warning flex items-center justify-center">
           {offline
-            ? <WifiOff className="h-5 w-5 text-amber-400" />
-            : <ShieldAlert className="h-5 w-5 text-amber-400" />}
+            ? <WifiOff className="h-5 w-5" />
+            : <ShieldAlert className="h-5 w-5" />}
         </div>
         <div className="min-w-0">
-          <p className="text-[10px] font-black uppercase tracking-[0.3em] text-amber-400">Recuperación de sesión</p>
-          <h2 className="mt-1 text-base md:text-lg font-black uppercase italic text-white leading-tight">{heading}</h2>
-          <p className="mt-2 text-xs text-zinc-400 leading-relaxed">{body}</p>
+          <p className="text-[13px] font-medium text-muted-foreground">Recuperación de sesión</p>
+          <h2 className="bm-heading mt-0.5 text-lg sm:text-xl leading-snug">{heading}</h2>
+          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{body}</p>
           {auth.lastError && !compact && (
-            <p className="mt-2 text-[10px] font-mono text-zinc-600 break-words">Detalle técnico: {auth.lastError}</p>
+            <p className="mt-3 rounded-lg bg-muted px-3 py-2 font-data text-xs leading-relaxed text-muted-foreground break-words">
+              Detalle técnico: {auth.lastError}
+            </p>
           )}
         </div>
       </div>
 
       {!confirmRepair ? (
-        <div className="mt-6 grid gap-2 sm:grid-cols-2">
+        <div className="mt-6 grid gap-2.5 sm:grid-cols-2">
           <button
             type="button"
             onClick={onRetry}
             disabled={busy !== null}
-            className="flex items-center justify-center gap-2 rounded-2xl bg-[#E1AD01] px-4 py-3.5 text-[10px] font-black uppercase tracking-widest text-black transition-all hover:bg-white disabled:opacity-50"
+            className={btnPrimary}
           >
             {busy === 'retry' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             Reintentar
@@ -116,7 +142,7 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
               type="button"
               onClick={() => void onSignOut()}
               disabled={busy !== null}
-              className="flex items-center justify-center gap-2 rounded-2xl border border-white/10 px-4 py-3.5 text-[10px] font-black uppercase tracking-widest text-zinc-300 transition-all hover:bg-white/5 disabled:opacity-50"
+              className={btnSecondary}
             >
               {busy === 'signout' ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogOut className="h-4 w-4" />}
               Cerrar sesión
@@ -127,28 +153,28 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
             type="button"
             onClick={() => setConfirmRepair(true)}
             disabled={busy !== null}
-            className="flex items-center justify-center gap-2 rounded-2xl border border-red-500/25 px-4 py-3.5 text-[10px] font-black uppercase tracking-widest text-red-400 transition-all hover:bg-red-500/10 disabled:opacity-50 sm:col-span-2"
+            className={`${btnDanger} sm:col-span-2`}
           >
             <Wrench className="h-4 w-4" />
             Reparar sesión del dispositivo
           </button>
         </div>
       ) : (
-        <div className="mt-6 rounded-2xl border border-red-500/25 bg-red-500/[0.05] p-4">
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="h-4 w-4 shrink-0 text-red-400 mt-0.5" />
-            <p className="text-xs text-red-200 leading-relaxed">
-              Se eliminará la sesión de <strong>Águilas OS</strong> guardada en este navegador.
+        <div className="mt-6 rounded-2xl border border-destructive/25 bg-primary-tint p-4">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-destructive mt-0.5" />
+            <p className="text-sm leading-relaxed text-foreground">
+              Se eliminará la sesión de <strong>B&amp;M</strong> guardada en este navegador.
               Tendrá que <strong>iniciar sesión otra vez</strong>. No se borran datos del sistema,
               ni de otras páginas o aplicaciones del equipo.
             </p>
           </div>
-          <div className="mt-4 grid grid-cols-2 gap-2">
+          <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
             <button
               type="button"
               onClick={() => setConfirmRepair(false)}
               disabled={busy === 'repair'}
-              className="rounded-xl border border-white/10 px-3 py-3 text-[10px] font-black uppercase text-zinc-400 hover:bg-white/5"
+              className={btnSecondary}
             >
               Cancelar
             </button>
@@ -156,7 +182,7 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
               type="button"
               onClick={() => void onRepair()}
               disabled={busy === 'repair'}
-              className="flex items-center justify-center gap-2 rounded-xl bg-red-500 px-3 py-3 text-[10px] font-black uppercase text-white hover:bg-red-400 disabled:opacity-50"
+              className={`${btnBase} bg-destructive text-destructive-foreground hover:brightness-[0.9]`}
             >
               {busy === 'repair' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wrench className="h-4 w-4" />}
               Confirmar reparación
@@ -168,11 +194,11 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
       <button
         type="button"
         onClick={() => void onCopy()}
-        className="mt-4 flex w-full items-center justify-center gap-2 text-[9px] font-black uppercase tracking-widest text-zinc-600 hover:text-[#E1AD01]"
+        className="mt-4 flex w-full items-center justify-center gap-2 py-2 text-[13px] font-medium text-muted-foreground hover:text-primary transition-colors"
       >
         {copied === 'ok'
-          ? <><CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> Diagnóstico copiado</>
-          : <><ClipboardCopy className="h-3.5 w-3.5" /> Copiar diagnóstico para soporte</>}
+          ? <><CheckCircle2 className="h-4 w-4 text-success" /> Diagnóstico copiado</>
+          : <><ClipboardCopy className="h-4 w-4" /> Copiar diagnóstico para soporte</>}
       </button>
 
       {diagText && (
@@ -180,7 +206,8 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
           readOnly
           value={diagText}
           rows={6}
-          className="mt-3 w-full rounded-xl border border-white/10 bg-black/60 p-3 font-mono text-[9px] text-zinc-400"
+          aria-label="Diagnóstico para soporte"
+          className="mt-2 w-full rounded-xl border border-border bg-muted p-3 font-data text-xs text-muted-foreground outline-none"
         />
       )}
     </div>
@@ -189,7 +216,8 @@ export const AuthRecoveryPanel: React.FC<AuthRecoveryPanelProps> = ({
   if (!fullScreen) return panel;
 
   return (
-    <div className="flex min-h-screen w-full items-center justify-center bg-[#020202] p-6">
+    <div className="bm-app flex min-h-[100dvh] w-full flex-col items-center justify-center gap-8 bg-muted px-5 py-10">
+      <BmLogo variant="compact" className="h-10 w-auto text-primary" />
       {panel}
     </div>
   );
@@ -203,7 +231,7 @@ interface AuthLoaderProps {
 }
 
 export const AuthLoader: React.FC<AuthLoaderProps> = ({
-  label = 'Sincronizando Águilas OS...',
+  label = 'Sincronizando B&M…',
   escapeAfterMs = 10000,
   fullScreen = true,
 }) => {
@@ -215,11 +243,14 @@ export const AuthLoader: React.FC<AuthLoaderProps> = ({
   }, [escapeAfterMs]);
 
   const content = (
-    <div className="flex flex-col items-center gap-6 text-left">
-      <div className="h-16 w-16 animate-spin rounded-full border-t-2 border-[#E1AD01]" />
-      <span className="animate-pulse text-[10px] font-black uppercase italic tracking-[0.5em] text-[#E1AD01]">
-        {label}
-      </span>
+    <div className="bm-app flex w-full flex-col items-center gap-6 text-center">
+      <div role="status" aria-live="polite" className="flex flex-col items-center gap-5">
+        <BmLogo variant="mark" aria-hidden="true" className="h-14 w-auto text-primary" />
+        <div className="bm-indeterminate h-1 w-40 rounded-full bg-muted" aria-hidden="true" />
+        <span className="text-sm font-medium text-muted-foreground">
+          {label}
+        </span>
+      </div>
       {slow && (
         <AuthRecoveryPanel
           compact
@@ -233,7 +264,7 @@ export const AuthLoader: React.FC<AuthLoaderProps> = ({
   if (!fullScreen) return <div className="flex w-full justify-center py-16">{content}</div>;
 
   return (
-    <div className="flex min-h-screen w-full items-center justify-center bg-[#020202] p-6">
+    <div className="flex min-h-[100dvh] w-full items-center justify-center bg-background px-5 py-10">
       {content}
     </div>
   );

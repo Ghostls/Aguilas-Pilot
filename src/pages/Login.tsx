@@ -1,6 +1,27 @@
 // src/pages/Login.tsx
-// VALKYRON OS v7.1 — LOGIN / SOLICITUD DE ALTA · ÁGUILAS PILOT
-// FUSIÓN: Login original (PLANIFICADOR_VUELO) + v7.0
+// VALKYRON OS v8.0.1 — LOGIN / SOLICITUD DE ALTA · B&M MANTENIMIENTO AERONÁUTICO
+// FUSIÓN: Login original (PLANIFICADOR_VUELO) + v7.0 + v7.1 + rebrand B&M
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v8.0.1:
+//   [FIX]  Se retira import '@/theme/bm-theme.css': el tema entra una sola vez
+//          por index.css. Evita el error de Vite si el archivo falta aquí.
+// CHANGELOG v8.0 — REBRAND B&M:
+//   [UI]   Identidad B&M (ex Águilas Pilot): fondo blanco, rojo B&M #D42125 en
+//          acciones y foco, logo vectorial <BmLogo> (sin /logo.png).
+//   [UI]   Mobile-first: una columna alineada a la izquierda en móvil; desde lg,
+//          panel de marca con el cóndor a gran escala + formulario.
+//   [UI]   Campos de 48 px con texto de 16 px (iOS no hace zoom al enfocar),
+//          ícono que se tiñe de rojo con el foco, selects con chevron propio.
+//   [UI]   Mensajes en minúscula de oración y voz de la interfaz. El error
+//          desconocido se muestra tal cual (antes .toUpperCase()).
+//   [UI]   El botón principal indica qué está pasando: Verificando / Enviando /
+//          Sincronizando sesión.
+//   [A11Y] aria-live en avisos, aria-invalid en confirmación, foco visible.
+// PRESERVADO ÍNTEGRO (v7.1): signIn con timeout, espera de AuthContext antes de
+//   navegar, alta con cliente aislado y rol_solicitado, detección de usuario
+//   existente, clasificación de errores (mismas expresiones), recuperación de
+//   sesión, limpieza de ?reparado=1, Bloq Mayús, mostrar/ocultar contraseña,
+//   mínimos 8 (alta) / 6 (login), sedes y perfil de planificación.
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v7.1:
 //   [NEW] Aviso de Bloq Mayús activado en la contraseña.
@@ -25,8 +46,7 @@
 //   [NEW] Avisos: sesión expirada, dispositivo reparado, incidencias de sesión
 //         con acceso a Reintentar / Reparar sesión del dispositivo.
 //   [NEW] Si ya hay sesión válida, redirige a la ruta de origen.
-// PRESERVADO: diseño, identidad visual, campos, sedes, perfil de planificación,
-//   mensajes de error, alternancia login/registro.
+// PRESERVADO: campos, sedes, perfil de planificación, alternancia login/registro.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import React, { useEffect, useState } from 'react';
@@ -35,6 +55,8 @@ import { supabase, createIsolatedAuthClient } from '@/lib/supabaseClient';
 import { authLog, promiseWithTimeout, shortId } from '@/lib/authRecovery';
 import { useAuth } from '@/context/AuthContext';
 import { AuthRecoveryPanel } from '@/components/AuthRecoveryPanel';
+import { BmLogo } from '@/components/brand/BmLogo'; // [v8.0] logo vectorial B&M
+// [v8.0.1] El tema B&M (bm-theme.css) se carga una sola vez desde index.css.
 import {
   Mail,
   Lock,
@@ -42,13 +64,14 @@ import {
   Loader2,
   AlertCircle,
   ChevronLeft,
+  ChevronDown, // [v8.0] chevron de selects
   CheckCircle2,
   Wrench,
   Eye,
   EyeOff,
 } from 'lucide-react';
 
-// VALKYRON OS — ÁGUILAS PILOT
+// VALKYRON OS — B&M MANTENIMIENTO AERONÁUTICO
 // LOGIN / SOLICITUD DE ALTA DE PERSONAL
 //
 // IMPORTANTE:
@@ -57,21 +80,64 @@ import {
 // real desde el módulo de Alta de Personal (fn_asignar_rol_operativo).
 
 const ROLES = [
-  { value: 'MECANICO', label: 'MECÁNICO' },
-  { value: 'CAPITAN', label: 'CAPITÁN' },
+  { value: 'MECANICO', label: 'Mecánico' },
+  { value: 'CAPITAN', label: 'Capitán' },
   {
     value: 'PLANIFICADOR_VUELO',
-    label: 'PLANIFICADOR DE VUELO',
+    label: 'Planificador de vuelo',
   },
-  { value: 'OPERACIONES', label: 'OPERACIONES' },
+  { value: 'OPERACIONES', label: 'Operaciones' },
 ] as const;
 
 type Rol = (typeof ROLES)[number]['value'];
+
+// [v8.0] Sedes: los valores enviados a user_metadata no cambian ('Lara' | 'Maturin').
+const SEDES = [
+  { value: 'Lara', label: 'Lara' },
+  { value: 'Maturin', label: 'Maturín' },
+] as const;
 
 const SIGNIN_TIMEOUT_MS = 25000;
 const SESSION_SYNC_TIMEOUT_MS = 12000;
 const NEW_PASSWORD_MIN = 8;
 const LOGIN_PASSWORD_MIN = 6;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [v8.0] PIEZAS DE UI B&M — a nivel de módulo
+// ─────────────────────────────────────────────────────────────────────────────
+
+type AvisoTone = 'ok' | 'warn' | 'error';
+
+const AVISO_TONES: Record<AvisoTone, { box: string; icon: string }> = {
+  ok: { box: 'bg-[#E7F5EE] border-[#18794E]/20 text-[#14532D]', icon: 'text-[#18794E]' },
+  warn: { box: 'bg-[#FEF3E2] border-[#B45309]/20 text-[#7C2D12]', icon: 'text-[#B45309]' },
+  error: { box: 'bg-[#FCEBEC] border-[#D42125]/25 text-[#7F1D1D]', icon: 'text-[#D42125]' },
+};
+
+/** Aviso en línea: éxito, advertencia o error. */
+const Aviso = ({
+  tone,
+  children,
+  alert = false,
+}: {
+  tone: AvisoTone;
+  children: React.ReactNode;
+  alert?: boolean;
+}) => {
+  const t = AVISO_TONES[tone];
+  const Icon = tone === 'ok' ? CheckCircle2 : AlertCircle;
+  return (
+    <div
+      role={alert ? 'alert' : 'status'}
+      className={`mb-5 flex items-start gap-3 rounded-xl border px-4 py-3 ${t.box}`}
+    >
+      <Icon className={`mt-0.5 h-4 w-4 shrink-0 ${t.icon}`} />
+      <p className="text-sm leading-snug">{children}</p>
+    </div>
+  );
+};
+
+const labelClass = 'text-sm font-medium text-[#1B1D22]';
 
 const Login: React.FC = () => {
   const navigate = useNavigate();
@@ -122,7 +188,7 @@ const Login: React.FC = () => {
       setAwaitingSession(false);
       setLoading(false);
       setShowRecovery(true);
-      setError('LA SESIÓN SE INICIÓ PERO NO SE PUDO SINCRONIZAR EN ESTE EQUIPO');
+      setError('La sesión se inició, pero este equipo no pudo sincronizarla. Use las opciones de recuperación.');
     }, SESSION_SYNC_TIMEOUT_MS);
     return () => clearTimeout(t);
   }, [awaitingSession]);
@@ -139,15 +205,15 @@ const Login: React.FC = () => {
     try {
       if (isRegistering) {
         if (!nombre.trim()) {
-          throw new Error('EL NOMBRE DEL OPERADOR ES OBLIGATORIO');
+          throw new Error('Ingrese el nombre completo del operador.');
         }
 
         if (password.length < NEW_PASSWORD_MIN) {
-          throw new Error(`LA CONTRASEÑA DEBE TENER AL MENOS ${NEW_PASSWORD_MIN} CARACTERES`);
+          throw new Error(`La contraseña debe tener al menos ${NEW_PASSWORD_MIN} caracteres.`);
         }
 
         if (password !== confirmPassword) {
-          throw new Error('LAS CONTRASEÑAS NO COINCIDEN');
+          throw new Error('Las contraseñas no coinciden.');
         }
 
         // Cliente aislado: la solicitud no deja sesión activa en este navegador.
@@ -172,7 +238,7 @@ const Login: React.FC = () => {
 
         if (!data.user) {
           throw new Error(
-            'NO SE PUDO COMPLETAR EL REGISTRO DEL OPERADOR'
+            'No se pudo completar el registro del operador.'
           );
         }
 
@@ -181,9 +247,9 @@ const Login: React.FC = () => {
         }
 
         setNotice(
-          `SOLICITUD REGISTRADA · ${nombre.trim().toUpperCase()} · ` +
-          `${ROLES.find(r => r.value === rol)?.label} · ${sede.toUpperCase()}. ` +
-          'El acceso se habilitará cuando administración valide y asigne el rol.'
+          `Solicitud registrada para ${nombre.trim().toUpperCase()}: ` +
+          `${ROLES.find(r => r.value === rol)?.label}, sede ${SEDES.find(s => s.value === sede)?.label ?? sede}. ` +
+          'El acceso se habilitará cuando administración valide la cuenta y asigne el rol.'
         );
 
         setPassword('');
@@ -204,7 +270,7 @@ const Login: React.FC = () => {
         if (authError) throw authError;
 
         if (!data.user) {
-          throw new Error('NO SE PUDO VALIDAR LA SESIÓN');
+          throw new Error('No se pudo validar la sesión.');
         }
 
         // AuthContext obtiene el rol autorizado desde la base de datos y,
@@ -217,29 +283,29 @@ const Login: React.FC = () => {
       const mensaje =
         err instanceof Error
           ? err.message
-          : 'ERROR DESCONOCIDO';
+          : 'Error desconocido.';
 
-      console.error('[ÁGUILAS PILOT AUTH]', err instanceof Error ? err.name : 'Error');
+      console.error('[B&M AUTH]', err instanceof Error ? err.name : 'Error');
 
       if (/already registered/i.test(mensaje)) {
-        setError('EL USUARIO YA EXISTE EN EL SISTEMA');
+        setError('Este correo ya está registrado en el sistema.');
       } else if (/credentials/i.test(mensaje)) {
         setError(
-          'ACCESO DENEGADO: CREDENCIALES INVÁLIDAS'
+          'Correo o contraseña incorrectos.'
         );
       } else if (/rate limit|too many|429/i.test(mensaje)) {
-        setError('DEMASIADOS INTENTOS. ESPERE UNOS MINUTOS ANTES DE REINTENTAR');
+        setError('Demasiados intentos. Espere unos minutos antes de volver a intentar.');
       } else if (/signups? (not allowed|is disabled|are disabled)/i.test(mensaje)) {
-        setError('EL REGISTRO PÚBLICO ESTÁ DESHABILITADO. SOLICITE EL ALTA A ADMINISTRACIÓN');
+        setError('El registro público está deshabilitado. Solicite el alta a administración.');
       } else if (/password should|weak password|password is too/i.test(mensaje)) {
-        setError('LA CONTRASEÑA NO CUMPLE LA POLÍTICA DE SEGURIDAD');
+        setError('La contraseña no cumple la política de seguridad.');
       } else if (/email not confirmed/i.test(mensaje)) {
-        setError('DEBE CONFIRMAR SU CORREO ANTES DE INGRESAR');
+        setError('Debe confirmar su correo antes de ingresar. Revise su bandeja de entrada.');
       } else if (/tiempo de espera|timeout|failed to fetch|network/i.test(mensaje)) {
-        setError('SIN RESPUESTA DEL SERVIDOR. VERIFIQUE LA CONEXIÓN E INTENTE DE NUEVO');
+        setError('El servidor no respondió. Verifique la conexión e intente de nuevo.');
         setShowRecovery(true);
       } else {
-        setError(mensaje.toUpperCase());
+        setError(mensaje);
       }
       setLoading(false);
       setAwaitingSession(false);
@@ -260,554 +326,458 @@ const Login: React.FC = () => {
     setCapsLock(e.getModifierState('CapsLock'));
   };
 
+  // [v8.0] Campos B&M: 48 px de alto, 16 px de texto, foco rojo.
   const inputClass =
-    'w-full p-4 pl-12 rounded-2xl bg-black/50 ' +
-    'text-white border border-white/5 ' +
-    'focus:border-[#E1AD01] outline-none text-xs ' +
-    'transition-all';
+    'peer w-full h-12 rounded-xl border border-[#D9DCE1] bg-white ' +
+    'pl-11 pr-4 text-base text-[#1B1D22] placeholder:text-[#9AA0A8] ' +
+    'outline-none transition-[border-color,box-shadow] ' +
+    'focus:border-[#D42125] focus:ring-4 focus:ring-[#D42125]/10';
 
   const selectClass =
-    'w-full p-4 rounded-2xl bg-black/50 ' +
-    'text-[#E1AD01] border border-white/5 ' +
-    'outline-none text-[10px] font-black ' +
-    'uppercase cursor-pointer';
+    'w-full h-12 appearance-none rounded-xl border border-[#D9DCE1] bg-white ' +
+    'pl-4 pr-10 text-base text-[#1B1D22] cursor-pointer outline-none ' +
+    'transition-[border-color,box-shadow] ' +
+    'focus:border-[#D42125] focus:ring-4 focus:ring-[#D42125]/10';
+
+  // Ícono de campo: va DESPUÉS del input en el DOM para reaccionar al foco (peer).
+  const fieldIconClass =
+    'pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 ' +
+    'text-[#9AA0A8] transition-colors peer-focus:text-[#D42125]';
 
   const sessionProblem =
     auth.status === 'error' ||
     auth.issue === 'SESSION_INVALID' ||
     auth.issue === 'STORAGE_CORRUPT';
 
+  const passwordMismatch = confirmPassword.length > 0 && confirmPassword !== password;
+
   return (
-    <div
-      className="
-        flex min-h-screen items-center justify-center
-        bg-[#020202] overflow-hidden font-sans
-        relative px-4 py-8
-      "
-    >
-      {/* Iluminación estructural */}
+    <div className="bm-app min-h-[100dvh] bg-white lg:grid lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
+      {/* Panel de marca — solo escritorio */}
 
-      <div
+      <aside
         className="
-          pointer-events-none absolute
-          w-[600px] h-[600px] bg-[#E1AD01]/10
-          rounded-full blur-[120px] -top-40 -left-40
-        "
-      />
-
-      <div
-        className="
-          pointer-events-none absolute
-          w-[600px] h-[600px] bg-[#E1AD01]/5
-          rounded-full blur-[120px] -bottom-40 -right-40
-        "
-      />
-
-      <div
-        className="
-          relative z-10 bg-white/5 backdrop-blur-2xl
-          p-7 md:p-10 rounded-[2.5rem]
-          border border-white/10 w-full max-w-md
-          shadow-2xl transition-all duration-500
-          max-h-[95vh] overflow-y-auto
+          relative hidden lg:flex flex-col
+          overflow-hidden bg-[#F2F3F5]
+          p-12 xl:p-16
         "
       >
-        {/* Identidad visual */}
+        <BmLogo
+          variant="compact"
+          className="relative h-12 xl:h-14 w-auto self-start text-[#D42125]"
+        />
 
-        <div className="flex flex-col items-center mb-8">
-          <div
-            className="
-              mb-6 drop-shadow-[0_0_15px_rgba(225,173,1,0.3)]
-            "
-          >
-            <img
-              src="/logo.png"
-              alt="Águilas Pilot"
-              className="w-48 h-auto object-contain"
-            />
-          </div>
-
-          <h1
-            className="
-              text-white text-3xl font-black
-              tracking-tighter uppercase italic
-              text-center leading-none
-            "
-          >
-            {isRegistering
-              ? 'Solicitud de Alta'
-              : 'Inicio de Sesión'}
-          </h1>
-
-          <p
-            className="
-              text-slate-500 text-[9px] mt-3
-              font-mono uppercase tracking-[0.4em]
-              text-center
-            "
-          >
-            {isRegistering
-              ? 'Registro de Operadores'
-              : 'Sistema de Inventario & MRO'}
+        <div className="relative mt-14 xl:mt-16 max-w-[25rem]">
+          <p className="bm-heading text-[32px] xl:text-[38px] leading-[1.06] text-[#1B1D22]">
+            Mantenimiento aeronáutico con trazabilidad de cada parte y cada hora.
+          </p>
+          <p className="mt-4 max-w-sm text-[15px] leading-relaxed text-[#5F6670]">
+            Inventario, órdenes de trabajo y estado de la flota de las sedes
+            Lara y Maturín.
           </p>
         </div>
 
-        {/* Avisos de sesión */}
-
-        {reparado && !error && (
-          <div className="mb-6 p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-center gap-3">
-            <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
-            <p className="text-[10px] text-emerald-300 font-black uppercase leading-tight tracking-widest">
-              Sesión del dispositivo reparada. Inicie sesión nuevamente.
-            </p>
-          </div>
-        )}
-
-        {auth.issue === 'SESSION_EXPIRED' && !error && (
-          <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl flex items-center gap-3">
-            <AlertCircle className="h-4 w-4 text-amber-400 shrink-0" />
-            <p className="text-[10px] text-amber-300 font-black uppercase leading-tight tracking-widest">
-              Su sesión expiró. Inicie sesión nuevamente.
-            </p>
-          </div>
-        )}
-
-        {notice && (
-          <div className="mb-6 p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-start gap-3">
-            <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
-            <p className="text-[10px] text-emerald-300 font-black uppercase leading-relaxed tracking-wider">
-              {notice}
-            </p>
-          </div>
-        )}
-
-        {/* Errores */}
-
-        {error && (
-          <div
-            role="alert"
+        {/* Cóndor a gran escala: ocupa el espacio bajo el texto (nunca lo pisa)
+            y sale por el borde inferior. Escala con la altura de la ventana. */}
+        <div
+          className="relative flex-1 min-h-[180px] mt-10 -mx-12 -mb-12 xl:-mx-16 xl:-mb-16"
+          aria-hidden="true"
+        >
+          <BmLogo
+            variant="mark"
+            aria-hidden="true"
+            preserveAspectRatio="xMaxYMin meet"
             className="
-              mb-6 p-4 bg-red-500/10
-              border border-red-500/20 rounded-xl
-              flex items-center gap-3
+              pointer-events-none absolute
+              right-[4%] top-0 h-[118%] w-[92%]
+              text-[#D42125]
             "
-          >
-            <AlertCircle
-              className="h-4 w-4 text-red-500 shrink-0"
+          />
+        </div>
+      </aside>
+
+      {/* Formulario */}
+
+      <main className="flex min-h-[100dvh] flex-col px-5 sm:px-10">
+        <div className="flex flex-1 items-center justify-center py-10 sm:py-14">
+          <div className="w-full max-w-[400px]">
+            {/* Identidad visual (móvil y tablet) */}
+
+            <BmLogo
+              variant="lockup"
+              className="lg:hidden mb-10 h-auto w-40 sm:w-48 text-[#D42125]"
             />
 
-            <p
-              className="
-                text-[10px] text-red-500 font-black
-                uppercase leading-tight tracking-widest
-              "
-            >
-              {error}
+            <h1 className="bm-heading text-[28px] sm:text-[32px] leading-tight text-[#1B1D22]">
+              {isRegistering
+                ? 'Solicitud de alta'
+                : 'Inicie sesión'}
+            </h1>
+
+            <p className="mt-2 mb-8 text-[15px] leading-relaxed text-[#5F6670]">
+              {isRegistering
+                ? 'Registre sus datos. Administración validará la cuenta y asignará su rol.'
+                : 'Sistema de inventario y MRO de B&M Mantenimiento Aeronáutico.'}
             </p>
-          </div>
-        )}
 
-        {(sessionProblem || showRecovery) && (
-          <div className="mb-6">
-            <AuthRecoveryPanel compact showSignOut={auth.status !== 'anonymous'} />
-          </div>
-        )}
+            {/* Avisos de sesión */}
 
-        <form
-          onSubmit={handleAuth}
-          className="space-y-4"
-        >
-          {isRegistering && (
-            <div className="space-y-4">
-              {/* Nombre */}
+            {reparado && !error && (
+              <Aviso tone="ok">
+                La sesión del dispositivo se reparó. Inicie sesión nuevamente.
+              </Aviso>
+            )}
 
-              <div className="space-y-1">
-                <label
-                  htmlFor="operator-name"
-                  className="
-                    text-[8px] text-slate-500
-                    font-black uppercase ml-2
-                    tracking-widest
-                  "
-                >
-                  Nombre del Operador
+            {auth.issue === 'SESSION_EXPIRED' && !error && (
+              <Aviso tone="warn">
+                Su sesión expiró. Inicie sesión nuevamente.
+              </Aviso>
+            )}
+
+            {notice && <Aviso tone="ok">{notice}</Aviso>}
+
+            {/* Errores */}
+
+            {error && (
+              <Aviso tone="error" alert>
+                {error}
+              </Aviso>
+            )}
+
+            {(sessionProblem || showRecovery) && (
+              <div className="mb-5">
+                <AuthRecoveryPanel compact showSignOut={auth.status !== 'anonymous'} />
+              </div>
+            )}
+
+            <form
+              onSubmit={handleAuth}
+              className="space-y-4"
+            >
+              {isRegistering && (
+                <div className="space-y-4">
+                  {/* Nombre */}
+
+                  <div className="space-y-1.5">
+                    <label htmlFor="operator-name" className={labelClass}>
+                      Nombre completo
+                    </label>
+
+                    <div className="relative">
+                      <input
+                        id="operator-name"
+                        type="text"
+                        placeholder="Como aparece en su cédula"
+                        required
+                        autoComplete="name"
+                        value={nombre}
+                        className={`${inputClass} uppercase placeholder:normal-case`}
+                        onChange={e =>
+                          setNombre(e.target.value)
+                        }
+                      />
+                      <User className={fieldIconClass} />
+                    </div>
+                  </div>
+
+                  {/* Rol y sede */}
+
+                  <div className="grid grid-cols-1 min-[400px]:grid-cols-2 gap-4 min-[400px]:gap-3">
+                    <div className="space-y-1.5">
+                      <label htmlFor="operator-role" className={labelClass}>
+                        Cargo solicitado
+                      </label>
+
+                      <div className="relative">
+                        <select
+                          id="operator-role"
+                          className={selectClass}
+                          value={rol}
+                          onChange={e =>
+                            setRol(e.target.value as Rol)
+                          }
+                        >
+                          {ROLES.map(item => (
+                            <option
+                              key={item.value}
+                              value={item.value}
+                            >
+                              {item.label}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronDown className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-[#5F6670]" />
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label htmlFor="operator-site" className={labelClass}>
+                        Sede
+                      </label>
+
+                      <div className="relative">
+                        <select
+                          id="operator-site"
+                          className={selectClass}
+                          value={sede}
+                          onChange={e =>
+                            setSede(e.target.value)
+                          }
+                        >
+                          {SEDES.map(item => (
+                            <option key={item.value} value={item.value}>
+                              {item.label}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronDown className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-[#5F6670]" />
+                      </div>
+                    </div>
+                  </div>
+
+                  {rol === 'PLANIFICADOR_VUELO' && (
+                    <div className="rounded-xl bg-[#F2F3F5] px-4 py-3.5">
+                      <p className="text-sm font-semibold text-[#1B1D22]">
+                        Perfil de planificación
+                      </p>
+
+                      <p className="mt-1 text-[13px] leading-relaxed text-[#5F6670]">
+                        Acceso previsto al hangar en
+                        modalidad de consulta y al módulo
+                        de planificación de vuelos.
+                        Sin permisos de certificación
+                        de mantenimiento.
+                      </p>
+                    </div>
+                  )}
+
+                  <p className="text-[13px] leading-relaxed text-[#5F6670]">
+                    Los cargos administrativos (administración, dirección y CEO)
+                    solo se asignan desde el módulo interno de Alta de Personal.
+                  </p>
+                </div>
+              )}
+
+              {/* Correo */}
+
+              <div className="space-y-1.5">
+                <label htmlFor="operator-email" className={labelClass}>
+                  Correo corporativo
                 </label>
 
                 <div className="relative">
-                  <User
-                    className="
-                      absolute left-4 top-1/2
-                      -translate-y-1/2 h-4 w-4
-                      text-slate-600
-                    "
-                  />
-
                   <input
-                    id="operator-name"
-                    type="text"
-                    placeholder="NOMBRE COMPLETO"
+                    id="operator-email"
+                    type="email"
+                    inputMode="email"
+                    placeholder="nombre@empresa.com"
                     required
-                    autoComplete="name"
-                    value={nombre}
-                    className={`${inputClass} uppercase`}
+                    autoComplete="email"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    value={email}
+                    className={inputClass}
                     onChange={e =>
-                      setNombre(e.target.value)
+                      setEmail(e.target.value)
                     }
                   />
+                  <Mail className={fieldIconClass} />
                 </div>
               </div>
 
-              {/* Rol y sede */}
+              {/* Contraseña */}
 
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <label
-                    htmlFor="operator-role"
+              <div className="space-y-1.5">
+                <label htmlFor="operator-password" className={labelClass}>
+                  Contraseña
+                </label>
+
+                <div className="relative">
+                  <input
+                    id="operator-password"
+                    type={showPassword ? 'text' : 'password'}
+                    placeholder={
+                      isRegistering
+                        ? `Mínimo ${NEW_PASSWORD_MIN} caracteres`
+                        : 'Su contraseña'
+                    }
+                    required
+                    minLength={
+                      isRegistering
+                        ? NEW_PASSWORD_MIN
+                        : LOGIN_PASSWORD_MIN
+                    }
+                    autoComplete={
+                      isRegistering
+                        ? 'new-password'
+                        : 'current-password'
+                    }
+                    value={password}
+                    className={`${inputClass} pr-12`}
+                    onKeyDown={detectCaps}
+                    onKeyUp={detectCaps}
+                    onBlur={() => setCapsLock(false)}
+                    onChange={e =>
+                      setPassword(e.target.value)
+                    }
+                  />
+                  <Lock className={fieldIconClass} />
+
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(v => !v)}
+                    aria-label={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+                    aria-pressed={showPassword}
                     className="
-                      text-[8px] text-slate-500
-                      font-black uppercase ml-2
-                      tracking-widest
+                      absolute right-1.5 top-1/2 -translate-y-1/2
+                      h-9 w-9 rounded-lg flex items-center justify-center
+                      text-[#5F6670] hover:text-[#D42125] hover:bg-[#F2F3F5]
+                      transition-colors
                     "
                   >
-                    Rango solicitado
-                  </label>
-
-                  <select
-                    id="operator-role"
-                    className={selectClass}
-                    value={rol}
-                    onChange={e =>
-                      setRol(e.target.value as Rol)
-                    }
-                  >
-                    {ROLES.map(item => (
-                      <option
-                        key={item.value}
-                        value={item.value}
-                      >
-                        {item.label}
-                      </option>
-                    ))}
-                  </select>
+                    {showPassword
+                      ? <EyeOff className="h-4 w-4" />
+                      : <Eye className="h-4 w-4" />}
+                  </button>
                 </div>
 
-                <div className="space-y-1">
-                  <label
-                    htmlFor="operator-site"
-                    className="
-                      text-[8px] text-slate-500
-                      font-black uppercase ml-2
-                      tracking-widest
-                    "
-                  >
-                    Sede
-                  </label>
-
-                  <select
-                    id="operator-site"
-                    className={selectClass}
-                    value={sede}
-                    onChange={e =>
-                      setSede(e.target.value)
-                    }
-                  >
-                    <option value="Lara">LARA</option>
-
-                    <option value="Maturin">
-                      MATURÍN
-                    </option>
-                  </select>
-                </div>
+                {capsLock && (
+                  <p className="flex items-center gap-1.5 text-[13px] font-medium text-[#B45309]" role="status">
+                    <AlertCircle className="h-3.5 w-3.5" /> Bloq Mayús está activado
+                  </p>
+                )}
               </div>
 
-              {rol === 'PLANIFICADOR_VUELO' && (
-                <div
-                  className="
-                    bg-[#E1AD01]/5
-                    border border-[#E1AD01]/20
-                    rounded-xl p-4
-                  "
-                >
-                  <p
-                    className="
-                      text-[10px] text-[#E1AD01]
-                      font-black uppercase mb-2
-                    "
-                  >
-                    Perfil de Planificación
-                  </p>
+              {/* Confirmación de contraseña (solo solicitud de alta) */}
 
-                  <p
-                    className="
-                      text-[10px] text-slate-400
-                      leading-relaxed
-                    "
-                  >
-                    Acceso previsto al hangar en
-                    modalidad de consulta y al módulo
-                    de planificación de vuelos.
-                    Sin permisos de certificación
-                    de mantenimiento.
-                  </p>
+              {isRegistering && (
+                <div className="space-y-1.5">
+                  <label htmlFor="operator-password-confirm" className={labelClass}>
+                    Confirmar contraseña
+                  </label>
+
+                  <div className="relative">
+                    <input
+                      id="operator-password-confirm"
+                      type={showPassword ? 'text' : 'password'}
+                      placeholder="Repita la contraseña"
+                      required
+                      minLength={NEW_PASSWORD_MIN}
+                      autoComplete="new-password"
+                      value={confirmPassword}
+                      aria-invalid={passwordMismatch}
+                      aria-describedby={passwordMismatch ? 'password-mismatch' : undefined}
+                      className={`${inputClass} ${passwordMismatch ? 'border-[#D42125]' : ''}`}
+                      onKeyDown={detectCaps}
+                      onKeyUp={detectCaps}
+                      onChange={e =>
+                        setConfirmPassword(e.target.value)
+                      }
+                    />
+                    <Lock className={fieldIconClass} />
+                  </div>
+
+                  {passwordMismatch && (
+                    <p id="password-mismatch" className="text-[13px] font-medium text-[#D42125]">
+                      Las contraseñas no coinciden
+                    </p>
+                  )}
                 </div>
               )}
 
-              <p className="text-[9px] text-slate-500 leading-relaxed px-1">
-                Los cargos administrativos (ADMIN, CEO, DIRECTOR) solo se asignan
-                desde el módulo interno de Alta de Personal.
-              </p>
-            </div>
-          )}
-
-          {/* Correo */}
-
-          <div className="space-y-1">
-            <label
-              htmlFor="operator-email"
-              className="
-                text-[8px] text-slate-500
-                font-black uppercase ml-2
-                tracking-widest
-              "
-            >
-              ID Corporativo
-            </label>
-
-            <div className="relative">
-              <Mail
-                className="
-                  absolute left-4 top-1/2
-                  -translate-y-1/2 h-4 w-4
-                  text-slate-600
-                "
-              />
-
-              <input
-                id="operator-email"
-                type="email"
-                placeholder="EMAIL"
-                required
-                autoComplete="email"
-                value={email}
-                className={inputClass}
-                onChange={e =>
-                  setEmail(e.target.value)
-                }
-              />
-            </div>
-          </div>
-
-          {/* Contraseña */}
-
-          <div className="space-y-1">
-            <label
-              htmlFor="operator-password"
-              className="
-                text-[8px] text-slate-500
-                font-black uppercase ml-2
-                tracking-widest
-              "
-            >
-              Contraseña
-            </label>
-
-            <div className="relative">
-              <Lock
-                className="
-                  absolute left-4 top-1/2
-                  -translate-y-1/2 h-4 w-4
-                  text-slate-600
-                "
-              />
-
-              <input
-                id="operator-password"
-                type={showPassword ? 'text' : 'password'}
-                placeholder="••••••••"
-                required
-                minLength={
-                  isRegistering
-                    ? NEW_PASSWORD_MIN
-                    : LOGIN_PASSWORD_MIN
-                }
-                autoComplete={
-                  isRegistering
-                    ? 'new-password'
-                    : 'current-password'
-                }
-                value={password}
-                className={`${inputClass} pr-12`}
-                onKeyDown={detectCaps}
-                onKeyUp={detectCaps}
-                onBlur={() => setCapsLock(false)}
-                onChange={e =>
-                  setPassword(e.target.value)
-                }
-              />
+              {/* Acción principal */}
 
               <button
-                type="button"
-                onClick={() => setShowPassword(v => !v)}
-                aria-label={showPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+                type="submit"
+                disabled={loading}
                 className="
-                  absolute right-4 top-1/2 -translate-y-1/2
-                  text-slate-600 hover:text-[#E1AD01]
-                  transition-colors
+                  !mt-6 w-full h-12 rounded-xl
+                  bg-[#D42125] text-white
+                  text-[15px] font-semibold
+                  inline-flex items-center justify-center gap-2
+                  hover:bg-[#A9161B] active:scale-[0.99]
+                  transition
+                  disabled:cursor-not-allowed disabled:opacity-60
+                  disabled:hover:bg-[#D42125] disabled:active:scale-100
                 "
               >
-                {showPassword
-                  ? <EyeOff className="h-4 w-4" />
-                  : <Eye className="h-4 w-4" />}
+                {loading ? (
+                  <>
+                    <Loader2
+                      className="h-5 w-5 animate-spin"
+                    />
+                    <span>
+                      {awaitingSession
+                        ? 'Sincronizando sesión'
+                        : isRegistering
+                          ? 'Enviando solicitud'
+                          : 'Verificando'}
+                    </span>
+                  </>
+                ) : isRegistering ? (
+                  'Enviar solicitud'
+                ) : (
+                  'Iniciar sesión'
+                )}
               </button>
-            </div>
+            </form>
 
-            {capsLock && (
-              <p className="ml-2 text-[9px] font-black uppercase tracking-widest text-amber-400">
-                Bloq Mayús activado
-              </p>
-            )}
-          </div>
+            {/* Cambiar entre registro y login */}
 
-          {/* Confirmación de contraseña (solo solicitud de alta) */}
-
-          {isRegistering && (
-            <div className="space-y-1">
-              <label
-                htmlFor="operator-password-confirm"
-                className="
-                  text-[8px] text-slate-500
-                  font-black uppercase ml-2
-                  tracking-widest
-                "
-              >
-                Confirmar Contraseña
-              </label>
-
-              <div className="relative">
-                <Lock
+            <div className="mt-8 border-t border-[#E3E5E9] pt-6">
+              {isRegistering ? (
+                <button
+                  type="button"
+                  onClick={cambiarModo}
                   className="
-                    absolute left-4 top-1/2
-                    -translate-y-1/2 h-4 w-4
-                    text-slate-600
+                    group inline-flex items-center gap-1.5
+                    text-sm font-semibold text-[#1B1D22]
+                    hover:text-[#D42125] transition-colors
                   "
-                />
-
-                <input
-                  id="operator-password-confirm"
-                  type={showPassword ? 'text' : 'password'}
-                  placeholder="••••••••"
-                  required
-                  minLength={NEW_PASSWORD_MIN}
-                  autoComplete="new-password"
-                  value={confirmPassword}
-                  className={inputClass}
-                  onKeyDown={detectCaps}
-                  onKeyUp={detectCaps}
-                  onChange={e =>
-                    setConfirmPassword(e.target.value)
-                  }
-                />
-              </div>
-
-              {confirmPassword.length > 0 && confirmPassword !== password && (
-                <p className="ml-2 text-[9px] font-black uppercase tracking-widest text-red-400">
-                  Las contraseñas no coinciden
+                >
+                  <ChevronLeft
+                    className="
+                      h-4 w-4 transition-transform
+                      group-hover:-translate-x-0.5
+                    "
+                  />
+                  Volver al inicio de sesión
+                </button>
+              ) : (
+                <p className="text-sm text-[#5F6670]">
+                  ¿Personal nuevo?{' '}
+                  <button
+                    type="button"
+                    onClick={cambiarModo}
+                    className="font-semibold text-[#D42125] hover:text-[#A9161B] underline-offset-4 hover:underline"
+                  >
+                    Solicitar alta
+                  </button>
                 </p>
               )}
+
+              {!isRegistering && !sessionProblem && !showRecovery && (
+                <button
+                  type="button"
+                  onClick={() => setShowRecovery(true)}
+                  className="
+                    mt-4 inline-flex items-center gap-2
+                    text-[13px] text-[#5F6670]
+                    hover:text-[#1B1D22] transition-colors
+                  "
+                >
+                  <Wrench className="h-3.5 w-3.5" />
+                  ¿Problemas para entrar en este equipo?
+                </button>
+              )}
             </div>
-          )}
+          </div>
+        </div>
 
-          {/* Acción principal */}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="
-              w-full py-5 bg-[#E1AD01]
-              text-black rounded-2xl font-black
-              uppercase text-[10px]
-              tracking-[0.3em] shadow-xl
-              shadow-[#E1AD01]/10
-              transition-all active:scale-95
-              hover:bg-white
-              flex items-center justify-center gap-2
-              disabled:opacity-50
-            "
-          >
-            {loading ? (
-              <>
-                <Loader2
-                  className="h-5 w-5 animate-spin"
-                />
-                {awaitingSession && <span>Sincronizando</span>}
-              </>
-            ) : isRegistering ? (
-              'Enviar Solicitud'
-            ) : (
-              'Inicializar Sistema'
-            )}
-          </button>
-        </form>
-
-        {/* Cambiar entre registro y login */}
-
-        <button
-          type="button"
-          onClick={cambiarModo}
-          className="
-            w-full mt-8 text-[9px]
-            text-slate-600 font-black uppercase
-            tracking-[0.3em]
-            hover:text-[#E1AD01]
-            transition-colors
-            flex items-center justify-center
-            gap-2 group
-          "
-        >
-          {isRegistering ? (
-            <>
-              <ChevronLeft
-                className="
-                  h-3 w-3 transition-transform
-                  group-hover:-translate-x-1
-                "
-              />
-
-              Volver al Login
-            </>
-          ) : (
-            '¿Registrar Nuevo Operador?'
-          )}
-        </button>
-
-        {!isRegistering && !sessionProblem && !showRecovery && (
-          <button
-            type="button"
-            onClick={() => setShowRecovery(true)}
-            className="
-              w-full mt-4 text-[8px]
-              text-slate-700 font-black uppercase
-              tracking-[0.25em]
-              hover:text-amber-400
-              transition-colors
-              flex items-center justify-center gap-2
-            "
-          >
-            <Wrench className="h-3 w-3" />
-            ¿Problemas para entrar en este equipo?
-          </button>
-        )}
-      </div>
-
-      <p
-        className="
-          absolute bottom-2 text-center
-          text-[8px] text-slate-700
-          font-mono uppercase tracking-[0.3em]
-        "
-      >
-        Valkyron Group Deployment — Barquisimeto Hub
-      </p>
+        <p className="pb-[max(1.25rem,env(safe-area-inset-bottom))] text-xs text-[#9AA0A8]">
+          Valkyron Group, Barquisimeto
+        </p>
+      </main>
     </div>
   );
 };

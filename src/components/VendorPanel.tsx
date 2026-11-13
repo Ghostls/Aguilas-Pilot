@@ -1,10 +1,32 @@
+// src/components/VendorPanel.tsx
+// VALKYRON OS v2.0 — Proveedores · B&M MANTENIMIENTO AERONÁUTICO
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v2.0 — REBRAND B&M + CONEXIONES:
+//   [FIX] Alta: setVendors([entry, ...vendors]) usaba la lista capturada al
+//         renderizar; si la flota/proveedores se refrescaban mientras se
+//         guardaba, se perdían filas. Ahora es funcional (prev => ...).
+//   [FIX] Alta: si el INSERT no devuelve fila (RLS sin SELECT), data[0] era
+//         undefined y la pantalla fallaba. Ahora se avisa y se cierra limpio.
+//   [FIX] Filtro: v.name / vendor.id nulos rompían el render (toLowerCase /
+//         slice sobre undefined). Se normalizan con String(... ?? '').
+//   [FIX] Llamar / Escribir con teléfono o correo vacío abrían "tel:undefined".
+//         Ahora quedan deshabilitados; el teléfono se limpia para el enlace.
+//   [UI]  Estética B&M (bm-ui): barra con búsqueda, categorías segmentadas con
+//         conteo, tarjetas con contacto completo, alta en BmModal.
+// PRESERVADO ÍNTEGRO: categorías, payload a `proveedores`, mapeo a Vendor,
+//   filtro por nombre + categoría, reseteo del formulario al cerrar.
+// ─────────────────────────────────────────────────────────────────────────────
+
 import React, { useState } from 'react';
 import { Vendor } from '../Types/Maintenance';
-import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
 import { supabase } from '../lib/supabaseClient';
 import {
-  PlusCircle, X, Truck, Phone, Mail, Search,
-  ShieldCheck, Fuel, Wrench, Box, Settings, Loader2
+  BmModal, BmField, BmSelect, BmBadge, BmEmpty,
+  bmInput, bmBtn, bmIconTone, type BmTone,
+} from './brand/bm-ui';
+import {
+  PlusCircle, Truck, Phone, Mail, Search,
+  ShieldCheck, Fuel, Wrench, Box, Settings, Loader2, User, X,
 } from 'lucide-react';
 
 interface VendorPanelProps {
@@ -24,6 +46,18 @@ const EMPTY_VENDOR = {
   phone: '',
 };
 
+// [v2.0] Tono por categoría (antes: colores sueltos sobre negro)
+const CATEGORY_TONE: Record<string, BmTone> = {
+  'Combustible':        'info',
+  'Repuestos':          'red',
+  'Consumibles':        'ok',
+  'Servicios Técnicos': 'dark',
+};
+
+// [v2.0] Normalizadores defensivos
+const texto = (v: unknown): string => String(v ?? '').trim();
+const telHref = (phone: unknown): string => texto(phone).replace(/[^\d+]/g, '');
+
 export const VendorPanel: React.FC<VendorPanelProps> = ({ vendors, setVendors }) => {
   const [isAdding, setIsAdding]             = useState(false);
   const [searchTerm, setSearchTerm]         = useState('');
@@ -33,11 +67,11 @@ export const VendorPanel: React.FC<VendorPanelProps> = ({ vendors, setVendors })
 
   const getCategoryIcon = (category: string) => {
     switch (category) {
-      case 'Combustible':        return <Fuel     className="h-5 w-5 text-blue-400" />;
-      case 'Repuestos':          return <Wrench   className="h-5 w-5 text-[#E1AD01]" />;
-      case 'Consumibles':        return <Box      className="h-5 w-5 text-green-500" />;
-      case 'Servicios Técnicos': return <Settings className="h-5 w-5 text-purple-500" />;
-      default:                   return <Truck    className="h-5 w-5 text-slate-400" />;
+      case 'Combustible':        return <Fuel     className="h-5 w-5" />;
+      case 'Repuestos':          return <Wrench   className="h-5 w-5" />;
+      case 'Consumibles':        return <Box      className="h-5 w-5" />;
+      case 'Servicios Técnicos': return <Settings className="h-5 w-5" />;
+      default:                   return <Truck    className="h-5 w-5" />;
     }
   };
 
@@ -61,28 +95,35 @@ export const VendorPanel: React.FC<VendorPanelProps> = ({ vendors, setVendors })
 
       if (error) throw error;
 
-      if (data) {
-        const row = data[0];
-        const entry: Vendor = {
-          id:            row.id,
-          name:          row.nombre_empresa,
-          taxId:         'S/N',
-          category:      row.categoria,
-          contactPerson: row.contacto_nombre,
-          email:         row.email,
-          phone:         row.telefono,
-          location:      'VENEZUELA',
-          rating:        5,
-          providedItems: [],
-        };
-
-        setVendors([entry, ...vendors]);
+      // [FIX v2.0] Sin fila de vuelta no hay con qué pintar la tarjeta
+      const row = Array.isArray(data) ? data[0] : null;
+      if (!row) {
+        alert('Proveedor enviado, pero el servidor no devolvió el registro. Recargue el módulo para verlo.');
         setIsAdding(false);
         setNewVendor(EMPTY_VENDOR);
+        return;
       }
+
+      const entry: Vendor = {
+        id:            row.id,
+        name:          row.nombre_empresa,
+        taxId:         'S/N',
+        category:      row.categoria,
+        contactPerson: row.contacto_nombre,
+        email:         row.email,
+        phone:         row.telefono,
+        location:      'VENEZUELA',
+        rating:        5,
+        providedItems: [],
+      };
+
+      // [FIX v2.0] Actualización funcional: no pisa cambios concurrentes
+      setVendors(prev => [entry, ...prev.filter(v => String(v.id) !== String(entry.id))]);
+      setIsAdding(false);
+      setNewVendor(EMPTY_VENDOR);
     } catch (err: any) {
-      console.error('[VendorPanel] Falla:', err.message);
-      alert('ERROR DE INYECCIÓN: ' + err.message);
+      console.error('[VendorPanel] Falla:', err?.message);
+      alert('ERROR DE INYECCIÓN: ' + (err?.message ?? 'Desconocido'));
     } finally {
       setLoading(false);
     }
@@ -93,228 +134,254 @@ export const VendorPanel: React.FC<VendorPanelProps> = ({ vendors, setVendors })
     setNewVendor(EMPTY_VENDOR);
   };
 
+  const term = searchTerm.toLowerCase();
   const filteredVendors = vendors.filter(v => {
-    const matchesSearch   = v.name.toLowerCase().includes(searchTerm.toLowerCase());
+    const matchesSearch   = texto(v.name).toLowerCase().includes(term);
     const matchesCategory = activeCategory === 'Todas' || v.category === activeCategory;
     return matchesSearch && matchesCategory;
   });
 
+  // [v2.0] Conteo por categoría para los segmentos
+  const countFor = (cat: CategoryFilter) =>
+    cat === 'Todas' ? vendors.length : vendors.filter(v => v.category === cat).length;
+
+  const hayFiltro = !!searchTerm.trim() || activeCategory !== 'Todas';
+
   return (
-    <div className="space-y-8 animate-in fade-in duration-700 text-left font-sans">
+    <div className="bm-app space-y-4 text-left text-bm-ink sm:space-y-5">
 
       {/* ACTION HEADER */}
-      <div className="flex flex-col md:flex-row justify-between items-center gap-4
-                      bg-white/5 p-4 rounded-2xl border border-white/10 shadow-2xl backdrop-blur-md">
-
-        <div className="relative w-full md:w-96 font-mono">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
-          <input
-            type="text"
-            placeholder="FILTRAR ALIADOS..."
-            className="w-full bg-black border border-white/10 p-3 pl-10 rounded-xl
-                       text-xs text-white outline-none focus:border-[#E1AD01] transition-all
-                       uppercase tracking-widest"
-            value={searchTerm}
-            onChange={e => setSearchTerm(e.target.value)}
-          />
+      <div className="space-y-3 rounded-[24px] border border-bm-line bg-white p-4 sm:p-5">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-bm-hint" />
+            <input
+              type="search"
+              aria-label="Buscar proveedor por nombre"
+              placeholder="Buscar proveedor por nombre"
+              className={`${bmInput} pl-11 pr-11`}
+              value={searchTerm}
+              onChange={e => setSearchTerm(e.target.value)}
+            />
+            {searchTerm && (
+              <button type="button" onClick={() => setSearchTerm('')} aria-label="Limpiar búsqueda"
+                className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-lg text-bm-steel hover:bg-bm-canvas hover:text-bm-ink">
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+          <button type="button" onClick={() => setIsAdding(true)} className={`${bmBtn.primary} w-full md:w-auto`}>
+            <PlusCircle className="h-5 w-5" /> Registrar proveedor
+          </button>
         </div>
 
-        <div className="flex bg-black rounded-xl p-1 border border-white/5 overflow-x-auto">
-          {CATEGORIES.map(cat => (
-            <button
-              key={cat}
-              onClick={() => setActiveCategory(cat)}
-              className={`px-4 py-2 rounded-lg text-[9px] font-black uppercase transition-all
-                          whitespace-nowrap tracking-widest
-                          ${activeCategory === cat
-                            ? 'bg-[#E1AD01] text-black'
-                            : 'text-slate-500 hover:text-white'}`}
-            >
-              {cat}
-            </button>
-          ))}
+        <div role="group" aria-label="Filtrar por categoría"
+          className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-0.5">
+          {CATEGORIES.map(cat => {
+            const active = activeCategory === cat;
+            return (
+              <button
+                key={cat}
+                type="button"
+                aria-pressed={active}
+                onClick={() => setActiveCategory(cat)}
+                className={`flex h-10 shrink-0 items-center gap-2 rounded-xl px-3.5 text-sm transition-colors ${
+                  active ? 'bg-bm-ink font-semibold text-white' : 'border border-bm-line font-medium text-bm-steel hover:text-bm-ink'
+                }`}
+              >
+                {cat}
+                <span className={`bm-num rounded-full px-1.5 text-[11px] ${active ? 'bg-white/15' : 'bg-bm-canvas'}`}>
+                  {countFor(cat)}
+                </span>
+              </button>
+            );
+          })}
         </div>
-
-        <button
-          onClick={() => setIsAdding(true)}
-          className="w-full md:w-auto flex items-center justify-center gap-2
-                     bg-[#E1AD01] text-black px-6 py-3 rounded-xl font-black text-xs
-                     hover:bg-white transition-all shadow-lg uppercase tracking-widest"
-        >
-          <PlusCircle className="h-4 w-4" /> Registrar Aliado
-        </button>
       </div>
 
       {/* VENDOR GRID */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {filteredVendors.length === 0 ? (
-          <p className="col-span-3 text-center text-slate-700 text-[10px] font-black
-                        uppercase tracking-widest py-16">
-            Sin proveedores registrados para esta categoría
-          </p>
-        ) : (
-          filteredVendors.map(vendor => (
-            <Card
-              key={vendor.id}
-              className="bg-[#0f0f0f] border border-white/10 hover:border-[#E1AD01]/40
-                         transition-all group shadow-xl"
-            >
-              <CardHeader className="border-b border-white/5 pb-5 pt-6 flex flex-row items-center gap-4">
-                <div className="p-3 bg-white/5 rounded-2xl border border-white/10">
-                  {getCategoryIcon(vendor.category)}
-                </div>
-                <div className="flex-1 text-left min-w-0">
-                  <CardTitle className="text-white font-black text-lg tracking-tighter
-                                        uppercase leading-tight truncate">
-                    {vendor.name}
-                  </CardTitle>
-                  <span className="text-[9px] text-[#E1AD01] font-mono font-bold uppercase">
-                    {vendor.category}
-                  </span>
-                </div>
-              </CardHeader>
-
-              <CardContent className="pt-5 space-y-4 font-mono text-left">
-                <div className="space-y-2 text-[10px] uppercase">
-                  <div className="flex justify-between border-b border-white/5 pb-2">
-                    <span className="text-slate-600 font-bold tracking-widest">Atención</span>
-                    <span className="text-white font-black truncate ml-2">{vendor.contactPerson}</span>
-                  </div>
-                  <div className="flex justify-between border-b border-white/5 pb-2">
-                    <span className="text-slate-600 font-bold tracking-widest">ID Sistema</span>
-                    <span className="text-slate-500 font-black truncate ml-2 text-[8px]">
-                      {vendor.id.slice(0, 18)}…
-                    </span>
-                  </div>
-                </div>
-
-                <div className="pt-3 flex gap-3">
-                  <a
-                    href={`tel:${vendor.phone}`}
-                    className="flex-1 flex items-center justify-center gap-2 bg-white/5
-                               hover:bg-[#E1AD01]/20 p-3.5 rounded-xl transition-all border border-white/5"
-                  >
-                    <Phone className="h-3.5 w-3.5 text-[#E1AD01]" />
-                    <span className="text-[9px] font-black uppercase text-white">Call</span>
-                  </a>
-                  <a
-                    href={`mailto:${vendor.email}`}
-                    className="flex-1 flex items-center justify-center gap-2 bg-white/5
-                               hover:bg-[#E1AD01]/20 p-3.5 rounded-xl transition-all border border-white/5"
-                  >
-                    <Mail className="h-3.5 w-3.5 text-[#E1AD01]" />
-                    <span className="text-[9px] font-black uppercase text-white">Mail</span>
-                  </a>
-                </div>
-              </CardContent>
-            </Card>
-          ))
-        )}
-      </div>
-
-      {/* REGISTER MODAL */}
-      {isAdding && (
-        <div className="fixed inset-0 bg-black/95 backdrop-blur-md z-[100]
-                        flex items-center justify-center p-4">
-          <Card className="bg-[#0f0f0f] border border-[#E1AD01]/30 w-full max-w-lg
-                           shadow-2xl overflow-hidden">
-            <CardHeader className="flex flex-row justify-between items-center
-                                   border-b border-white/5 bg-white/[0.02]">
-              <CardTitle className="text-[#E1AD01] text-[10px] font-black uppercase
-                                    tracking-[0.3em] flex items-center gap-2">
-                <ShieldCheck className="h-4 w-4" /> Alta de Proveedor Valkyron
-              </CardTitle>
-              <button onClick={handleClose} className="text-slate-500 hover:text-white transition-colors">
-                <X className="h-5 w-5" />
-              </button>
-            </CardHeader>
-
-            <CardContent className="pt-6">
-              <form onSubmit={handleAddVendor} className="space-y-4 font-mono">
-
-                <div className="space-y-1.5 text-left">
-                  <label className="text-[9px] text-slate-600 font-black uppercase">
-                    Nombre de la Empresa
-                  </label>
-                  <input
-                    required
-                    value={newVendor.name}
-                    className="w-full bg-black border border-white/10 p-3 rounded-lg
-                               text-white text-xs outline-none focus:border-[#E1AD01] uppercase"
-                    onChange={e => setNewVendor({ ...newVendor, name: e.target.value })}
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-1.5 text-left">
-                    <label className="text-[9px] text-slate-600 font-black uppercase">Categoría</label>
-                    <select
-                      value={newVendor.category}
-                      className="w-full bg-black border border-white/10 p-3 rounded-lg
-                                 text-white text-xs outline-none focus:border-[#E1AD01]
-                                 [&>option]:bg-black [&>option]:text-white"
-                      onChange={e => setNewVendor({ ...newVendor, category: e.target.value as any })}
-                    >
-                      {CATEGORIES.filter(c => c !== 'Todas').map(c => (
-                        <option key={c} value={c}>{c.toUpperCase()}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="space-y-1.5 text-left">
-                    <label className="text-[9px] text-slate-600 font-black uppercase">
-                      Nombre de Contacto
-                    </label>
-                    <input
-                      required
-                      value={newVendor.contactPerson}
-                      className="w-full bg-black border border-white/10 p-3 rounded-lg
-                                 text-white text-xs outline-none focus:border-[#E1AD01] uppercase"
-                      onChange={e => setNewVendor({ ...newVendor, contactPerson: e.target.value })}
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4 text-left">
-                  <div className="space-y-1.5">
-                    <label className="text-[9px] text-slate-600 font-black uppercase">Teléfono</label>
-                    <input
-                      required
-                      value={newVendor.phone}
-                      className="w-full bg-black border border-white/10 p-3 rounded-lg
-                                 text-white text-xs outline-none focus:border-[#E1AD01]"
-                      onChange={e => setNewVendor({ ...newVendor, phone: e.target.value })}
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-[9px] text-slate-600 font-black uppercase">Email</label>
-                    <input
-                      required
-                      type="email"
-                      value={newVendor.email}
-                      className="w-full bg-black border border-white/10 p-3 rounded-lg
-                                 text-white text-xs outline-none focus:border-[#E1AD01]"
-                      onChange={e => setNewVendor({ ...newVendor, email: e.target.value })}
-                    />
-                  </div>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="w-full bg-[#E1AD01] text-black font-black py-4 rounded-xl mt-4
-                             flex items-center justify-center gap-2 uppercase text-[10px]
-                             tracking-widest shadow-2xl disabled:opacity-50 hover:bg-white transition-all"
-                >
-                  {loading
-                    ? <Loader2 className="h-4 w-4 animate-spin" />
-                    : 'REGISTRAR PROVEEDOR EN NODO'
-                  }
+      {filteredVendors.length === 0 ? (
+        <div className="rounded-[24px] border border-dashed border-bm-line bg-white">
+          {vendors.length === 0 ? (
+            <BmEmpty
+              icon={<Truck className="h-5 w-5" />}
+              title="Sin proveedores registrados"
+              text="Registre a sus proveedores de repuestos, consumibles, servicios y combustible."
+              action={
+                <button type="button" onClick={() => setIsAdding(true)} className={bmBtn.primary}>
+                  <PlusCircle className="h-5 w-5" /> Registrar proveedor
                 </button>
-              </form>
-            </CardContent>
-          </Card>
+              }
+            />
+          ) : (
+            <BmEmpty
+              icon={<Search className="h-5 w-5" />}
+              title="Ningún proveedor coincide"
+              text="Pruebe con otro nombre o cambie de categoría."
+              action={hayFiltro ? (
+                <button type="button" onClick={() => { setSearchTerm(''); setActiveCategory('Todas'); }}
+                  className={bmBtn.secondary}>
+                  Ver todos
+                </button>
+              ) : undefined}
+            />
+          )}
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {filteredVendors.map(vendor => {
+            const tone   = CATEGORY_TONE[texto(vendor.category)] ?? 'neutral';
+            const phone  = telHref(vendor.phone);
+            const email  = texto(vendor.email);
+            const idCorto = texto(vendor.id).slice(0, 8).toUpperCase();
+            return (
+              <article key={vendor.id} className="flex flex-col rounded-[20px] border border-bm-line bg-white p-4 sm:p-5">
+                <header className="flex items-start gap-3.5">
+                  <span className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl ${bmIconTone[tone]}`}>
+                    {getCategoryIcon(texto(vendor.category))}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <h3 className="bm-heading line-clamp-2 break-words text-base uppercase leading-tight" title={texto(vendor.name)}>
+                      {texto(vendor.name) || 'Sin nombre'}
+                    </h3>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      <BmBadge tone={tone === 'red' || tone === 'dark' ? 'neutral' : tone}>
+                        {texto(vendor.category) || 'Sin categoría'}
+                      </BmBadge>
+                      {idCorto && <span className="font-data text-[11px] text-bm-hint">#{idCorto}</span>}
+                    </div>
+                  </div>
+                </header>
+
+                <dl className="mt-4 flex-1 space-y-2 border-t border-bm-line pt-4 text-sm">
+                  <div className="flex items-center gap-2.5">
+                    <dt className="sr-only">Atención</dt>
+                    <User className="h-4 w-4 shrink-0 text-bm-steel" aria-hidden="true" />
+                    <dd className="truncate uppercase">{texto(vendor.contactPerson) || <span className="normal-case text-bm-hint">Sin contacto</span>}</dd>
+                  </div>
+                  <div className="flex items-center gap-2.5">
+                    <dt className="sr-only">Teléfono</dt>
+                    <Phone className="h-4 w-4 shrink-0 text-bm-steel" aria-hidden="true" />
+                    <dd className="bm-num truncate">{texto(vendor.phone) || <span className="text-bm-hint">Sin teléfono</span>}</dd>
+                  </div>
+                  <div className="flex items-center gap-2.5">
+                    <dt className="sr-only">Correo</dt>
+                    <Mail className="h-4 w-4 shrink-0 text-bm-steel" aria-hidden="true" />
+                    <dd className="truncate">{email || <span className="text-bm-hint">Sin correo</span>}</dd>
+                  </div>
+                </dl>
+
+                <div className="mt-4 flex gap-2">
+                  {phone ? (
+                    <a href={`tel:${phone}`} className={`${bmBtn.secondary} ${bmBtn.sm} flex-1`}>
+                      <Phone className="h-4 w-4" /> Llamar
+                    </a>
+                  ) : (
+                    <span aria-disabled="true" className={`${bmBtn.secondary} ${bmBtn.sm} flex-1 cursor-not-allowed opacity-50 hover:!border-bm-line hover:!text-bm-ink`}>
+                      <Phone className="h-4 w-4" /> Llamar
+                    </span>
+                  )}
+                  {email ? (
+                    <a href={`mailto:${email}`} className={`${bmBtn.secondary} ${bmBtn.sm} flex-1`}>
+                      <Mail className="h-4 w-4" /> Escribir
+                    </a>
+                  ) : (
+                    <span aria-disabled="true" className={`${bmBtn.secondary} ${bmBtn.sm} flex-1 cursor-not-allowed opacity-50 hover:!border-bm-line hover:!text-bm-ink`}>
+                      <Mail className="h-4 w-4" /> Escribir
+                    </span>
+                  )}
+                </div>
+              </article>
+            );
+          })}
         </div>
       )}
+
+      {/* REGISTER MODAL */}
+      <BmModal
+        open={isAdding}
+        onClose={handleClose}
+        busy={loading}
+        title="Registrar proveedor"
+        subtitle="Alta en el directorio de proveedores de B&M"
+        icon={<ShieldCheck className="h-5 w-5" />}
+        tone="red"
+        z={100}
+      >
+        <form onSubmit={handleAddVendor} className="space-y-4">
+          <BmField label="Nombre de la empresa" htmlFor="vd-name" required>
+            <input
+              id="vd-name"
+              required
+              autoComplete="organization"
+              value={newVendor.name}
+              className={`${bmInput} uppercase`}
+              onChange={e => setNewVendor({ ...newVendor, name: e.target.value })}
+            />
+          </BmField>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <BmField label="Categoría" htmlFor="vd-cat">
+              <BmSelect
+                id="vd-cat"
+                value={newVendor.category}
+                onChange={e => setNewVendor({ ...newVendor, category: e.target.value as any })}
+              >
+                {CATEGORIES.filter(c => c !== 'Todas').map(c => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </BmSelect>
+            </BmField>
+            <BmField label="Persona de contacto" htmlFor="vd-contact" required>
+              <input
+                id="vd-contact"
+                required
+                autoComplete="name"
+                value={newVendor.contactPerson}
+                className={`${bmInput} uppercase`}
+                onChange={e => setNewVendor({ ...newVendor, contactPerson: e.target.value })}
+              />
+            </BmField>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <BmField label="Teléfono" htmlFor="vd-phone" required>
+              <input
+                id="vd-phone"
+                required
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                value={newVendor.phone}
+                className={`${bmInput} bm-num`}
+                onChange={e => setNewVendor({ ...newVendor, phone: e.target.value })}
+              />
+            </BmField>
+            <BmField label="Correo" htmlFor="vd-email" required>
+              <input
+                id="vd-email"
+                required
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                value={newVendor.email}
+                className={bmInput}
+                onChange={e => setNewVendor({ ...newVendor, email: e.target.value })}
+              />
+            </BmField>
+          </div>
+
+          <div className="flex flex-col-reverse gap-3 pt-1 sm:flex-row">
+            <button type="button" onClick={handleClose} disabled={loading} className={`${bmBtn.secondary} sm:flex-1`}>
+              Cancelar
+            </button>
+            <button type="submit" disabled={loading} className={`${bmBtn.primary} sm:flex-[2]`}>
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlusCircle className="h-4 w-4" />}
+              {loading ? 'Registrando…' : 'Registrar proveedor'}
+            </button>
+          </div>
+        </form>
+      </BmModal>
     </div>
   );
 };

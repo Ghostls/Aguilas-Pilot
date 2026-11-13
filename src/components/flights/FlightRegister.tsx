@@ -1,5 +1,36 @@
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  VALKYRON FLIGHT SYSTEM — FLIGHT REGISTER v7.0                             ║
+// ║  VALKYRON FLIGHT SYSTEM — FLIGHT REGISTER v7.1 · B&M                       ║
+// ║  v7.1 REBRAND B&M + CONEXIONES (sobre v7.0):                               ║
+// ║    — [UI] Estética B&M mobile-first: superficies blancas, rojo B&M como    ║
+// ║      acción principal, campos de 48 px (16 px, sin zoom en iOS). Sin       ║
+// ║      pantalla completa negra: vive dentro del Centro de Mando.             ║
+// ║    — [UI] Las confirmaciones (sin tarifa, saldo, crédito, combustible,     ║
+// ║      TAC vs ruta, TAC solapado, posponer día) pasan de window.confirm a    ║
+// ║      un modal B&M con el mismo orden y los mismos datos.                   ║
+// ║    — [FIX] Límite de crédito (administración): el diálogo decía           ║
+// ║      "Cancelar = registrar el vuelo con cobro pendiente", así que          ║
+// ║      Cancelar NO cancelaba. Ahora hay dos botones con su acción escrita    ║
+// ║      (Autorizar cobro / Registrar con cobro pendiente) y cerrar el diálogo ║
+// ║      no registra nada.                                                     ║
+// ║    — [FIX] Combustible de la aeronave: un solo SELECT (tope de 1.000 filas ║
+// ║      de PostgREST) y sin contar los consumos BURN que descuenta AVGAS.     ║
+// ║      Ahora lectura completa por lotes, misma regla que AVGAS y, para el    ║
+// ║      aviso de seguridad, OUT también descuenta (estimación conservadora).  ║
+// ║      Respuestas obsoletas descartadas al cambiar de aeronave.              ║
+// ║    — [FIX] Posponer día ignoraba el error de posponer_dia_vuelo y          ║
+// ║      anunciaba "✓ undefined misiones pospuestas".                          ║
+// ║    — [FIX] Si supabase.auth.getUser() fallaba, "Inicializando sistema…"    ║
+// ║      quedaba para siempre. El usuario sale de la sesión verificada por     ║
+// ║      AuthContext; getUser queda como respaldo con error visible.           ║
+// ║    — [FIX] Registro heredado: los fallos de horas del alumno, combustible, ║
+// ║      deuda o asignación se ignoraban y se anunciaba "SINCRONIZADA". Ahora  ║
+// ║      se listan en el aviso final.                                          ║
+// ║    — PRESERVADO ÍNTEGRO: fn_vuelo_registrar / fn_vuelo_saldos, registro    ║
+// ║      heredado completo, cascada A→B→C, reservas de Planificación, nombres  ║
+// ║      desde perfiles_estudiantes, rutas y coherencia ±20 % / ±40 %, cálculo ║
+// ║      de producción, tarifas, evidencia de tacómetros, AbortController,     ║
+// ║      reintentos con backoff, props { onFlightLogUpdate }.                  ║
+// ╠══════════════════════════════════════════════════════════════════════════════╣
 // ║  v7.0 EVOLUCIÓN (sobre v6.2) — DESCUENTO DE HORAS ↔ BILLETERA (v18 SQL):   ║
 // ║    — [NEW] Cierre de bitácora en UNA transacción: fn_vuelo_registrar      ║
 // ║      (bitácora + horas alumno + combustible + asignación VOLADO +         ║
@@ -30,17 +61,23 @@
 // ║    — ASIG_SELECT corregido: sin carrera_id (no existe en tabla base)       ║
 // ║  v6.1 preservado: AbortController, retry backoff, normalizarSedeDB,        ║
 // ║    maybeSingle, initError UI, rutas_vuelo degradación silenciosa,          ║
-// ║    toda la lógica de vuelo, liquid glass, componentes atómicos.            ║
+// ║    toda la lógica de vuelo, componentes atómicos.                          ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/lib/supabaseClient';
+import { useAuth } from '@/context/AuthContext';                       // [v7.1]
+import {
+  BmBadge, BmEmpty, BmNotice, BmSelect, bmBtn, bmInput, bmLabel, bmTextarea,
+  useBmConfirm, type BmConfirmOptions,
+} from '@/components/brand/bm-ui';                                       // [v7.1]
 import {
   Loader2, Plane, ShieldCheck, Camera,
   FileCheck, Activity, AlertTriangle, Fuel, MapPin,
   CloudRain, Calendar, CheckCircle2, ChevronRight, Clock,
   DollarSign, Navigation, ChevronDown, WifiOff, RefreshCw,
   Wallet, Receipt,   // [NEW v7.0]
+  Gauge, UserRound,  // [v7.1]
 } from 'lucide-react';
 // [NEW v7.0] Contratos de fn_vuelo_saldos / fn_vuelo_registrar (migracion_vuelos_v18_billetera.sql)
 import type {
@@ -114,6 +151,9 @@ const RATE_HORA_CAPITAN  = 15;
 const RATE_HORA_ACADEMIA = 180;
 const FETCH_RETRY_LIMIT  = 3;
 const FETCH_RETRY_DELAY  = 1500;
+// [v7.1] Lectura de combustible por lotes
+const FUEL_BATCH         = 500;
+const FUEL_MAX_BATCHES   = 200;   // tope: 100.000 movimientos por aeronave
 
 const SEDES = ['BARQUISIMETO', 'MATURÍN'] as const;
 type Sede = typeof SEDES[number];
@@ -133,17 +173,13 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LIQUID GLASS
+// [v7.1] SUPERFICIES B&M (sustituyen el "liquid glass" oscuro de v6/v7.0)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const glass = {
-  base:    'backdrop-blur-3xl bg-white/[0.04] border border-white/[0.09] shadow-[0_8px_32px_rgba(0,0,0,0.4)]',
-  gold:    'backdrop-blur-3xl bg-[#E1AD01]/[0.06] border border-[#E1AD01]/[0.18] shadow-[0_8px_32px_rgba(225,173,1,0.08)]',
-  emerald: 'backdrop-blur-3xl bg-emerald-500/[0.06] border border-emerald-500/[0.18] shadow-[0_8px_32px_rgba(16,185,129,0.08)]',
-  red:     'backdrop-blur-3xl bg-red-500/[0.06] border border-red-500/[0.18] shadow-[0_8px_32px_rgba(239,68,68,0.08)]',
-  orange:  'backdrop-blur-3xl bg-orange-500/[0.06] border border-orange-500/[0.18] shadow-[0_8px_32px_rgba(249,115,22,0.08)]',
-  dark:    'backdrop-blur-3xl bg-black/[0.45] border border-white/[0.06] shadow-[0_8px_32px_rgba(0,0,0,0.6)]',
-  amber:   'backdrop-blur-3xl bg-amber-500/[0.06] border border-amber-500/[0.18] shadow-[0_8px_32px_rgba(245,158,11,0.08)]',
+const surface = {
+  card:  'rounded-[24px] border border-bm-line bg-white',
+  tile:  'rounded-2xl border border-bm-line bg-white',
+  soft:  'rounded-2xl bg-bm-canvas',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,6 +291,23 @@ const horasDeudaLegacy = (concepto: string | null | undefined): number => {
 };
 
 /**
+ * [v7.1] Efecto de un movimiento de combustible sobre el saldo de una aeronave.
+ * Regla de AVGAS (IN +, TRANSFER −/+, BURN −) y, para este aviso de seguridad,
+ * OUT (salida del registro heredado) también descuenta: ante la duda se estima
+ * menos combustible, nunca más.
+ */
+const efectoCombustible = (r: { operation_type?: unknown; liters?: unknown; aircraft_id?: unknown; destination_aircraft_id?: unknown }, matricula: string): number => {
+  const lts = Number(r.liters) || 0;
+  const t   = String(r.operation_type ?? '');
+  let delta = 0;
+  if (t === 'IN'       && r.aircraft_id === matricula) delta += lts;
+  if (t === 'TRANSFER' && r.aircraft_id === matricula) delta -= lts;
+  if (t === 'TRANSFER' && r.destination_aircraft_id === matricula) delta += lts;
+  if ((t === 'BURN' || t === 'OUT') && r.aircraft_id === matricula) delta -= lts;
+  return delta;
+};
+
+/**
  * Integra las reservas CONFIRMADAS/COMPLETADAS de hoy (Planificación) con las asignaciones del día.
  * Un alumno con asignación conserva su fila (se le adjunta la reserva); si no, la reserva crea su fila.
  */
@@ -313,6 +366,16 @@ interface RutaSelectorProps {
 
 const RutaSelector: React.FC<RutaSelectorProps> = ({ rutas, selected, onSelect, saldo, deltaTac }) => {
   const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null); // [v7.1] cierre al tocar fuera / Escape
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => { if (!boxRef.current?.contains(e.target as Node)) setOpen(false); };
+    const onKey  = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('pointerdown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('pointerdown', onDown); document.removeEventListener('keydown', onKey); };
+  }, [open]);
 
   const coherencia = useMemo(() => {
     if (!selected || deltaTac <= 0) return null;
@@ -323,43 +386,44 @@ const RutaSelector: React.FC<RutaSelectorProps> = ({ rutas, selected, onSelect, 
   }, [selected, deltaTac]);
 
   return (
-    <div className="flex flex-col space-y-2 w-full">
-      <label className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest ml-1 flex items-center gap-1.5">
-        <Navigation className="h-3 w-3" /> Ruta del Vuelo
-      </label>
+    <div className="flex w-full flex-col space-y-2">
+      <span className={`${bmLabel} flex items-center gap-1.5`} id="fr-ruta-label">
+        <Navigation className="h-4 w-4 text-bm-steel" /> Ruta del vuelo <span className="text-bm-red" aria-hidden="true">*</span>
+      </span>
 
-      <div className="relative">
+      <div className="relative" ref={boxRef}>
         <button
           type="button"
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          aria-labelledby="fr-ruta-label"
           onClick={() => setOpen(o => !o)}
-          className={`w-full flex items-center justify-between gap-3 bg-white/[0.04] backdrop-blur-xl
-                      border rounded-2xl p-4 text-left transition-all
-                      ${open ? 'border-[#E1AD01]/60 bg-[#E1AD01]/[0.03]' : 'border-white/[0.09] hover:border-white/20'}`}
+          className={`flex min-h-12 w-full items-center justify-between gap-3 rounded-xl border bg-white px-4 py-2.5 text-left transition-[border-color,box-shadow] ${
+            open ? 'border-bm-red ring-4 ring-bm-red/10' : 'border-bm-field hover:border-bm-steel/40'}`}
         >
-          <div className="flex items-center gap-3 min-w-0">
-            <Navigation className="h-4 w-4 text-[#E1AD01] flex-shrink-0" />
+          <div className="flex min-w-0 items-center gap-3">
+            <Navigation className="h-4 w-4 shrink-0 text-bm-red" />
             <div className="min-w-0">
               {selected ? (
                 <>
-                  <p className="text-white text-sm font-black uppercase truncate">{selected.destino}</p>
-                  <p className="text-[#E1AD01]/70 text-[9px] font-black uppercase tracking-widest">
-                    Ref. {selected.horas_tac}h TAC esperadas
-                  </p>
+                  <p className="truncate text-base font-semibold uppercase">{selected.destino}</p>
+                  <p className="text-xs text-bm-steel">Referencia: <span className="bm-num">{selected.horas_tac}</span> h TAC esperadas</p>
                 </>
               ) : (
-                <p className="text-zinc-500 text-sm font-bold uppercase">Seleccionar destino...</p>
+                <p className="text-base text-bm-hint">Seleccione el destino</p>
               )}
             </div>
           </div>
-          <ChevronDown className={`h-4 w-4 text-zinc-500 flex-shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+          <ChevronDown className={`h-4 w-4 shrink-0 text-bm-steel transition-transform ${open ? 'rotate-180' : ''}`} />
         </button>
 
         {open && (
-          <div className={`absolute top-full left-0 right-0 mt-2 z-50 ${glass.dark} rounded-2xl overflow-hidden shadow-2xl`}>
+          <div role="listbox" aria-labelledby="fr-ruta-label"
+            className="absolute left-0 right-0 top-full z-50 mt-2 max-h-80 overflow-y-auto rounded-2xl border border-bm-line bg-white shadow-bm-pop">
             {rutas.length === 0 ? (
-              <div className="py-8 text-center space-y-1">
-                <p className="text-zinc-600 text-[10px] font-black uppercase tracking-widest">Sin rutas disponibles</p>
-                <p className="text-zinc-700 text-[8px] font-mono">Ejecutar migración SQL rutas_vuelo</p>
+              <div className="space-y-1 px-4 py-8 text-center">
+                <p className="text-sm font-semibold">Sin rutas disponibles</p>
+                <p className="text-xs text-bm-steel">Ejecute la migración SQL de rutas_vuelo para esta sede.</p>
               </div>
             ) : (
               rutas.map(ruta => {
@@ -369,24 +433,25 @@ const RutaSelector: React.FC<RutaSelectorProps> = ({ rutas, selected, onSelect, 
                   <button
                     key={ruta.id}
                     type="button"
+                    role="option"
+                    aria-selected={isSelected}
                     onClick={() => { onSelect(ruta); setOpen(false); }}
-                    className={`w-full flex items-center justify-between px-5 py-3.5
-                                border-b border-white/[0.05] last:border-0 text-left transition-all
-                                ${isSelected ? 'bg-[#E1AD01]/10' : 'hover:bg-white/[0.04]'}`}
+                    className={`flex w-full items-center justify-between gap-3 border-b border-bm-line px-4 py-3 text-left transition-colors last:border-0 ${
+                      isSelected ? 'bg-bm-red-tint' : 'hover:bg-bm-canvas'}`}
                   >
-                    <div>
-                      <p className={`text-sm font-black uppercase ${isSelected ? 'text-[#E1AD01]' : 'text-white'}`}>
+                    <div className="min-w-0">
+                      <p className={`truncate text-sm font-semibold uppercase ${isSelected ? 'text-bm-red-deep' : ''}`}>
                         {ruta.destino}
                       </p>
                       {!suficiente && (
-                        <p className="text-[8px] text-red-400 font-mono mt-0.5">Saldo insuficiente para esta ruta</p>
+                        <p className="mt-0.5 text-xs text-bm-red">Saldo insuficiente para esta ruta</p>
                       )}
                     </div>
-                    <div className="flex items-center gap-2">
-                      {!suficiente && <AlertTriangle className="h-3 w-3 text-red-400" />}
-                      <span className={`text-sm font-black font-mono ${
-                        isSelected ? 'text-[#E1AD01]' : suficiente ? 'text-zinc-300' : 'text-red-400/60'
-                      }`}>{ruta.horas_tac}h</span>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {!suficiente && <AlertTriangle className="h-3.5 w-3.5 text-bm-red" />}
+                      <span className={`bm-num text-sm font-semibold ${
+                        isSelected ? 'text-bm-red-deep' : suficiente ? 'text-bm-ink' : 'text-bm-red'
+                      }`}>{ruta.horas_tac} h</span>
                     </div>
                   </button>
                 );
@@ -397,26 +462,18 @@ const RutaSelector: React.FC<RutaSelectorProps> = ({ rutas, selected, onSelect, 
       </div>
 
       {selected && deltaTac > 0 && coherencia !== 'ok' && (
-        <div className={`flex items-start gap-2 px-4 py-3 rounded-xl border text-[9px] font-black uppercase tracking-wide ${
-          coherencia === 'warn'
-            ? 'bg-amber-500/10 border-amber-500/20 text-amber-400'
-            : 'bg-red-500/10 border-red-500/20 text-red-400'
-        }`}>
-          <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
-          <span>
-            Delta TAC ({deltaTac.toFixed(2)}h) difiere{' '}
-            {(Math.abs(deltaTac - selected.horas_tac) / selected.horas_tac * 100).toFixed(0)}%
-            de la ruta {selected.destino} ({selected.horas_tac}h esperadas).
-            {coherencia === 'error' ? ' Verificar tacómetros.' : ' Verificar ruta.'}
-          </span>
-        </div>
+        <BmNotice tone={coherencia === 'warn' ? 'warn' : 'danger'} icon={<AlertTriangle className="h-4 w-4" />}>
+          Delta TAC (<span className="bm-num">{deltaTac.toFixed(2)}</span> h) difiere{' '}
+          <span className="bm-num">{(Math.abs(deltaTac - selected.horas_tac) / selected.horas_tac * 100).toFixed(0)}</span> %
+          de la ruta {selected.destino} ({selected.horas_tac} h esperadas).
+          {coherencia === 'error' ? ' Verifique los tacómetros.' : ' Verifique la ruta.'}
+        </BmNotice>
       )}
 
       {selected && deltaTac > 0 && coherencia === 'ok' && (
-        <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-[9px] font-black uppercase text-emerald-400">
-          <CheckCircle2 className="h-3 w-3" />
-          Delta TAC coherente con ruta {selected.destino}
-        </div>
+        <BmNotice tone="ok" icon={<CheckCircle2 className="h-4 w-4" />}>
+          Delta TAC coherente con la ruta {selected.destino}.
+        </BmNotice>
       )}
     </div>
   );
@@ -443,57 +500,51 @@ const PanelAsignaciones: React.FC<PanelAsignacionesProps> = ({
   const progreso   = asignaciones.length ? Math.round((volados.length / asignaciones.length) * 100) : 0;
 
   return (
-    <div className={`${glass.base} rounded-[2rem] overflow-hidden`}>
-      <div className={`${glass.gold} px-6 py-4 flex items-center justify-between border-b border-[#E1AD01]/[0.12]`}>
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-xl bg-[#E1AD01]/20 flex items-center justify-center">
-            <Calendar size={15} className="text-[#E1AD01]" />
-          </div>
-          <div>
-            <p className="text-[#E1AD01] font-black text-xs uppercase tracking-widest">
-              Misiones del Día — {instructorNombre || 'Sistema'}
-            </p>
-            <p className="text-zinc-500 text-[8px] font-black uppercase tracking-widest mt-0.5">
+    <section className={`${surface.card} overflow-hidden`} aria-labelledby="fr-misiones">
+      <div className="flex flex-col gap-4 border-b border-bm-line p-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-bm-red-tint text-bm-red">
+            <Calendar className="h-5 w-5" />
+          </span>
+          <div className="min-w-0">
+            <h3 id="fr-misiones" className="bm-heading truncate text-base">
+              Misiones del día · {instructorNombre || 'Sistema'}
+            </h3>
+            <p className="text-[13px] text-bm-steel first-letter:uppercase">
               {new Date().toLocaleDateString('es-VE', { weekday: 'long', day: 'numeric', month: 'long' })}
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <span className="text-[9px] font-black uppercase text-zinc-500">{volados.length}/{asignaciones.length}</span>
-            <div className="w-24 h-1.5 bg-white/5 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-[#E1AD01] to-[#f5c842] rounded-full transition-all duration-700"
-                style={{ width: `${progreso}%` }}
-              />
+        <div className="flex items-center gap-3">
+          <div className="flex flex-1 items-center gap-2 sm:flex-none">
+            <span className="bm-num text-[13px] text-bm-steel">{volados.length}/{asignaciones.length}</span>
+            <div className="h-2 flex-1 overflow-hidden rounded-full bg-bm-canvas sm:w-24 sm:flex-none"
+              role="progressbar" aria-valuenow={progreso} aria-valuemin={0} aria-valuemax={100} aria-label="Misiones completadas">
+              <div className="h-full rounded-full bg-bm-red transition-[width] duration-700" style={{ width: `${progreso}%` }} />
             </div>
-            <span className="text-[8px] font-black text-[#E1AD01]">{progreso}%</span>
+            <span className="bm-num text-[13px] font-semibold">{progreso} %</span>
           </div>
 
           <button
+            type="button"
             onClick={onPosponer}
             disabled={posponiendo || pendientes.length === 0}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[9px] font-black
-                        uppercase tracking-widest transition-all disabled:opacity-30
-                        disabled:cursor-not-allowed ${glass.orange}`}
+            className={`${bmBtn.secondary} ${bmBtn.sm} shrink-0`}
           >
-            {posponiendo
-              ? <Loader2 size={12} className="animate-spin text-orange-400" />
-              : <CloudRain size={12} className="text-orange-400" />
-            }
-            <span className="text-orange-400">Posponer día</span>
+            {posponiendo ? <Loader2 className="h-4 w-4 animate-spin" /> : <CloudRain className="h-4 w-4" />}
+            Posponer día
           </button>
         </div>
       </div>
 
-      <div className="p-4 space-y-2">
+      <div className="space-y-2 p-3 sm:p-4">
         {asignaciones.length === 0 ? (
-          <div className="py-10 text-center">
-            <Plane size={32} className="mx-auto mb-3 text-zinc-800 opacity-40" />
-            <p className="text-zinc-700 text-[10px] font-black uppercase tracking-widest">Sin asignaciones para hoy</p>
-            <p className="text-zinc-800 text-[8px] font-mono mt-1">Verificar RPC generar_asignaciones_del_dia y vuelos confirmados por Planificación</p>
-          </div>
+          <BmEmpty
+            icon={<Plane className="h-5 w-5" />}
+            title="Sin asignaciones para hoy"
+            text="Verifique la generación de asignaciones del día y los vuelos confirmados por Planificación."
+          />
         ) : (
           asignaciones.map(a => {
             const esSeleccionado = seleccionado === a.student_id;
@@ -501,71 +552,62 @@ const PanelAsignaciones: React.FC<PanelAsignacionesProps> = ({
             return (
               <button
                 key={a.id}
+                type="button"
                 onClick={() => !yaVolo && onSeleccionar(a)}
                 disabled={yaVolo}
-                className={`w-full flex items-center justify-between p-4 rounded-2xl text-left transition-all group
-                            ${esSeleccionado
-                              ? `${glass.gold} shadow-[0_0_20px_rgba(225,173,1,0.12)]`
-                              : yaVolo
-                              ? `${glass.emerald} opacity-60 cursor-default`
-                              : `${glass.base} hover:border-white/20`
-                            }`}
+                aria-pressed={esSeleccionado}
+                className={`group flex w-full items-center justify-between gap-3 rounded-2xl border p-3 text-left transition-colors sm:p-4 ${
+                  esSeleccionado
+                    ? 'border-bm-red bg-bm-red-tint ring-4 ring-bm-red/10'
+                    : yaVolo
+                    ? 'cursor-default border-bm-line bg-bm-canvas/60'
+                    : 'border-bm-line bg-white hover:border-bm-field'
+                }`}
               >
-                <div className="flex items-center gap-4">
+                <div className="flex min-w-0 items-center gap-3">
                   {a.orden_capitan != null && (
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center
-                                     text-[9px] font-black flex-shrink-0 border ${
-                      yaVolo
-                        ? 'bg-emerald-500/15 border-emerald-500/20 text-emerald-400'
-                        : 'bg-[#E1AD01]/15 border-[#E1AD01]/20 text-[#E1AD01]'
+                    <span className={`bm-num flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold ${
+                      yaVolo ? 'bg-bm-ok-tint text-bm-ok' : 'bg-bm-ink text-white'
                     }`}>
                       {a.orden_capitan}
-                    </div>
+                    </span>
                   )}
-                  <div className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 transition-all ${
-                    yaVolo          ? 'bg-emerald-500/15 border border-emerald-500/20'
-                    : esSeleccionado ? 'bg-[#E1AD01]/15 border border-[#E1AD01]/25'
-                    :                  'bg-white/[0.04] border border-white/10'
+                  <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${
+                    yaVolo          ? 'bg-bm-ok-tint text-bm-ok'
+                    : esSeleccionado ? 'bg-bm-red text-white'
+                    :                  'bg-bm-canvas text-bm-steel'
                   }`}>
-                    {yaVolo
-                      ? <CheckCircle2 size={16} className="text-emerald-400" />
-                      : <Plane size={16} className={esSeleccionado ? 'text-[#E1AD01]' : 'text-zinc-500'} />
-                    }
-                  </div>
-                  <div>
-                    <p className={`font-black uppercase text-sm transition-colors ${yaVolo ? 'text-zinc-500' : 'text-white'}`}>
+                    {yaVolo ? <CheckCircle2 className="h-4 w-4" /> : <Plane className="h-4 w-4" />}
+                  </span>
+                  <div className="min-w-0">
+                    <p className={`truncate text-sm font-semibold uppercase ${yaVolo ? 'text-bm-steel' : ''}`}>
                       {a.student_nombre}
                     </p>
-                    <div className="flex items-center gap-3 mt-0.5 flex-wrap">
-                      <span className="text-[8px] text-zinc-600 font-black uppercase font-mono">{a.student_serial}</span>
-                      <span className={`text-[8px] font-black uppercase ${a.saldo_horas > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {Number(a.saldo_horas).toFixed(1)}h disponibles
-                      </span>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      {a.student_serial && <span className="font-data text-[11px] text-bm-steel">{a.student_serial}</span>}
+                      <BmBadge tone={a.saldo_horas > 0 ? 'ok' : 'danger'}>
+                        <span className="bm-num">{Number(a.saldo_horas).toFixed(1)}</span> h disponibles
+                      </BmBadge>
                       {/* [NEW v7.0] billetera y origen de la misión */}
                       {a.saldo_usd != null && a.saldo_usd > 0 && (
-                        <span className="text-[8px] font-black uppercase text-teal-400 flex items-center gap-1">
-                          <Wallet size={9} /> {usd(a.saldo_usd)}
-                        </span>
+                        <BmBadge tone="neutral" icon={<Wallet className="h-3 w-3" />}>
+                          <span className="bm-num">{usd(a.saldo_usd)}</span>
+                        </BmBadge>
                       )}
                       {a.reserva_id && (
-                        <span className="text-[8px] font-black uppercase text-purple-400 px-1.5 py-0.5 rounded-md bg-purple-500/10 border border-purple-500/20">
+                        <BmBadge tone="info">
                           Planificación{a.slot_hora ? ` · ${a.slot_hora}` : ''}{a.tipo_vuelo ? ` · ${a.tipo_vuelo}` : ''}
-                        </span>
+                        </BmBadge>
                       )}
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex shrink-0 items-center gap-2">
                   {yaVolo ? (
-                    <span className="text-[8px] text-emerald-400 font-black uppercase tracking-widest
-                                     px-2 py-1 bg-emerald-500/10 rounded-lg border border-emerald-500/20">
-                      Completado
-                    </span>
+                    <BmBadge tone="ok">Completado</BmBadge>
                   ) : (
-                    <ChevronRight size={16} className={`transition-transform ${
-                      esSeleccionado
-                        ? 'text-[#E1AD01] translate-x-1'
-                        : 'text-zinc-700 group-hover:translate-x-0.5 group-hover:text-zinc-400'
+                    <ChevronRight className={`h-5 w-5 transition-transform ${
+                      esSeleccionado ? 'translate-x-0.5 text-bm-red' : 'text-bm-hint group-hover:translate-x-0.5 group-hover:text-bm-steel'
                     }`} />
                   )}
                 </div>
@@ -574,7 +616,7 @@ const PanelAsignaciones: React.FC<PanelAsignacionesProps> = ({
           })
         )}
       </div>
-    </div>
+    </section>
   );
 };
 
@@ -583,17 +625,38 @@ const PanelAsignaciones: React.FC<PanelAsignacionesProps> = ({
 // ─────────────────────────────────────────────────────────────────────────────
 
 const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
-  const [authUserId, setAuthUserId] = useState<string | null>(null);
-
-  useEffect(() => {
-    supabase.auth.getUser().then(({ data: { user } }) => setAuthUserId(user?.id ?? null));
-  }, []);
+  // [FIX v7.1] Usuario desde la sesión verificada por AuthContext; getUser() como respaldo.
+  const { session } = useAuth();
+  const sessionUserId = session?.user?.id ?? null;
+  const [authUserId, setAuthUserId] = useState<string | null>(sessionUserId);
 
   const [isProcessing,     setIsProcessing]     = useState(false);
   const [loadingInicial,   setLoadingInicial]   = useState(true);
   const [posponiendo,      setPosponiendo]      = useState(false);
   const [initError,        setInitError]        = useState<string | null>(null);
   const [retryCount,       setRetryCount]       = useState(0);
+
+  useEffect(() => {
+    if (sessionUserId) { setAuthUserId(sessionUserId); return; }
+    let vivo = true;
+    supabase.auth.getUser()
+      .then(({ data: { user } }) => {
+        if (!vivo) return;
+        if (user?.id) { setAuthUserId(user.id); return; }
+        setInitError('auth:No hay una sesión activa. Vuelva a iniciar sesión.');
+        setLoadingInicial(false);
+      })
+      .catch((err: unknown) => {
+        if (!vivo) return;
+        setInitError(`network:${err instanceof Error ? err.message : 'No se pudo verificar la sesión.'}`);
+        setLoadingInicial(false);
+      });
+    return () => { vivo = false; };
+  }, [sessionUserId, retryCount]);
+
+  // [v7.1] Confirmaciones B&M (sustituyen window.confirm)
+  const [preguntar, confirmDialog] = useBmConfirm();
+  const confirmar = useCallback(async (o: BmConfirmOptions) => (await preguntar(o)) === 'confirm', [preguntar]);
 
   const [fleet,            setFleet]            = useState<Aircraft[]>([]);
   const [asignaciones,     setAsignaciones]     = useState<AsignacionDia[]>([]);
@@ -873,6 +936,13 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     return () => controller.abort();
   }, [inicializar, retryCount]);
 
+  // [v7.1] Reintento desde la pantalla de error (también reverifica la sesión)
+  const reintentar = () => {
+    setInitError(null);
+    setLoadingInicial(true);
+    setRetryCount(c => c + 1);
+  };
+
   // ── SELECCIONAR ALUMNO ───────────────────────────────────────────────────
 
   const handleSeleccionarAlumno = useCallback((a: AsignacionDia) => {
@@ -891,27 +961,40 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   }, [fleet]);
 
   // ── SALDO COMBUSTIBLE ────────────────────────────────────────────────────
+  // [FIX v7.1] Lectura completa por lotes (antes un SELECT truncado a 1.000 filas),
+  // regla de AVGAS + OUT, valores entre comillas en el filtro .or() y descarte de
+  // respuestas obsoletas si se cambia de aeronave mientras se lee.
 
   useEffect(() => {
+    let cancelado = false;
     const fetchFuel = async () => {
       if (!form.matricula) { setAircraftFuelStock(null); return; }
       try {
-        const { data: logs } = await (supabase as any)
-          .from('registros_combustible')
-          .select('operation_type, liters, aircraft_id, destination_aircraft_id')
-          .or(`aircraft_id.eq.${form.matricula},destination_aircraft_id.eq.${form.matricula}`);
+        const matricula = form.matricula;
+        const m = matricula.replace(/"/g, '');
+        const porId = new Map<string, any>();
+        for (let b = 0; b < FUEL_MAX_BATCHES; b++) {
+          const from = b * FUEL_BATCH;
+          const { data: logs, error } = await (supabase as any)
+            .from('registros_combustible')
+            .select('id, operation_type, liters, aircraft_id, destination_aircraft_id')
+            .or(`aircraft_id.eq."${m}",destination_aircraft_id.eq."${m}"`)
+            .order('id', { ascending: true })
+            .range(from, from + FUEL_BATCH - 1);
+          if (error) throw error;
+          if (cancelado) return;
+          const filas = (logs ?? []) as any[];
+          filas.forEach((r, i) => porId.set(r.id != null ? String(r.id) : `sin-id-${from + i}`, r));
+          if (filas.length < FUEL_BATCH) break;
+        }
+        if (cancelado) return;
         let stock = 0;
-        (logs || []).forEach((r: any) => {
-          const lts = Number(r.liters);
-          if (r.operation_type === 'IN'       && r.aircraft_id === form.matricula) stock += lts;
-          if (r.operation_type === 'TRANSFER' && r.aircraft_id === form.matricula) stock -= lts;
-          if (r.operation_type === 'TRANSFER' && r.destination_aircraft_id === form.matricula) stock += lts;
-          if (r.operation_type === 'OUT'      && r.aircraft_id === form.matricula) stock -= lts;
-        });
+        porId.forEach(r => { stock += efectoCombustible(r, matricula); });
         setAircraftFuelStock(Math.max(stock, 0));
-      } catch { setAircraftFuelStock(null); }
+      } catch { if (!cancelado) setAircraftFuelStock(null); }
     };
     fetchFuel();
+    return () => { cancelado = true; };
   }, [form.matricula]);
 
   // ── SALDO HORAS ALUMNO ───────────────────────────────────────────────────
@@ -996,25 +1079,37 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     // [v7.0] Solo se posponen asignaciones del día; los vuelos de Planificación se reprograman en su tablero
     const pendientesCount = asignaciones.filter(a => a.estado === 'PENDIENTE' && a.origen !== 'RESERVA').length;
     const reservasPend    = asignaciones.filter(a => a.estado === 'PENDIENTE' && a.origen === 'RESERVA').length;
-    if (!window.confirm(
-      `¿Posponer ${pendientesCount} misiones pendientes al ${manana()}?` +
-      (reservasPend > 0 ? `\n\n${reservasPend} vuelo(s) confirmados por Planificación no se mueven aquí: Planificación debe reprogramarlos.` : '')
-    )) return;
+    if (!(await confirmar({
+      title: 'Posponer el día',
+      subtitle: `Mover las misiones al ${manana()}`,
+      icon: <CloudRain className="h-5 w-5" />,
+      confirmLabel: `Posponer ${pendientesCount} ${pendientesCount === 1 ? 'misión' : 'misiones'}`,
+      variant: 'dark',
+      body: <>
+        <p>¿Posponer <strong>{pendientesCount}</strong> {pendientesCount === 1 ? 'misión pendiente' : 'misiones pendientes'} al <span className="bm-num">{manana()}</span>?</p>
+        {reservasPend > 0 && (
+          <BmNotice tone="info">
+            {reservasPend} vuelo(s) confirmados por Planificación no se mueven aquí: Planificación debe reprogramarlos.
+          </BmNotice>
+        )}
+      </>,
+    }))) return;
     setPosponiendo(true);
     try {
       const sede = asignaciones[0]?.sede ?? 'BARQUISIMETO';
-      const { data: count } = await supabase.rpc('posponer_dia_vuelo', {
+      const { data: count, error } = await supabase.rpc('posponer_dia_vuelo', {
         p_fecha_origen: hoy(), p_fecha_destino: manana(), p_sede: sede,
       });
-      alert(`✓ ${count} misiones pospuestas al ${manana()}.`);
+      if (error) throw error; // [FIX v7.1] antes se ignoraba y se anunciaba "✓ undefined misiones"
+      alert(`✓ ${numOr(count)} misiones pospuestas al ${manana()}.`);
       const ctrl = new AbortController();
       await inicializar(ctrl.signal);
     } catch (e: any) {
-      alert('Error al posponer: ' + e.message);
+      alert('Error al posponer: ' + (e?.message ?? String(e)));
     } finally {
       setPosponiendo(false);
     }
-  }, [asignaciones, inicializar]);
+  }, [asignaciones, inicializar, confirmar]);
 
   // ── UPLOAD EVIDENCIA ─────────────────────────────────────────────────────
 
@@ -1034,10 +1129,16 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   const registrarVueloV18 = async (payload: RegistroVueloInput): Promise<RegistroVueloResultado | null> => {
     let { data, error } = await supabase.rpc('fn_vuelo_registrar', { p: payload });
     if (error && /TAC_SOLAPADO/.test(error.message ?? '')) {
-      if (!window.confirm(
-        `⚠️ TAC SOLAPADO\n\nEl intervalo TAC ${payload.tac_inicial} → ${payload.tac_final} de ${form.matricula} se cruza con otro vuelo ya registrado.\n\n` +
-        `¿Confirma que los tacómetros son correctos?`
-      )) throw new Error('Registro cancelado: verifique los tacómetros.');
+      if (!(await confirmar({
+        title: 'TAC solapado',
+        subtitle: `${form.matricula} · ${payload.tac_inicial} → ${payload.tac_final}`,
+        icon: <AlertTriangle className="h-5 w-5" />,
+        tone: 'danger',
+        confirmLabel: 'Los tacómetros son correctos',
+        cancelLabel: 'Revisar',
+        variant: 'danger',
+        body: <p>El intervalo TAC <span className="bm-num">{payload.tac_inicial} → {payload.tac_final}</span> de {form.matricula} se cruza con otro vuelo ya registrado. ¿Confirma que los tacómetros son correctos?</p>,
+      }))) throw new Error('Registro cancelado: verifique los tacómetros.');
       ({ data, error } = await supabase.rpc('fn_vuelo_registrar', { p: { ...payload, confirmar_solape: true } }));
     }
     if (error) {
@@ -1065,6 +1166,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   // ── CERRAR BITÁCORA ──────────────────────────────────────────────────────
 
   const handleProcessFlight = async () => {
+    if (isProcessing) return; // [v7.1] doble toque durante las confirmaciones
     if (!form.aircraft_id || stats.horasTac <= 0 || !form.student_id)
       return alert('SISTEMA: Verifique Aeronave, TAC y Cadete seleccionado.');
     if (!evidence.inicial || !evidence.final)
@@ -1080,53 +1182,90 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
     if (v18 !== false && preview && saldoVuelo) {
       // ▼ [NEW v7.0] Aviso en USD con la tarifa real (paquete → billetera → cuentas por cobrar)
       if (preview.sinTarifa) {
-        if (!window.confirm(
-          `⚠️ SIN TARIFA DE VUELO\n\nNo hay tarifa activa para ${form.matricula}.\n` +
-          `El vuelo se registrará y el cobro de ${preview.horasBilletera.toFixed(2)}h quedará pendiente en ` +
-          `Finanzas → Billeteras → Vuelos por cargar.\n\n¿Continuar?`
-        )) return;
+        if (!(await confirmar({
+          title: 'Sin tarifa de vuelo',
+          subtitle: form.matricula,
+          icon: <AlertTriangle className="h-5 w-5" />,
+          confirmLabel: 'Registrar con cobro pendiente',
+          body: <p>No hay tarifa activa para {form.matricula}. El vuelo se registrará y el cobro de <span className="bm-num">{preview.horasBilletera.toFixed(2)}</span> h quedará pendiente en Finanzas → Billeteras → Vuelos por cargar.</p>,
+        }))) return;
       } else if (preview.aCxc > 0) {
-        if (!window.confirm(
-          `⚠️ SALDO INSUFICIENTE\n\n` +
-          (preview.horasPaquete > 0 ? `Paquete anterior: ${preview.horasPaquete.toFixed(2)}h\n` : '') +
-          `Billetera: ${usd(saldoVuelo.saldo_usd)} · Cargo: ${preview.horasBilletera.toFixed(2)}h × ${usd(preview.tarifa ?? 0)} = ${usd(preview.monto)}\n` +
-          `Pasará a cuentas por cobrar del alumno: ${usd(preview.aCxc)}\n\n¿Continuar?`
-        )) return;
+        if (!(await confirmar({
+          title: 'Saldo insuficiente',
+          subtitle: form.student_nombre,
+          icon: <Wallet className="h-5 w-5" />,
+          confirmLabel: 'Continuar',
+          body: <dl className="space-y-1.5 rounded-2xl bg-bm-canvas p-4 text-sm">
+            {preview.horasPaquete > 0 && <Fila k="Paquete anterior" v={`${preview.horasPaquete.toFixed(2)} h`} />}
+            <Fila k="Billetera" v={usd(saldoVuelo.saldo_usd)} />
+            <Fila k="Cargo" v={`${preview.horasBilletera.toFixed(2)} h × ${usd(preview.tarifa ?? 0)} = ${usd(preview.monto)}`} />
+            <Fila k="A cuentas por cobrar" v={usd(preview.aCxc)} fuerte />
+          </dl>,
+        }))) return;
         if (excedeCredito) {
           if (instructorId !== null) {
-            if (!window.confirm(
-              `⚠️ LÍMITE DE CRÉDITO\n\nLa deuda del alumno supera el límite autorizado.\n` +
-              `El vuelo se registrará y el cobro quedará pendiente de autorización de administración.\n\n¿Continuar?`
-            )) return;
+            if (!(await confirmar({
+              title: 'Límite de crédito',
+              icon: <AlertTriangle className="h-5 w-5" />,
+              confirmLabel: 'Registrar con cobro pendiente',
+              body: <p>La deuda del alumno supera el límite autorizado. El vuelo se registrará y el cobro quedará pendiente de autorización de administración.</p>,
+            }))) return;
           } else {
-            autorizarSobreLimite = window.confirm(
-              `⚠️ LÍMITE DE CRÉDITO (${usd(saldoVuelo.credito_maximo_usd ?? 0)})\n\n` +
-              `La nueva deuda (${usd(preview.aCxc)}) supera el crédito disponible (${usd(saldoVuelo.credito_disponible_usd ?? 0)}).\n\n` +
-              `Aceptar = autorizar el cobro · Cancelar = registrar el vuelo con cobro pendiente`
-            );
+            // [FIX v7.1] Decisión explícita; cerrar el diálogo no registra nada.
+            const decision = await preguntar({
+              title: `Límite de crédito (${usd(saldoVuelo.credito_maximo_usd ?? 0)})`,
+              icon: <AlertTriangle className="h-5 w-5" />,
+              tone: 'danger',
+              confirmLabel: 'Autorizar cobro',
+              cancelLabel: 'Registrar con cobro pendiente',
+              variant: 'danger',
+              body: <p>La nueva deuda (<span className="bm-num">{usd(preview.aCxc)}</span>) supera el crédito disponible (<span className="bm-num">{usd(saldoVuelo.credito_disponible_usd ?? 0)}</span>).</p>,
+            });
+            if (decision === 'dismiss') return;
+            autorizarSobreLimite = decision === 'confirm';
           }
         }
       }
     } else if (deficit !== null && deficit > 0) {
-      if (!window.confirm(
-        `⚠️ SALDO INSUFICIENTE\n\nSaldo: ${(studentBalance ?? 0).toFixed(1)}h · Vuelo: ${stats.horasTac.toFixed(2)}h\n` +
-        `Déficit: ${deficit.toFixed(2)}h = $${(deficit * form.precioHoraCostoTac).toFixed(2)}\n\nSe registrará una deuda. ¿Continuar?`
-      )) return;
+      if (!(await confirmar({
+        title: 'Saldo insuficiente',
+        subtitle: form.student_nombre,
+        icon: <AlertTriangle className="h-5 w-5" />,
+        confirmLabel: 'Registrar con deuda',
+        body: <>
+          <dl className="space-y-1.5 rounded-2xl bg-bm-canvas p-4 text-sm">
+            <Fila k="Saldo" v={`${(studentBalance ?? 0).toFixed(1)} h`} />
+            <Fila k="Vuelo" v={`${stats.horasTac.toFixed(2)} h`} />
+            <Fila k="Déficit" v={`${deficit.toFixed(2)} h = $${(deficit * form.precioHoraCostoTac).toFixed(2)}`} fuerte />
+          </dl>
+          <p>Se registrará una deuda. ¿Continuar?</p>
+        </>,
+      }))) return;
     }
 
     if (aircraftFuelStock !== null && aircraftFuelStock < stats.litersToBurn) {
-      if (!window.confirm(
-        `⚠️ COMBUSTIBLE BAJO\n\n${form.matricula} tiene ${aircraftFuelStock.toFixed(1)} LTS.\n` +
-        `Este vuelo consumirá ~${stats.litersToBurn.toFixed(1)} LTS.\n\n¿Continuar?`
-      )) return;
+      if (!(await confirmar({
+        title: 'Combustible bajo',
+        subtitle: form.matricula,
+        icon: <Fuel className="h-5 w-5" />,
+        confirmLabel: 'Continuar',
+        body: <p>{form.matricula} tiene <span className="bm-num font-semibold">{aircraftFuelStock.toFixed(1)}</span> L. Este vuelo consumirá unos <span className="bm-num font-semibold">{stats.litersToBurn.toFixed(1)}</span> L.</p>,
+      }))) return;
     }
 
     const pct = Math.abs(stats.horasTac - rutaSeleccionada.horas_tac) / rutaSeleccionada.horas_tac;
     if (pct > 0.40) {
-      if (!window.confirm(
-        `⚠️ INCOHERENCIA TAC vs RUTA\n\nDelta TAC: ${stats.horasTac.toFixed(2)}h\n` +
-        `Ruta (${rutaSeleccionada.destino}): ${rutaSeleccionada.horas_tac}h\nDiferencia: ${(pct * 100).toFixed(0)}%\n\n¿Confirmar?`
-      )) return;
+      if (!(await confirmar({
+        title: 'Incoherencia TAC vs ruta',
+        subtitle: rutaSeleccionada.destino,
+        icon: <AlertTriangle className="h-5 w-5" />,
+        confirmLabel: 'Confirmar',
+        body: <dl className="space-y-1.5 rounded-2xl bg-bm-canvas p-4 text-sm">
+          <Fila k="Delta TAC" v={`${stats.horasTac.toFixed(2)} h`} />
+          <Fila k={`Ruta (${rutaSeleccionada.destino})`} v={`${rutaSeleccionada.horas_tac} h`} />
+          <Fila k="Diferencia" v={`${(pct * 100).toFixed(0)} %`} fuerte />
+        </dl>,
+      }))) return;
     }
 
     const horasCobradas    = instructorId ? stats.horasTac : form.horasCobrada;
@@ -1226,13 +1365,17 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
         }]);
         if (dbError) throw dbError;
 
-        await supabase.from('horas_vuelo_estudiante').insert([{
+        // [FIX v7.1] Las escrituras secundarias ya no fallan en silencio
+        const fallos: string[] = [];
+
+        const { error: horasErr } = await supabase.from('horas_vuelo_estudiante').insert([{
           student_id:      form.student_id,
           fecha:           form.fecha,
           horas:           stats.horasTac,
           matricula_avion: form.matricula,
           tipo_mision:     rutaSeleccionada.destino.toUpperCase(),
         }]);
+        if (horasErr) fallos.push(`horas del alumno (${horasErr.message})`);
 
         // [FIX v7.0] Eliminado el INSERT de un INGRESO 'PAID' (categoría 'Vuelos') en transacciones_finanzas:
         //            sin método de pago ni asiento, contaba el ingreso dos veces (venta del paquete/recarga
@@ -1240,7 +1383,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
         //            cobrarlo (Billeteras → Vuelos por cargar) o el paquete al venderse.
 
         if (stats.litersToBurn > 0) {
-          await (supabase as any).from('registros_combustible').insert([{
+          const { error: fuelErr } = await (supabase as any).from('registros_combustible').insert([{
             operation_type:          'OUT',
             aircraft_id:             form.matricula,
             destination_aircraft_id: null,
@@ -1251,11 +1394,12 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
             technician:              form.student_nombre.toUpperCase(),
             hobbs_at_charge:         form.tacFinal,
           }]);
+          if (fuelErr) fallos.push(`consumo de combustible (${fuelErr.message})`);
         }
 
         if (deficit !== null && deficit > 0) {
           const montoDeuda = parseFloat((deficit * form.precioHoraCostoTac).toFixed(2));
-          await supabase.from('cuentas_por_cobrar').insert([{
+          const { error: deudaErr } = await supabase.from('cuentas_por_cobrar').insert([{
             alumno_id:        form.student_id,
             student_id:       form.student_id,
             nombre_alumno:    form.student_nombre.toUpperCase(),
@@ -1268,6 +1412,7 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
             horas_compradas:  0,
             horas_prometidas: 0,
           }]);
+          if (deudaErr) fallos.push(`deuda del alumno (${deudaErr.message})`);
         }
 
         const asig = asignaciones.find(a => a.student_id === form.student_id && a.estado === 'PENDIENTE')
@@ -1275,7 +1420,8 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
         if (asig) {
           // [v7.0] las filas que vienen de Planificación (RSV-…) no existen en asignaciones_vuelo_diario
           if (asig.origen !== 'RESERVA') {
-            await supabase.from('asignaciones_vuelo_diario').update({ estado: 'VOLADO' }).eq('id', asig.id);
+            const { error: asigErr } = await supabase.from('asignaciones_vuelo_diario').update({ estado: 'VOLADO' }).eq('id', asig.id);
+            if (asigErr) fallos.push(`estado de la misión (${asigErr.message})`);
           }
           setAsignaciones(prev => prev.map(a => a.id === asig.id ? { ...a, estado: 'VOLADO' } : a));
         }
@@ -1283,7 +1429,10 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
         if (onFlightLogUpdate) onFlightLogUpdate(form.aircraft_id, stats.horasTac);
 
         const debtMsg = deficit && deficit > 0 ? `\n\nDeuda: $${(deficit * form.precioHoraCostoTac).toFixed(2)}` : '';
-        alert(`MIA: BITÁCORA SINCRONIZADA — ${rutaSeleccionada.destino} · ${stats.horasTac.toFixed(2)}h TAC.${debtMsg}`);
+        const fallosMsg = fallos.length
+          ? `\n\n⚠️ La bitácora quedó guardada, pero NO se registró: ${fallos.join('; ')}. Avise a administración.`
+          : '';
+        alert(`MIA: BITÁCORA SINCRONIZADA — ${rutaSeleccionada.destino} · ${stats.horasTac.toFixed(2)}h TAC.${debtMsg}${fallosMsg}`);
       }
 
       setForm(prev => ({
@@ -1309,32 +1458,33 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   const selectedAircraft = fleet.find(a => a.id === form.aircraft_id);
   const burnRate         = selectedAircraft?.fuel_burn_rate ?? DEFAULT_BURN_RATE;
 
-  const balanceBadgeClass = studentBalance === null ? 'text-zinc-600'
-    : studentBalance >= stats.horasTac ? 'text-emerald-400'
-    : studentBalance > 0               ? 'text-orange-400 animate-pulse'
-    :                                    'text-red-400 animate-pulse';
+  // [v7.1] Tono del saldo (antes clases de color sobre fondo negro)
+  const balanceTone = studentBalance === null ? 'neutral'
+    : studentBalance >= stats.horasTac ? 'ok'
+    : studentBalance > 0               ? 'warn'
+    :                                    'danger';
 
   const balanceLabel = studentBalance === null ? ''
-    : `[ ${studentBalance >= 0 ? 'SALDO' : 'DEBE'}: ${Math.abs(studentBalance).toFixed(1)}h ]`;
+    : `${studentBalance >= 0 ? 'Saldo' : 'Debe'} ${Math.abs(studentBalance).toFixed(1)} h`;
+
+  const combustibleBajo = aircraftFuelStock !== null && aircraftFuelStock < stats.litersToBurn;
 
   // ── PANTALLA ERROR DE RED ─────────────────────────────────────────────────
 
   if (!loadingInicial && initError) {
+    const esAuth = initError.startsWith('auth:');
     return (
-      <div className="min-h-screen bg-[#050505] flex items-center justify-center font-mono p-8">
-        <div className={`${glass.base} rounded-[2rem] p-10 max-w-md w-full text-center space-y-6`}>
-          <div className="w-16 h-16 rounded-full bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mx-auto">
-            <WifiOff className="h-7 w-7 text-orange-400" />
-          </div>
-          <div>
-            <p className="text-[11px] font-black uppercase tracking-[0.4em] text-orange-400 mb-2">Sin Conexión</p>
-            <p className="text-[9px] text-zinc-600 font-mono">{initError.replace('network:', '')}</p>
-          </div>
-          <button onClick={() => setRetryCount(c => c + 1)}
-            className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl bg-[#E1AD01] text-black font-black text-[10px] uppercase tracking-widest hover:bg-white transition-all">
-            <RefreshCw className="h-4 w-4" /> Reintentar Conexión
-          </button>
-        </div>
+      <div className={`${surface.card} bm-app text-bm-ink`}>
+        <BmEmpty
+          icon={<WifiOff className="h-5 w-5" />}
+          title={esAuth ? 'Sesión no disponible' : 'Sin conexión'}
+          text={initError.replace(/^(network|auth):/, '')}
+          action={
+            <button type="button" onClick={reintentar} className={bmBtn.primary}>
+              <RefreshCw className="h-4 w-4" /> Reintentar conexión
+            </button>
+          }
+        />
       </div>
     );
   }
@@ -1343,20 +1493,12 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
 
   if (loadingInicial) {
     return (
-      <div className="min-h-screen bg-[#050505] flex items-center justify-center font-mono">
-        <div className="pointer-events-none fixed inset-0 opacity-[0.015] bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,rgba(255,255,255,0.07)_2px,rgba(255,255,255,0.07)_4px)]" />
-        <div className="text-center space-y-5 relative z-10">
-          <div className="relative mx-auto w-16 h-16">
-            <div className="absolute inset-0 rounded-full bg-[#E1AD01]/20 animate-ping" />
-            <div className={`w-16 h-16 rounded-full ${glass.gold} flex items-center justify-center`}>
-              <Loader2 className="animate-spin text-[#E1AD01] w-7 h-7" />
-            </div>
-          </div>
-          <div>
-            <p className="text-[11px] font-black uppercase tracking-[0.5em] text-[#E1AD01]">M.I.A. Flight Core</p>
-            <p className="text-[9px] font-black uppercase tracking-widest text-zinc-600 mt-1">Inicializando sistema...</p>
-          </div>
-        </div>
+      <div className="bm-app space-y-4" role="status" aria-label="Inicializando registro de vuelo">
+        <div className="bm-skeleton h-20 rounded-[24px]" />
+        <div className="bm-skeleton h-64 rounded-[24px]" />
+        <p className="flex items-center gap-2 text-sm text-bm-steel">
+          <Loader2 className="h-4 w-4 animate-spin text-bm-red" /> Inicializando registro de vuelo…
+        </p>
       </div>
     );
   }
@@ -1364,405 +1506,335 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
   // ── RENDER PRINCIPAL ──────────────────────────────────────────────────────
 
   return (
-    <div className="min-h-screen bg-[#050505] p-4 md:p-8 font-mono text-zinc-200 text-left relative">
-      <div className="pointer-events-none fixed inset-0 z-0 opacity-[0.015] bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,rgba(255,255,255,0.07)_2px,rgba(255,255,255,0.07)_4px)]" />
-      <div className="pointer-events-none fixed top-0 left-1/2 -translate-x-1/2 w-[600px] h-[300px] bg-[#E1AD01]/[0.04] blur-[120px] rounded-full z-0" />
+    <div className="bm-app space-y-4 text-left text-bm-ink sm:space-y-5">
 
-      <div className="max-w-5xl mx-auto relative z-10">
-
-        {/* CABECERA */}
-        <header className={`${glass.gold} px-8 py-5 flex justify-between items-center rounded-t-[2.5rem] shadow-[0_0_40px_rgba(225,173,1,0.1)]`}>
-          <div className="flex items-center gap-4">
-            <div className="w-11 h-11 rounded-2xl bg-[#E1AD01] flex items-center justify-center shadow-[0_4px_20px_rgba(225,173,1,0.4)]">
-              <Plane size={22} className="text-black" />
-            </div>
-            <div>
-              <h1 className="font-black text-sm tracking-[0.3em] uppercase text-white">MRO Flight Operations</h1>
-              <p className="text-[#E1AD01]/60 text-[9px] font-bold uppercase tracking-widest">
-                Valkyron OS v7.0 · {instructorNombre || 'Sistema de Vuelo'}
-              </p>
-            </div>
+      {/* CABECERA */}
+      <header className={`${surface.card} flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5`}>
+        <div className="flex min-w-0 items-center gap-3.5">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-bm-red text-white">
+            <Plane className="h-5 w-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="bm-heading text-lg leading-tight sm:text-xl">Registro de vuelo</h2>
+            <p className="truncate text-[13px] text-bm-steel">
+              Valkyron OS v7.1 · {instructorNombre || 'Sistema de vuelo'}
+            </p>
           </div>
-          <div className="flex items-center gap-2">
-            <div className={`flex items-center gap-2 ${glass.dark} px-3 py-1.5 rounded-full`}>
-              <Clock size={11} className="text-zinc-500" />
-              <span className="text-[9px] font-black text-zinc-300">{hoy()}</span>
-            </div>
-            <div className={`flex items-center gap-2 ${glass.emerald} px-3 py-1.5 rounded-full`}>
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-[9px] font-black text-emerald-400">SYS OK</span>
-            </div>
-          </div>
-        </header>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-bm-canvas px-3 py-1.5 text-xs font-medium">
+            <Clock className="h-3.5 w-3.5 text-bm-steel" /> <span className="bm-num">{hoy()}</span>
+          </span>
+          {esCapitan
+            ? <BmBadge tone="dark" icon={<UserRound className="h-3 w-3" />}>Capitán</BmBadge>
+            : <BmBadge tone="neutral" icon={<UserRound className="h-3 w-3" />}>Administración</BmBadge>}
+          <BmBadge tone="ok" dot>Bitácora activa</BmBadge>
+        </div>
+      </header>
 
-        {/* BODY */}
-        <div className={`${glass.dark} border-t-0 rounded-b-[2.5rem] overflow-hidden shadow-[0_40px_80px_rgba(0,0,0,0.6)] p-8 space-y-8`}>
+      {/* [NEW v7.0] Aviso de modo heredado */}
+      {v18 === false && (
+        <BmNotice tone="warn" icon={<AlertTriangle className="h-4 w-4" />}>
+          <p className="font-semibold">Modo heredado: la billetera no está conectada</p>
+          <p className="mt-0.5">
+            Ejecute migracion_vuelos_v18_billetera.sql en Supabase para descontar horas de la billetera al cerrar la bitácora.
+          </p>
+        </BmNotice>
+      )}
 
-          {/* [NEW v7.0] Aviso de modo heredado */}
-          {v18 === false && (
-            <div className={`${glass.amber} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
-              <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-[9px] text-amber-400 font-black uppercase tracking-widest">Modo heredado — billetera no conectada</p>
-                <p className="text-[8px] text-amber-300/60 font-mono mt-0.5">
-                  Ejecute migracion_vuelos_v18_billetera.sql en Supabase para descontar horas de la billetera al cerrar la bitácora.
-                </p>
-              </div>
-            </div>
-          )}
+      <PanelAsignaciones
+        asignaciones={asignaciones}
+        seleccionado={form.student_id}
+        onSeleccionar={handleSeleccionarAlumno}
+        onPosponer={handlePosponer}
+        posponiendo={posponiendo}
+        instructorNombre={instructorNombre}
+      />
 
-          <PanelAsignaciones
-            asignaciones={asignaciones}
-            seleccionado={form.student_id}
-            onSeleccionar={handleSeleccionarAlumno}
-            onPosponer={handlePosponer}
-            posponiendo={posponiendo}
-            instructorNombre={instructorNombre}
-          />
+      {/* [NEW v7.0] Resultado del último cierre de bitácora */}
+      {ultimoRegistro && !form.student_id && (
+        <BmNotice tone={ultimoRegistro.cobro_pendiente ? 'warn' : 'ok'} role="status"
+          icon={ultimoRegistro.cobro_pendiente ? <AlertTriangle className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}>
+          <p className="font-semibold">
+            Último vuelo · <span className="font-data">{ultimoRegistro.matricula}</span> · <span className="bm-num">{numOr(ultimoRegistro.horas).toFixed(2)}</span> h TAC · <span className="bm-num">{numOr(ultimoRegistro.litros).toFixed(1)}</span> L
+            {ultimoRegistro.reserva_id ? ' · reserva completada' : ''}
+          </p>
+          <p className="mt-0.5">
+            {ultimoRegistro.cargo
+              ? resumenCargo(ultimoRegistro.cargo)
+              : `Cobro pendiente: ${traducirErrorVuelo(ultimoRegistro.cobro_error ?? '')} — Finanzas → Billeteras → Vuelos por cargar`}
+          </p>
+        </BmNotice>
+      )}
 
-          {/* [NEW v7.0] Resultado del último cierre de bitácora */}
-          {ultimoRegistro && !form.student_id && (
-            <div className={`${ultimoRegistro.cobro_pendiente ? glass.orange : glass.emerald} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
-              {ultimoRegistro.cobro_pendiente
-                ? <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
-                : <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />}
+      {form.student_id ? (
+        <div className="space-y-4 sm:space-y-5">
+          {/* HUD ALUMNO */}
+          <div className="flex flex-col gap-3 rounded-[24px] bg-bm-ink p-4 text-white sm:flex-row sm:items-center sm:justify-between sm:p-5">
+            <div className="flex min-w-0 items-center gap-3.5">
+              <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white/10">
+                <Plane className="h-5 w-5" />
+              </span>
               <div className="min-w-0">
-                <p className={`text-[9px] font-black uppercase tracking-widest ${ultimoRegistro.cobro_pendiente ? 'text-orange-400' : 'text-emerald-400'}`}>
-                  Último vuelo · {ultimoRegistro.matricula} · {numOr(ultimoRegistro.horas).toFixed(2)}h TAC · {numOr(ultimoRegistro.litros).toFixed(1)} LTS
-                  {ultimoRegistro.reserva_id ? ' · reserva completada' : ''}
-                </p>
-                <p className="text-[8px] text-zinc-400 font-mono mt-0.5">
-                  {ultimoRegistro.cargo
-                    ? resumenCargo(ultimoRegistro.cargo)
-                    : `Cobro pendiente: ${traducirErrorVuelo(ultimoRegistro.cobro_error ?? '')} — Finanzas → Billeteras → Vuelos por cargar`}
-                </p>
+                <p className="truncate text-base font-semibold uppercase">{form.student_nombre}</p>
+                <p className="text-[13px] text-white/60">Cadete en misión activa</p>
+                {/* [NEW v7.0] desglose del saldo */}
+                {saldoVuelo && (
+                  <p className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-white/80">
+                    <span>Paquete <span className="bm-num">{Math.max(saldoVuelo.horas_paquete, 0).toFixed(1)}</span> h</span>
+                    <span className="inline-flex items-center gap-1">
+                      <Wallet className="h-3 w-3" /> <span className="bm-num">{usd(saldoVuelo.saldo_usd)}</span>
+                      {saldoVuelo.tarifa_hora ? <> ≈ <span className="bm-num">{saldoVuelo.horas_billetera.toFixed(1)}</span> h a <span className="bm-num">{usd(saldoVuelo.tarifa_hora)}</span>/h</> : ' · sin tarifa'}
+                    </span>
+                    {saldoVuelo.deuda_usd > 0 && <span className="font-semibold text-[#FF8A8D]">Deuda <span className="bm-num">{usd(saldoVuelo.deuda_usd)}</span></span>}
+                  </p>
+                )}
               </div>
             </div>
+            {studentBalance !== null && (
+              <span className={`inline-flex shrink-0 items-center gap-1.5 self-start rounded-full px-3 py-1.5 text-sm font-semibold sm:self-center ${
+                balanceTone === 'ok' ? 'bg-bm-ok text-white' : balanceTone === 'warn' ? 'bg-bm-warn text-white' : balanceTone === 'danger' ? 'bg-bm-red text-white' : 'bg-white/10'
+              }`}>
+                <span className="bm-num">{balanceLabel}</span>
+              </span>
+            )}
+          </div>
+
+          {/* ALERTA SALDO — [v7.0] con billetera: cálculo en USD a la tarifa real */}
+          {preview && (preview.aCxc > 0 || preview.sinTarifa) && (
+            <BmNotice tone="warn" icon={<AlertTriangle className="h-4 w-4" />}>
+              <p className="font-semibold">
+                {preview.sinTarifa
+                  ? 'Sin tarifa de vuelo activa: el cobro quedará pendiente en Finanzas'
+                  : excedeCredito
+                    ? 'Saldo insuficiente y límite de crédito excedido: cobro pendiente de autorización'
+                    : 'Saldo insuficiente: el excedente pasará a cuentas por cobrar'}
+              </p>
+              <p className="mt-0.5">
+                {preview.sinTarifa
+                  ? `${preview.horasBilletera.toFixed(2)} h sin tarifa · configure el Tarifario`
+                  : `Billetera ${usd(preview.desdeBilletera)} · A cuentas por cobrar ${usd(preview.aCxc)}`}
+              </p>
+            </BmNotice>
+          )}
+          {!preview && studentBalance !== null && studentBalance < stats.horasTac && stats.horasTac > 0 && (
+            <BmNotice tone="warn" icon={<AlertTriangle className="h-4 w-4" />}>
+              <p className="font-semibold">Saldo insuficiente: se generará deuda automática</p>
+              <p className="mt-0.5">
+                Déficit: {Math.max(0, stats.horasTac - studentBalance).toFixed(2)} h · ${(Math.max(0, stats.horasTac - studentBalance) * form.precioHoraCostoTac).toFixed(2)}
+              </p>
+            </BmNotice>
           )}
 
-          {form.student_id ? (
-            <>
-              {/* HUD ALUMNO */}
-              <div className={`${glass.gold} flex items-center justify-between px-6 py-4 rounded-2xl`}>
-                <div className="flex items-center gap-4">
-                  <div className="w-10 h-10 rounded-2xl bg-[#E1AD01]/15 border border-[#E1AD01]/25 flex items-center justify-center">
-                    <Plane size={18} className="text-[#E1AD01]" />
-                  </div>
-                  <div>
-                    <p className="text-white font-black uppercase text-sm">{form.student_nombre}</p>
-                    <p className="text-zinc-500 text-[9px] font-black uppercase tracking-widest mt-0.5">Cadete en misión activa</p>
-                    {/* [NEW v7.0] desglose del saldo */}
-                    {saldoVuelo && (
-                      <p className="text-[8px] font-black uppercase tracking-widest mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                        <span className="text-zinc-400">Paquete {Math.max(saldoVuelo.horas_paquete, 0).toFixed(1)}h</span>
-                        <span className="text-teal-400 flex items-center gap-1">
-                          <Wallet size={9} /> {usd(saldoVuelo.saldo_usd)}
-                          {saldoVuelo.tarifa_hora ? ` ≈ ${saldoVuelo.horas_billetera.toFixed(1)}h a ${usd(saldoVuelo.tarifa_hora)}/h` : ' · sin tarifa'}
-                        </span>
-                        {saldoVuelo.deuda_usd > 0 && <span className="text-red-400">Deuda {usd(saldoVuelo.deuda_usd)}</span>}
-                      </p>
-                    )}
-                  </div>
-                </div>
-                {studentBalance !== null && (
-                  <span className={`text-[10px] font-black uppercase tracking-widest ${balanceBadgeClass}`}>{balanceLabel}</span>
+          {/* AERONAVE · FECHA · SEDE */}
+          <section className={`${surface.card} space-y-5 p-4 sm:p-5`} aria-label="Datos del vuelo">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label htmlFor="mro_aeronave" className={bmLabel}>Unidad de flota</label>
+                <BmSelect
+                  id="mro_aeronave"
+                  value={form.aircraft_id}
+                  onChange={e => {
+                    const sel = fleet.find(a => a.id === e.target.value);
+                    setForm(prev => ({ ...prev, aircraft_id: e.target.value, matricula: sel?.matricula ?? '' }));
+                  }}
+                >
+                  {fleet.map(u => (
+                    <option key={u.id} value={u.id}>{u.matricula} — {u.modelo}</option>
+                  ))}
+                </BmSelect>
+                {aircraftFuelStock !== null && (
+                  <p className={`flex items-center gap-1.5 text-[13px] ${combustibleBajo ? 'font-semibold text-bm-warn' : 'text-bm-steel'}`}>
+                    <Fuel className="h-3.5 w-3.5" />
+                    <span className="bm-num">{aircraftFuelStock.toFixed(1)}</span> L disponibles
+                    {combustibleBajo && stats.litersToBurn > 0 && <AlertTriangle className="h-3.5 w-3.5" />}
+                  </p>
                 )}
               </div>
 
-              {/* ALERTA SALDO — [v7.0] con billetera: cálculo en USD a la tarifa real */}
-              {preview && (preview.aCxc > 0 || preview.sinTarifa) && (
-                <div className={`${glass.orange} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
-                  <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="text-[9px] text-orange-400 font-black uppercase tracking-widest">
-                      {preview.sinTarifa
-                        ? 'Sin tarifa de vuelo activa — el cobro quedará pendiente en Finanzas'
-                        : excedeCredito
-                          ? 'Saldo insuficiente y límite de crédito excedido — cobro pendiente de autorización'
-                          : 'Saldo insuficiente — el excedente pasará a cuentas por cobrar'}
-                    </p>
-                    <p className="text-[8px] text-orange-300/60 font-mono mt-0.5">
-                      {preview.sinTarifa
-                        ? `${preview.horasBilletera.toFixed(2)}h sin tarifa · configure el Tarifario`
-                        : `Billetera ${usd(preview.desdeBilletera)} · A cuentas por cobrar ${usd(preview.aCxc)}`}
-                    </p>
-                  </div>
-                </div>
-              )}
-              {!preview && studentBalance !== null && studentBalance < stats.horasTac && stats.horasTac > 0 && (
-                <div className={`${glass.orange} flex items-start gap-3 px-5 py-4 rounded-2xl`}>
-                  <AlertTriangle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="text-[9px] text-orange-400 font-black uppercase tracking-widest">Saldo insuficiente — se generará deuda automática</p>
-                    <p className="text-[8px] text-orange-300/60 font-mono mt-0.5">
-                      Déficit: {Math.max(0, stats.horasTac - studentBalance).toFixed(2)}h · ${(Math.max(0, stats.horasTac - studentBalance) * form.precioHoraCostoTac).toFixed(2)}
-                    </p>
-                  </div>
-                </div>
-              )}
+              <InputGroup id="mro_fecha" label="Fecha de registro" type="date" value={form.fecha}
+                onChange={(v: string) => setForm(prev => ({ ...prev, fecha: v }))} />
 
-              {/* VECTORES DE IDENTIDAD */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div className="flex flex-col space-y-2">
-                  <label className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest ml-1">Unidad de Flota</label>
-                  <select
-                    className="appearance-none bg-white/[0.04] backdrop-blur-xl border border-white/[0.09] p-4 rounded-2xl text-white text-sm font-bold outline-none focus:border-[#E1AD01]/60 transition-all uppercase w-full cursor-pointer"
-                    value={form.aircraft_id}
-                    onChange={e => {
-                      const sel = fleet.find(a => a.id === e.target.value);
-                      setForm(prev => ({ ...prev, aircraft_id: e.target.value, matricula: sel?.matricula ?? '' }));
-                    }}
-                  >
-                    {fleet.map(u => (
-                      <option key={u.id} value={u.id} className="bg-[#0d0d0d]">{u.matricula} — {u.modelo}</option>
-                    ))}
-                  </select>
-                  {aircraftFuelStock !== null && (
-                    <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase ${
-                      aircraftFuelStock >= stats.litersToBurn ? glass.gold : glass.orange
-                    }`}>
-                      <Fuel className={`h-3 w-3 ${aircraftFuelStock >= stats.litersToBurn ? 'text-[#E1AD01]' : 'text-orange-400'}`} />
-                      <span className={aircraftFuelStock >= stats.litersToBurn ? 'text-[#E1AD01]' : 'text-orange-400'}>
-                        {aircraftFuelStock.toFixed(1)} LTS
-                      </span>
-                      {aircraftFuelStock < stats.litersToBurn && stats.litersToBurn > 0 && (
-                        <AlertTriangle className="h-3 w-3 ml-auto text-orange-400" />
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                <InputGroup id="mro_fecha" label="Fecha Registro" type="date" value={form.fecha}
-                  onChange={(v: string) => setForm(prev => ({ ...prev, fecha: v }))} />
-
-                <div className="flex flex-col space-y-2">
-                  <label className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest ml-1 flex items-center gap-1.5">
-                    <MapPin className="h-3 w-3" /> Sede del Vuelo
-                  </label>
-                  <div className={`flex ${glass.dark} rounded-2xl p-1 gap-1`}>
-                    {SEDES.map(sede => (
-                      <button key={sede} type="button"
-                        onClick={() => setForm(prev => ({ ...prev, sede_vuelo: sede }))}
-                        className={`flex-1 py-3 px-2 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all ${
-                          form.sede_vuelo === sede
-                            ? 'bg-[#E1AD01] text-black shadow-[0_4px_12px_rgba(225,173,1,0.3)]'
-                            : 'text-zinc-500 hover:text-white'
-                        }`}>
-                        {sede}
-                      </button>
-                    ))}
-                  </div>
+              <div className="space-y-2">
+                <span className={`${bmLabel} flex items-center gap-1.5`} id="mro_sede_label">
+                  <MapPin className="h-4 w-4 text-bm-steel" /> Sede del vuelo
+                </span>
+                <div role="group" aria-labelledby="mro_sede_label" className="flex h-12 gap-1 rounded-xl border border-bm-field bg-white p-1">
+                  {SEDES.map(sede => (
+                    <button key={sede} type="button"
+                      aria-pressed={form.sede_vuelo === sede}
+                      onClick={() => setForm(prev => ({ ...prev, sede_vuelo: sede }))}
+                      className={`flex-1 rounded-lg px-2 text-sm capitalize transition-colors ${
+                        form.sede_vuelo === sede
+                          ? 'bg-bm-ink font-semibold text-white'
+                          : 'font-medium text-bm-steel hover:text-bm-ink'
+                      }`}>
+                      {sede.toLowerCase()}
+                    </button>
+                  ))}
                 </div>
               </div>
+            </div>
 
-              {/* RUTA + INSTRUCTOR */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 border-t border-white/[0.05] pt-6">
-                <RutaSelector rutas={rutas} selected={rutaSeleccionada} onSelect={setRutaSeleccionada}
-                  saldo={studentBalance ?? 0} deltaTac={stats.horasTac} />
-                <InputGroup id="mro_instructor" label="Instructor al Mando" value={form.instructor}
-                  onChange={(v: string) => setForm(prev => ({ ...prev, instructor: v }))} />
-              </div>
+            {/* RUTA + INSTRUCTOR */}
+            <div className="grid grid-cols-1 gap-4 border-t border-bm-line pt-5 md:grid-cols-2">
+              <RutaSelector rutas={rutas} selected={rutaSeleccionada} onSelect={setRutaSeleccionada}
+                saldo={studentBalance ?? 0} deltaTac={stats.horasTac} />
+              <InputGroup id="mro_instructor" label="Instructor al mando" value={form.instructor}
+                onChange={(v: string) => setForm(prev => ({ ...prev, instructor: v }))} />
+            </div>
+          </section>
 
-              {/* TACÓMETRO */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {([
-                  { id: 'mro_tac_inicial', label: 'TAC Inicial', key: 'tacInicial' as const, evKey: 'inicial' as const },
-                  { id: 'mro_tac_final',   label: 'TAC Final',   key: 'tacFinal'   as const, evKey: 'final'   as const },
-                ] as const).map(({ id, label, key, evKey }) => (
-                  <div key={id} className={`${glass.base} p-6 rounded-3xl relative overflow-hidden`}>
-                    <div className="absolute top-0 right-0 w-20 h-20 opacity-20 bg-gradient-to-bl from-[#E1AD01] to-transparent rounded-bl-3xl" />
-                    <div className="absolute top-0 right-0 p-3"><Activity size={12} className="text-[#E1AD01]" /></div>
-                    <InputGroup id={id} label={label} type="number" value={form[key]} color="text-[#E1AD01]"
-                      onChange={(v: number) => setForm(prev => ({ ...prev, [key]: Number(v) }))} />
-                    <div className="mt-4">
-                      <EvidenceUpload id={`file_${evKey}`} label={`Captura ${label}`}
-                        file={evidence[evKey]} onSelect={f => setEvidence(prev => ({ ...prev, [evKey]: f }))} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* RESUMEN DELTA TAC vs RUTA */}
-              {stats.horasTac > 0 && rutaSeleccionada && (
-                <div className="grid grid-cols-3 gap-4">
-                  <div className={`${glass.gold} rounded-2xl p-4 text-center`}>
-                    <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-1">Delta TAC Real</p>
-                    <p className="text-2xl font-black font-mono text-[#E1AD01]">
-                      {stats.horasTac.toFixed(2)}<span className="text-base text-[#E1AD01]/60">h</span>
-                    </p>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Fuente legal MRO</p>
-                  </div>
-                  <div className={`${glass.base} rounded-2xl p-4 text-center`}>
-                    <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-1">Ruta Ref.</p>
-                    <p className="text-2xl font-black font-mono text-white">
-                      {rutaSeleccionada.horas_tac}<span className="text-base text-zinc-500">h</span>
-                    </p>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-1 truncate">{rutaSeleccionada.destino}</p>
-                  </div>
-                  <div className={`rounded-2xl p-4 text-center ${
-                    Math.abs(stats.horasTac - rutaSeleccionada.horas_tac) / rutaSeleccionada.horas_tac <= 0.20
-                      ? glass.emerald : glass.orange
-                  }`}>
-                    <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-1">Δ Diferencia</p>
-                    <p className={`text-2xl font-black font-mono ${
-                      Math.abs(stats.horasTac - rutaSeleccionada.horas_tac) / rutaSeleccionada.horas_tac <= 0.20
-                        ? 'text-emerald-400' : 'text-orange-400'
-                    }`}>
-                      {Math.abs(stats.horasTac - rutaSeleccionada.horas_tac).toFixed(2)}<span className="text-base opacity-60">h</span>
-                    </p>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-1">
-                      {(Math.abs(stats.horasTac - rutaSeleccionada.horas_tac) / rutaSeleccionada.horas_tac * 100).toFixed(0)}% variación
-                    </p>
-                  </div>
+          {/* TACÓMETRO */}
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {([
+              { id: 'mro_tac_inicial', label: 'TAC inicial', key: 'tacInicial' as const, evKey: 'inicial' as const },
+              { id: 'mro_tac_final',   label: 'TAC final',   key: 'tacFinal'   as const, evKey: 'final'   as const },
+            ] as const).map(({ id, label, key, evKey }) => (
+              <div key={id} className={`${surface.card} space-y-4 p-4 sm:p-5`}>
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-2 text-sm font-semibold"><Gauge className="h-4 w-4 text-bm-red" /> {label}</span>
+                  <Activity className="h-4 w-4 text-bm-hint" aria-hidden="true" />
                 </div>
-              )}
-
-              {/* BURN PREVIEW */}
-              {stats.horasTac > 0 && (
-                <div className={`flex items-center gap-4 px-6 py-4 rounded-2xl ${
-                  aircraftFuelStock !== null && aircraftFuelStock < stats.litersToBurn ? glass.orange : glass.gold
-                }`}>
-                  <Fuel className={`h-5 w-5 shrink-0 ${
-                    aircraftFuelStock !== null && aircraftFuelStock < stats.litersToBurn ? 'text-orange-400' : 'text-[#E1AD01]'
-                  }`} />
-                  <div>
-                    <p className="text-[9px] font-black uppercase tracking-widest text-zinc-500">Consumo estimado</p>
-                    <p className={`text-base font-black font-mono ${
-                      aircraftFuelStock !== null && aircraftFuelStock < stats.litersToBurn ? 'text-orange-400' : 'text-[#E1AD01]'
-                    }`}>
-                      {stats.litersToBurn.toFixed(1)} LTS
-                      <span className="text-[9px] text-zinc-600 ml-2 font-normal">({stats.horasTac.toFixed(2)}h × {burnRate} LTS/h)</span>
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {/* RESUMEN CAPITÁN */}
-              {esCapitan && stats.horasTac > 0 && (
-                <div className="grid grid-cols-3 gap-4">
-                  <div className={`${glass.gold} rounded-2xl p-5 text-center relative overflow-hidden`}>
-                    <div className="absolute inset-0 bg-gradient-to-br from-[#E1AD01]/[0.04] to-transparent pointer-events-none" />
-                    <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2">Horas TAC</p>
-                    <p className="text-4xl font-black text-[#E1AD01] italic font-mono">
-                      {stats.horasTac.toFixed(2)}<span className="text-lg text-[#E1AD01]/60">h</span>
-                    </p>
-                    <p className="text-[8px] text-zinc-600 uppercase font-mono mt-1">Registradas</p>
-                  </div>
-                  {(() => {
-                    const saldoPost = Math.max(0, (studentBalance ?? 0) - stats.horasTac);
-                    const positivo  = saldoPost > 0;
-                    return (
-                      <div className={`${positivo ? glass.emerald : glass.red} rounded-2xl p-5 text-center relative overflow-hidden`}>
-                        <div className={`absolute inset-0 bg-gradient-to-br ${positivo ? 'from-emerald-500/[0.04]' : 'from-red-500/[0.04]'} to-transparent pointer-events-none`} />
-                        <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2">Saldo Post-Vuelo</p>
-                        <p className={`text-4xl font-black italic font-mono ${positivo ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {saldoPost.toFixed(1)}<span className={`text-lg ${positivo ? 'text-emerald-400/60' : 'text-red-400/60'}`}>h</span>
-                        </p>
-                        <p className="text-[8px] text-zinc-600 uppercase font-mono mt-1">{positivo ? 'Disponibles' : 'Sin saldo'}</p>
-                      </div>
-                    );
-                  })()}
-                  <div className={`${glass.emerald} rounded-2xl p-5 text-center relative overflow-hidden`}>
-                    <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/[0.05] to-transparent pointer-events-none" />
-                    <div className="flex items-center justify-center gap-1.5 mb-2">
-                      <DollarSign size={11} className="text-emerald-400" />
-                      <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest">Tu Pago</p>
-                    </div>
-                    <p className="text-4xl font-black text-emerald-400 italic font-mono">
-                      ${(stats.horasTac * RATE_HORA_CAPITAN).toFixed(2)}
-                    </p>
-                    <p className="text-[8px] text-zinc-600 uppercase font-mono mt-1">
-                      {stats.horasTac.toFixed(2)}h × ${RATE_HORA_CAPITAN}/h
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {/* FINANCIERA ADMIN */}
-              {!esCapitan && (
-                <>
-                  <div className={`${glass.dark} grid grid-cols-1 md:grid-cols-2 gap-6 p-8 rounded-[2rem]`}>
-                    <InputGroup id="mro_horas_facturadas" label={`Horas Facturadas (Rate ${usd(tarifaHora)}/h)`}
-                      type="number" value={form.horasCobrada}
-                      onChange={(v: number) => setForm(prev => ({ ...prev, horasCobrada: Number(v) }))} />
-                    <InputGroup id="mro_monto_cobrado" label="Monto Total a Cobrar ($)"
-                      type="number" value={form.precioCobrado} color="text-emerald-400"
-                      onChange={(v: number) => setForm(prev => ({ ...prev, precioCobrado: Number(v) }))} />
-                  </div>
-                  <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-                    <StatBox label="Horas TAC"   value={stats.horasTac.toFixed(2)} />
-                    <StatBox label="Instructor"  value={`-$${stats.pagoCapitan.toFixed(2)}`}  color="text-red-400/80" />
-                    <StatBox label="Combustible" value={`-$${stats.pagoGasolina.toFixed(1)}`} color="text-red-400/80" />
-                    <StatBox label="MRO Op Fee"  value={`-$${stats.costoOperacional}`}         color="text-[#E1AD01]" />
-                    <div className="bg-[#E1AD01] p-5 rounded-2xl flex flex-col justify-center items-center shadow-[0_10px_30px_rgba(225,173,1,0.25)] text-center">
-                      <span className="text-[9px] text-black font-black uppercase tracking-tighter">Net Profit</span>
-                      <span className="text-2xl font-mono text-black font-black leading-none mt-1">${stats.produccionNeta.toFixed(2)}</span>
-                    </div>
-                  </div>
-                  {/* [NEW v7.0] Los campos de arriba alimentan la producción de la bitácora; el cobro al alumno sale del Tarifario */}
-                  {v18 !== false && (
-                    <p className="text-[8px] text-zinc-600 font-mono -mt-4 ml-1">
-                      Producción de la bitácora. El cobro al alumno se calcula con el Tarifario (horas TAC × tarifa), ver "Cargo al alumno".
-                    </p>
-                  )}
-                </>
-              )}
-
-              {/* [NEW v7.0] CARGO AL ALUMNO — vista previa (el servidor aplica la misma regla al cerrar) */}
-              {preview && (
-                <div className={`${glass.base} rounded-[2rem] p-6 space-y-4`}>
-                  <div className="flex items-center justify-between">
-                    <p className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest flex items-center gap-2">
-                      <Receipt className="h-3.5 w-3.5" /> Cargo al alumno
-                    </p>
-                    <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">
-                      {saldoVuelo?.servicio ?? 'Sin tarifa'}{preview.tarifa ? ` · ${usd(preview.tarifa)}/h` : ''}
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                    <StatBox label="Paquete anterior" value={`${preview.horasPaquete.toFixed(2)}h`} color="text-blue-400" />
-                    <StatBox label="A billetera (h)"  value={`${preview.horasBilletera.toFixed(2)}h`} />
-                    <StatBox label="Desde billetera"  value={preview.sinTarifa ? 'Pendiente' : usd(preview.desdeBilletera)} color="text-teal-400" />
-                    <StatBox label="A cuentas por cobrar" value={preview.sinTarifa ? 'Pendiente' : usd(preview.aCxc)}
-                      color={preview.aCxc > 0 || preview.sinTarifa ? 'text-red-400' : 'text-zinc-500'} />
-                  </div>
-                  <p className="text-[8px] text-zinc-600 font-mono">
-                    Saldo de billetera después del vuelo: {usd(Math.max((saldoVuelo?.saldo_usd ?? 0) - preview.desdeBilletera, 0))}
-                    {preview.horasPaquete > 0 ? ` · paquete restante ${Math.max((saldoVuelo?.horas_paquete ?? 0) - preview.horasPaquete, 0).toFixed(2)}h` : ''}
-                  </p>
-                </div>
-              )}
-
-              {/* OBSERVACIÓN */}
-              <div className="flex flex-col space-y-2">
-                <label className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest ml-1">Observaciones</label>
-                <textarea rows={2}
-                  className={`${glass.base} p-4 rounded-2xl text-white text-sm font-bold outline-none focus:border-[#E1AD01]/60 transition-all uppercase resize-none`}
-                  value={form.observacion} onChange={e => setForm(prev => ({ ...prev, observacion: e.target.value }))} />
+                <InputGroup id={id} label={`Lectura ${label}`} type="number" value={form[key]} big
+                  onChange={(v: number) => setForm(prev => ({ ...prev, [key]: Number(v) }))} />
+                <EvidenceUpload id={`file_${evKey}`} label={`Foto del ${label}`}
+                  file={evidence[evKey]} onSelect={f => setEvidence(prev => ({ ...prev, [evKey]: f }))} />
               </div>
+            ))}
+          </div>
 
-              {/* CTA */}
-              <button type="button" onClick={handleProcessFlight} disabled={isProcessing}
-                className="w-full relative overflow-hidden font-black py-7 rounded-[2rem] uppercase text-[11px] tracking-[0.5em]
-                           flex items-center justify-center gap-4 transition-all shadow-[0_20px_60px_rgba(225,173,1,0.2)]
-                           active:scale-95 disabled:opacity-30 group bg-white text-black hover:bg-[#E1AD01]
-                           hover:shadow-[0_20px_60px_rgba(225,173,1,0.35)]">
-                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:translate-x-full duration-700" />
-                {isProcessing ? <Loader2 className="animate-spin h-5 w-5" /> : <ShieldCheck className="h-6 w-6 group-hover:scale-110 transition-transform" />}
-                {isProcessing ? 'ESTABLECIENDO DATA-LINK…' : 'CERRAR BITÁCORA Y SINCRONIZAR MRO'}
-              </button>
-            </>
-          ) : (
-            <div className={`${glass.base} py-16 text-center rounded-[2rem]`}>
-              <div className="w-16 h-16 rounded-[1.5rem] bg-white/[0.03] border border-white/[0.06] flex items-center justify-center mx-auto mb-4">
-                <Plane className="text-zinc-700" size={32} />
+          {/* RESUMEN DELTA TAC vs RUTA */}
+          {stats.horasTac > 0 && rutaSeleccionada && (() => {
+            const ok = Math.abs(stats.horasTac - rutaSeleccionada.horas_tac) / rutaSeleccionada.horas_tac <= 0.20;
+            return (
+              <div className="grid grid-cols-3 gap-2 sm:gap-3">
+                <Tile label="Delta TAC real" value={stats.horasTac.toFixed(2)} unit="h" note="Fuente legal MRO" />
+                <Tile label="Ruta ref." value={String(rutaSeleccionada.horas_tac)} unit="h" note={rutaSeleccionada.destino} />
+                <Tile label="Diferencia" value={Math.abs(stats.horasTac - rutaSeleccionada.horas_tac).toFixed(2)} unit="h"
+                  note={`${(Math.abs(stats.horasTac - rutaSeleccionada.horas_tac) / rutaSeleccionada.horas_tac * 100).toFixed(0)} % de variación`}
+                  tone={ok ? 'ok' : 'warn'} />
               </div>
-              <p className="text-[11px] font-black uppercase text-zinc-600 tracking-[0.3em]">Seleccione un cadete del panel de misiones</p>
-              <p className="text-[9px] font-black uppercase text-zinc-800 tracking-widest mt-2">Solo puede operar con alumnos asignados al día de hoy</p>
+            );
+          })()}
+
+          {/* BURN PREVIEW */}
+          {stats.horasTac > 0 && (
+            <div className={`flex items-center gap-4 rounded-2xl border p-4 ${combustibleBajo ? 'border-bm-warn/30 bg-bm-warn-tint' : 'border-bm-line bg-white'}`}>
+              <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${combustibleBajo ? 'bg-bm-warn text-white' : 'bg-bm-canvas text-bm-steel'}`}>
+                <Fuel className="h-5 w-5" />
+              </span>
+              <div className="min-w-0">
+                <p className="text-[13px] text-bm-steel">Consumo estimado</p>
+                <p className={`text-base font-semibold ${combustibleBajo ? 'text-bm-warn' : ''}`}>
+                  <span className="bm-num">{stats.litersToBurn.toFixed(1)}</span> L
+                  <span className="ml-2 text-xs font-normal text-bm-steel">(<span className="bm-num">{stats.horasTac.toFixed(2)}</span> h × <span className="bm-num">{burnRate}</span> L/h)</span>
+                </p>
+              </div>
             </div>
           )}
+
+          {/* RESUMEN CAPITÁN */}
+          {esCapitan && stats.horasTac > 0 && (
+            <div className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-3 sm:gap-3">
+              <Tile label="Horas TAC" value={stats.horasTac.toFixed(2)} unit="h" note="Registradas" big />
+              {(() => {
+                const saldoPost = Math.max(0, (studentBalance ?? 0) - stats.horasTac);
+                const positivo  = saldoPost > 0;
+                return (
+                  <Tile label="Saldo post-vuelo" value={saldoPost.toFixed(1)} unit="h"
+                    note={positivo ? 'Disponibles' : 'Sin saldo'} tone={positivo ? 'ok' : 'danger'} big />
+                );
+              })()}
+              <Tile label="Tu pago" value={`$${(stats.horasTac * RATE_HORA_CAPITAN).toFixed(2)}`}
+                note={`${stats.horasTac.toFixed(2)} h × $${RATE_HORA_CAPITAN}/h`} tone="ok" big icon={<DollarSign className="h-3.5 w-3.5" />} />
+            </div>
+          )}
+
+          {/* FINANCIERA ADMIN */}
+          {!esCapitan && (
+            <section className={`${surface.card} space-y-4 p-4 sm:p-5`} aria-label="Producción de la bitácora">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                <InputGroup id="mro_horas_facturadas" label={`Horas facturadas (tarifa ${usd(tarifaHora)}/h)`}
+                  type="number" value={form.horasCobrada}
+                  onChange={(v: number) => setForm(prev => ({ ...prev, horasCobrada: Number(v) }))} />
+                <InputGroup id="mro_monto_cobrado" label="Monto total a cobrar ($)"
+                  type="number" value={form.precioCobrado}
+                  onChange={(v: number) => setForm(prev => ({ ...prev, precioCobrado: Number(v) }))} />
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:gap-3 md:grid-cols-5">
+                <StatBox label="Horas TAC"   value={stats.horasTac.toFixed(2)} />
+                <StatBox label="Instructor"  value={`-$${stats.pagoCapitan.toFixed(2)}`}  color="text-bm-red" />
+                <StatBox label="Combustible" value={`-$${stats.pagoGasolina.toFixed(1)}`} color="text-bm-red" />
+                <StatBox label="Cargo MRO"   value={`-$${stats.costoOperacional}`}         color="text-bm-red-deep" />
+                <div className="col-span-2 flex flex-col justify-center rounded-2xl bg-bm-ink p-4 text-white md:col-span-1">
+                  <span className="text-xs text-white/70">Producción neta</span>
+                  <span className="bm-figure mt-1 text-2xl leading-none">${stats.produccionNeta.toFixed(2)}</span>
+                </div>
+              </div>
+              {/* [NEW v7.0] Los campos de arriba alimentan la producción de la bitácora; el cobro al alumno sale del Tarifario */}
+              {v18 !== false && (
+                <p className="text-[13px] text-bm-steel">
+                  Producción de la bitácora. El cobro al alumno se calcula con el Tarifario (horas TAC × tarifa), ver "Cargo al alumno".
+                </p>
+              )}
+            </section>
+          )}
+
+          {/* [NEW v7.0] CARGO AL ALUMNO — vista previa (el servidor aplica la misma regla al cerrar) */}
+          {preview && (
+            <section className={`${surface.card} space-y-4 p-4 sm:p-5`} aria-labelledby="fr-cargo">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 id="fr-cargo" className="flex items-center gap-2 text-sm font-semibold">
+                  <Receipt className="h-4 w-4 text-bm-red" /> Cargo al alumno
+                </h3>
+                <p className="text-xs text-bm-steel">
+                  {saldoVuelo?.servicio ?? 'Sin tarifa'}{preview.tarifa ? ` · ${usd(preview.tarifa)}/h` : ''}
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:gap-3 md:grid-cols-4">
+                <StatBox label="Paquete anterior" value={`${preview.horasPaquete.toFixed(2)} h`} color="text-[#2F5BB7]" />
+                <StatBox label="A billetera (h)"  value={`${preview.horasBilletera.toFixed(2)} h`} />
+                <StatBox label="Desde billetera"  value={preview.sinTarifa ? 'Pendiente' : usd(preview.desdeBilletera)} color="text-bm-ok" />
+                <StatBox label="A cuentas por cobrar" value={preview.sinTarifa ? 'Pendiente' : usd(preview.aCxc)}
+                  color={preview.aCxc > 0 || preview.sinTarifa ? 'text-bm-red' : 'text-bm-steel'} />
+              </div>
+              <p className="text-[13px] text-bm-steel">
+                Saldo de billetera después del vuelo: <span className="bm-num">{usd(Math.max((saldoVuelo?.saldo_usd ?? 0) - preview.desdeBilletera, 0))}</span>
+                {preview.horasPaquete > 0 ? ` · paquete restante ${Math.max((saldoVuelo?.horas_paquete ?? 0) - preview.horasPaquete, 0).toFixed(2)} h` : ''}
+              </p>
+            </section>
+          )}
+
+          {/* OBSERVACIÓN */}
+          <div className="space-y-2">
+            <label htmlFor="mro_observacion" className={bmLabel}>Observaciones</label>
+            <textarea id="mro_observacion" rows={2}
+              className={`${bmTextarea} uppercase placeholder:normal-case`}
+              placeholder="Novedades del vuelo"
+              value={form.observacion} onChange={e => setForm(prev => ({ ...prev, observacion: e.target.value }))} />
+          </div>
+
+          {/* CTA */}
+          <div className="sticky bottom-0 z-20 -mx-4 border-t border-bm-line bg-bm-canvas/95 px-4 py-3 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0">
+            <button type="button" onClick={handleProcessFlight} disabled={isProcessing}
+              className={`${bmBtn.primary} h-14 w-full text-base`}>
+              {isProcessing ? <Loader2 className="h-5 w-5 animate-spin" /> : <ShieldCheck className="h-5 w-5" />}
+              {isProcessing ? 'Sincronizando bitácora…' : 'Cerrar bitácora y sincronizar MRO'}
+            </button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className={`${surface.card} border-dashed`}>
+          <BmEmpty
+            icon={<Plane className="h-5 w-5" />}
+            title="Seleccione un cadete del panel de misiones"
+            text="Solo puede operar con alumnos asignados al día de hoy."
+          />
+        </div>
+      )}
+
+      {confirmDialog}
     </div>
   );
 };
@@ -1771,13 +1843,12 @@ const FlightRegister = ({ onFlightLogUpdate }: FlightRegisterProps) => {
 // COMPONENTES ATÓMICOS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const InputGroup = ({ id, label, value, onChange, type = 'text', color = 'text-white' }: any) => (
-  <div className="flex flex-col space-y-2 group w-full text-left">
-    <label htmlFor={id} className="text-[10px] text-[#E1AD01] font-black uppercase tracking-widest ml-1">{label}</label>
+const InputGroup = ({ id, label, value, onChange, type = 'text', big = false }: any) => (
+  <div className="flex w-full flex-col space-y-2 text-left">
+    <label htmlFor={id} className={bmLabel}>{label}</label>
     <input id={id} type={type} step="0.01" autoComplete="off"
-      className={`bg-white/[0.04] backdrop-blur-xl border border-white/[0.09] p-4 rounded-2xl
-                 ${color} text-sm font-bold outline-none focus:border-[#E1AD01]/60 focus:bg-[#E1AD01]/[0.03]
-                 transition-all uppercase w-full shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]`}
+      inputMode={type === 'number' ? 'decimal' : undefined}
+      className={`${bmInput} ${type === 'number' ? 'bm-num' : ''} ${type === 'text' ? 'uppercase' : ''} ${big ? 'h-14 text-2xl font-semibold' : ''}`}
       value={value} onChange={e => onChange(e.target.value)} />
   </div>
 );
@@ -1785,28 +1856,58 @@ const InputGroup = ({ id, label, value, onChange, type = 'text', color = 'text-w
 const EvidenceUpload = ({ id, label, file, onSelect }: {
   id: string; label: string; file: File | null; onSelect: (f: File) => void;
 }) => (
-  <div className={`relative overflow-hidden rounded-2xl transition-all cursor-pointer ${
+  <div className={`relative overflow-hidden rounded-xl border transition-colors ${
     file
-      ? 'bg-emerald-500/[0.06] border border-emerald-500/[0.20] backdrop-blur-xl'
-      : 'bg-white/[0.02] border border-dashed border-white/[0.12] backdrop-blur-xl hover:border-[#E1AD01]/40 hover:bg-[#E1AD01]/[0.02]'
+      ? 'border-bm-ok/30 bg-bm-ok-tint'
+      : 'border-dashed border-bm-field bg-white hover:border-bm-red/50 hover:bg-bm-red-tint/40'
   }`}>
-    <label htmlFor={id} className="flex items-center justify-between p-4 cursor-pointer">
-      <div className="flex items-center gap-3">
-        {file ? <FileCheck className="text-emerald-400 h-5 w-5" /> : <Camera className="text-white/30 h-5 w-5" />}
-        <span className={`text-[10px] font-black uppercase tracking-wider ${file ? 'text-emerald-400' : 'text-zinc-500'}`}>
-          {file ? 'Evidencia Capturada' : label}
+    <label htmlFor={id} className="flex min-h-12 cursor-pointer items-center justify-between gap-3 px-4 py-3">
+      <span className="flex min-w-0 items-center gap-3">
+        {file ? <FileCheck className="h-5 w-5 shrink-0 text-bm-ok" /> : <Camera className="h-5 w-5 shrink-0 text-bm-steel" />}
+        <span className={`truncate text-sm ${file ? 'font-semibold text-bm-ok' : 'text-bm-steel'}`}>
+          {file ? `Evidencia capturada · ${file.name}` : label}
         </span>
-      </div>
+      </span>
+      <span className="shrink-0 text-xs font-semibold text-bm-red">{file ? 'Cambiar' : 'Tomar foto'}</span>
       <input id={id} type="file" accept="image/*" capture="environment" className="sr-only"
         onChange={e => e.target.files && onSelect(e.target.files[0])} />
     </label>
   </div>
 );
 
-const StatBox = ({ label, value, color = 'text-white' }: any) => (
-  <div className="bg-white/[0.02] backdrop-blur-xl p-4 rounded-2xl border border-white/[0.06] flex flex-col justify-center items-start text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-    <p className="text-[8px] text-zinc-600 uppercase font-black mb-1 tracking-widest">{label}</p>
-    <p className={`text-sm font-mono font-bold ${color} tracking-tighter`}>{value}</p>
+const StatBox = ({ label, value, color = 'text-bm-ink' }: any) => (
+  <div className="flex flex-col items-start justify-center rounded-2xl border border-bm-line bg-white p-3.5 text-left sm:p-4">
+    <p className="mb-1 text-xs text-bm-steel">{label}</p>
+    <p className={`bm-num text-sm font-semibold ${color}`}>{value}</p>
+  </div>
+);
+
+// [v7.1] Indicador numérico B&M
+const Tile = ({ label, value, unit, note, tone = 'neutral', big = false, icon }: {
+  label: string; value: string; unit?: string; note?: string; tone?: 'neutral' | 'ok' | 'warn' | 'danger'; big?: boolean; icon?: React.ReactNode;
+}) => {
+  const cls = {
+    neutral: 'border-bm-line bg-white text-bm-ink',
+    ok:      'border-bm-ok/25 bg-bm-ok-tint text-bm-ok',
+    warn:    'border-bm-warn/25 bg-bm-warn-tint text-bm-warn',
+    danger:  'border-bm-red/25 bg-bm-red-tint text-bm-red',
+  }[tone];
+  return (
+    <div className={`min-w-0 rounded-2xl border p-3 sm:p-4 ${cls}`}>
+      <p className="flex items-center gap-1 truncate text-xs text-bm-steel">{icon}{label}</p>
+      <p className={`bm-figure mt-1.5 leading-none ${big ? 'text-[28px] sm:text-[32px]' : 'text-xl sm:text-2xl'}`}>
+        {value}{unit && <span className="ml-0.5 text-sm font-medium opacity-60">{unit}</span>}
+      </p>
+      {note && <p className="mt-1.5 truncate text-[11px] text-bm-steel">{note}</p>}
+    </div>
+  );
+};
+
+// [v7.1] Fila clave/valor para las confirmaciones
+const Fila = ({ k, v, fuerte = false }: { k: string; v: string; fuerte?: boolean }) => (
+  <div className="flex items-baseline justify-between gap-3">
+    <dt className="text-bm-steel">{k}</dt>
+    <dd className={`bm-num text-right ${fuerte ? 'font-semibold text-bm-red-deep' : ''}`}>{v}</dd>
   </div>
 );
 
