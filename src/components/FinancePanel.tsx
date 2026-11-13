@@ -1,3 +1,20 @@
+// VALKYRON FINANCIAL INTELLIGENCE CENTER v17.1 — B&M MANTENIMIENTO AERONÁUTICO
+// CHANGELOG v17.1 vs v17.0 (rebrand B&M + conexiones):
+//   [UI]  Tema B&M en todo el panel: superficies blancas, rojo B&M como acción principal, colores
+//         semánticos legibles sobre blanco (USDT verde, ZELLE azul, CASH ocre, BS naranja, FX teal,
+//         financiamiento violeta). Migración de clases con codemod verificado: las líneas tocadas por
+//         el codemod difieren SOLO en clases Tailwind (cero cambios de lógica, consultas, RPC o textos).
+//   [UI]  Etiquetas de 7–11 px en mayúsculas espaciadas → 11–14 px en tipo oración; cifras con
+//         bm-figure / bm-num (tabulares); campos de 16 px (sin zoom en iOS); modales como hoja
+//         inferior en móvil y diálogo centrado desde md; pestañas segmentadas con desplazamiento.
+//   [UI]  "Quién pagó": tipos en 2 columnas y campos en 1 columna (antes se cortaban en la columna
+//         estrecha del formulario).
+//   [UI]  Las 8 confirmaciones (window.confirm) pasan a un modal B&M con el mismo texto y la misma
+//         decisión; anularAsiento pasa a async para poder esperar la respuesta.
+//   [CHG] Entidad en textos e impresos: una sola constante (EMPRESA_CORTA / EMPRESA_LEGAL). Antes
+//         "Águilas" / "ÁGUILAS PILOT ACADEMY" estaban escritos en 6 lugares.
+//   [PRESERVADO] Toda la lógica v17.0: motor de asientos, billeteras, consumos, clases, reportes,
+//         pagadores, cajas, anticipos, FX Desk, préstamos, cierre, exportaciones e impresión.
 // VALKYRON FINANCIAL INTELLIGENCE CENTER v17.0
 // CHANGELOG v17.0 vs v16.8 (lógica QuickBooks solicitada por dirección Águilas):
 //   [NEW] BILLETERA DEL ALUMNO (USD): el alumno paga en USDT/ZELLE/CASH/BS → RECARGA (bóveda + caja + pagador
@@ -86,6 +103,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { LucideIcon } from 'lucide-react';
 import { FinanceTransaction, Vendor } from '../Types/Maintenance';
 import { supabase } from '../lib/supabaseClient';
+import { useBmConfirm } from './brand/bm-ui';   // [v17.1] confirmaciones B&M
 import {
   ArrowUpCircle, ArrowDownCircle, PlusCircle, X, Loader2,
   Wallet, ShieldCheck, Calculator, Landmark, CheckCircle2,
@@ -364,14 +382,18 @@ const getCajaConfig = (ref: string | CajaChica | null | undefined): CajaConf => 
 
 // ─── ESTILOS / CONSTANTES ─────────────────────────────────────────────────────
 
-const glass   = "bg-white/[0.02] backdrop-blur-[40px] border border-white/[0.07] shadow-[0_20px_50px_rgba(0,0,0,0.5)]";
-const inp     = "bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-[#E1AD01]/60 focus:ring-1 focus:ring-[#E1AD01]/20 transition-all w-full uppercase placeholder:text-white/20";
+const glass   = "bg-white border border-bm-line";   // [v17.1] antes: vidrio oscuro con sombra
+const inp     = "bg-white border border-bm-field px-4 py-3 min-h-12 rounded-xl text-bm-ink text-base outline-none focus:border-bm-red focus:ring-4 focus:ring-bm-red/10 transition-[border-color,box-shadow] w-full uppercase placeholder:text-bm-hint disabled:bg-bm-canvas disabled:text-bm-steel";   // [v17.1] 16 px
 const noUpper = { textTransform: 'none' } as const;
-const optOff  = 'bg-white/[0.02] border-white/[0.05] text-zinc-600 hover:text-zinc-400';
+const optOff  = 'bg-white border-bm-line text-bm-steel hover:text-bm-ink hover:border-bm-field';
 
 const DEFAULT_TASA_BS       = 36.50;
 const DIRECTOR_FINANCE_CODE = '4827';
 const NOOP = () => {};
+
+// ▼ v17.1 — entidad en textos e impresos (un solo punto de cambio)
+const EMPRESA_CORTA = 'B&M';
+const EMPRESA_LEGAL = 'B&M Mantenimiento Aeronáutico';
 
 // ▼ v16.6 — rol financiero canónico. El frontend acepta aliases, pero la BD/RLS sigue siendo autoridad final.
 const FINANCE_ROLES = ['CEO', 'ADMIN', 'DIRECTOR'] as const;
@@ -394,22 +416,22 @@ const isFinanceRole = (value: unknown): value is FinanceRole =>
   (FINANCE_ROLES as readonly string[]).includes(normalizeFinanceRole(value));
 
 const MONEDA_COLOR: Record<PaymentMethod, string> = {
-  USDT: 'text-emerald-400', ZELLE: 'text-blue-400', CASH: 'text-yellow-400', BS: 'text-orange-400',
+  USDT: 'text-bm-ok', ZELLE: 'text-[#2F5BB7]', CASH: 'text-[#8A6100]', BS: 'text-bm-warn',
 };
 const MONEDA_BG: Record<PaymentMethod, string> = {
-  USDT: 'bg-emerald-500/10 border-emerald-500/20', ZELLE: 'bg-blue-500/10 border-blue-500/20',
-  CASH: 'bg-yellow-500/10 border-yellow-500/20',   BS:    'bg-orange-500/10 border-orange-500/20',
+  USDT: 'bg-bm-ok-tint border-bm-ok/25', ZELLE: 'bg-[#E8EEF9] border-[#2F5BB7]/25',
+  CASH: 'bg-[#FDF3D8] border-[#8A6100]/25',   BS:    'bg-bm-warn-tint border-bm-warn/25',
 };
 const TONE = {
-  fx:      'bg-teal-500/10 text-teal-400 border-teal-500/20',
-  fin:     'bg-violet-500/10 text-violet-400 border-violet-500/20',
-  asiento: 'bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/20',
-  red:     'bg-red-500/10 text-red-400 border-red-500/20',
-  purple:  'bg-purple-500/10 text-purple-400 border-purple-500/20',
-  yellow:  'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
-  blue:    'bg-blue-500/10 text-blue-400 border-blue-500/20',
-  emerald: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
-  orange:  'bg-orange-500/10 text-orange-400 border-orange-500/20',
+  fx:      'bg-[#E6F4F2] text-[#0F766E] border-[#0F766E]/25',
+  fin:     'bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25',
+  asiento: 'bg-bm-red-tint text-bm-red border-bm-red/25',
+  red:     'bg-bm-red-tint text-bm-red border-bm-red/25',
+  purple:  'bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25',
+  yellow:  'bg-[#FDF3D8] text-[#8A6100] border-[#8A6100]/25',
+  blue:    'bg-[#E8EEF9] text-[#2F5BB7] border-[#2F5BB7]/25',
+  emerald: 'bg-bm-ok-tint text-bm-ok border-bm-ok/25',
+  orange:  'bg-bm-warn-tint text-bm-warn border-bm-warn/25',
 };
 
 const PREFIJO_EVENTO: Record<EventoContable, string> = {
@@ -760,7 +782,7 @@ const imprimirDocumento = (d: PrintDoc) => {
       .firmas div { flex: 1; border-top: 1px solid #333; padding-top: 4px; text-align: center; font-size: 9px; }
     </style></head><body>
     <header>
-      <div><div class="marca">ÁGUILAS PILOT ACADEMY · VALKYRON FINANCIAL CORE</div>
+      <div><div class="marca">${escHtml(EMPRESA_LEGAL.toUpperCase())} · VALKYRON FINANCIAL CORE</div>
         <h1>${escHtml(d.titulo)}</h1>${d.subtitulo ? `<div class="sub">${escHtml(d.subtitulo)}</div>` : ''}</div>
       <div class="meta">${(d.meta ?? []).map(([k, v]) => `${escHtml(k)}: <b>${escHtml(v)}</b>`).join('<br>')}
         <br>Emitido: <b>${escHtml(new Date().toLocaleString('es-VE'))}</b></div>
@@ -768,7 +790,7 @@ const imprimirDocumento = (d: PrintDoc) => {
     ${d.resumen?.length ? `<div class="resumen">${d.resumen.map(([k, v]) => `<div><span>${escHtml(k)}</span><b>${escHtml(v)}</b></div>`).join('')}</div>` : ''}
     ${d.secciones.map(tabla).join('')}
     <div class="firmas"><div>Elaborado por</div><div>Revisado por</div><div>Dirección</div></div>
-    <footer><span>${escHtml(d.pie ?? 'Documento generado por Valkyron Financial Core. Montos en USD salvo indicación.')}</span><span>Águilas Pilot Academy</span></footer>
+    <footer><span>${escHtml(d.pie ?? 'Documento generado por Valkyron Financial Core. Montos en USD salvo indicación.')}</span><span>${escHtml(EMPRESA_LEGAL)}</span></footer>
   </body></html>`;
   w.document.open();
   w.document.write(html);
@@ -779,25 +801,25 @@ const imprimirDocumento = (d: PrintDoc) => {
 // ─── COMPONENTES UI REUTILIZABLES ─────────────────────────────────────────────
 
 const ErrorBanner: React.FC<{ msg: string | null; onClose: () => void }> = ({ msg, onClose }) => !msg ? null : (
-  <div className="flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/30 animate-in slide-in-from-top-2 duration-300">
-    <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
-    <p className="text-[10px] text-red-400 flex-1 font-mono">{msg}</p>
-    <button type="button" onClick={onClose} className="text-red-700 hover:text-red-400 transition-colors"><X size={12} /></button>
+  <div role="alert" className="flex items-start gap-3 p-4 rounded-2xl bg-bm-red-tint border border-bm-red/25 animate-in slide-in-from-top-2 duration-300">
+    <AlertTriangle size={16} className="text-bm-red shrink-0 mt-0.5" />
+    <p className="text-sm text-bm-red-deep flex-1 break-words">{msg}</p>
+    <button type="button" onClick={onClose} aria-label="Cerrar aviso" className="text-bm-red hover:text-bm-red-deep transition-colors"><X size={16} /></button>
   </div>
 );
 
 const Badge: React.FC<{ tone: string; title?: string; children: React.ReactNode }> = ({ tone, title, children }) => (
-  <span title={title} className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full border shrink-0 flex items-center gap-1 ${tone}`}>{children}</span>
+  <span title={title} className={`text-[11px] font-semibold uppercase px-2 py-0.5 rounded-full border shrink-0 flex items-center gap-1 ${tone}`}>{children}</span>
 );
 
-const Lbl: React.FC<{ children: React.ReactNode; cls?: string }> = ({ children, cls = 'text-zinc-500' }) => (
-  <label className={`text-[8px] ${cls} font-black uppercase tracking-widest block mb-2`}>{children}</label>
+const Lbl: React.FC<{ children: React.ReactNode; cls?: string }> = ({ children, cls = 'text-bm-steel' }) => (
+  <label className={`text-[13px] ${cls} font-medium block mb-1.5`}>{children}</label>
 );
 
 const EmptyState: React.FC<{ icon?: LucideIcon; text: string; py?: string }> = ({ icon: Icon, text, py = 'py-12' }) => (
-  <div className={`text-center ${py} text-zinc-700`}>
-    {Icon && <Icon className="h-8 w-8 mx-auto mb-3 opacity-20" />}
-    <p className="text-[9px] font-black uppercase tracking-widest">{text}</p>
+  <div className={`text-center ${py} text-bm-steel`}>
+    {Icon && <span className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-bm-canvas"><Icon className="h-5 w-5 text-bm-hint" /></span>}
+    <p className="text-sm font-medium">{text}</p>
   </div>
 );
 
@@ -808,7 +830,7 @@ const MonedaPicker: React.FC<{
   <div className="grid grid-cols-4 gap-1.5">
     {options.map(m => (
       <button key={m} type="button" onClick={() => onChange(m)} disabled={isDisabled?.(m)}
-        className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all disabled:opacity-20 ${value === m ? `${MONEDA_BG[m]} ${MONEDA_COLOR[m]}` : optOff}`}>
+        className={`py-2.5 rounded-xl text-xs font-semibold border transition-all disabled:opacity-20 ${value === m ? `${MONEDA_BG[m]} ${MONEDA_COLOR[m]}` : optOff}`}>
         {m}
       </button>
     ))}
@@ -819,7 +841,7 @@ const SubcajaToggle: React.FC<{ value: SubcajaEfectivo; onChange: (s: SubcajaEfe
   <div className={`grid grid-cols-2 gap-1.5 ${className}`}>
     {(['ADM', 'CEO'] as SubcajaEfectivo[]).map(sc => (
       <button key={sc} type="button" onClick={() => onChange(sc)}
-        className={`py-2.5 rounded-xl text-[9px] font-black uppercase border transition-all ${value === sc ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30' : optOff}`}>
+        className={`py-2.5 rounded-xl text-xs font-semibold border transition-all ${value === sc ? 'bg-[#FDF3D8] text-[#8A6100] border-[#8A6100]/25' : optOff}`}>
         {sc === 'ADM' ? 'Administración' : 'Custodia CEO'}
       </button>
     ))}
@@ -834,20 +856,20 @@ const PagadorFields: React.FC<{
   const set = (k: keyof PagoForm, val: string) => onChange({ ...v, [k]: val });
   const origen = ORIGEN_LABEL[moneda];
   return (
-    <div className={`rounded-2xl border border-[#E1AD01]/25 bg-[#E1AD01]/[0.03] p-4 space-y-3 ${className}`}>
-      <p className="text-[9px] text-[#E1AD01] font-black uppercase tracking-widest flex items-center gap-2"><UserCheck size={12} /> Quién pagó · {moneda}</p>
+    <div className={`rounded-2xl border border-bm-red/25 bg-bm-red-tint/40 p-4 space-y-3 ${className}`}>
+      <p className="text-xs text-bm-red font-semibold flex items-center gap-2"><UserCheck size={12} /> Quién pagó · {moneda}</p>
       {!bloqueado && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5">
+        <div className="grid grid-cols-2 gap-1.5">   {/* [v17.1] antes 4 columnas: se cortaban */}
           {PAGADOR_TIPOS.filter(t => !sinPerfil || t.k !== 'ALUMNO').map(t => (
             <button key={t.k} type="button"
               onClick={() => onChange({ ...v, pagador_tipo: t.k, alumno_id: t.k === 'ALUMNO' ? v.alumno_id : '', pagador_nombre: t.k === 'ALUMNO' || v.pagador_tipo === 'ALUMNO' ? '' : v.pagador_nombre })}
-              className={`py-2 rounded-xl text-[9px] font-black uppercase border transition-all ${v.pagador_tipo === t.k ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`}>
+              className={`py-2 rounded-xl text-xs font-semibold border transition-all ${v.pagador_tipo === t.k ? 'bg-bm-red-tint text-bm-red border-bm-red/25' : optOff}`}>
               {sinPerfil && t.k === 'TERCERO' ? 'Aspirante (sin matrícula)' : t.l}
             </button>
           ))}
         </div>
       )}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+      <div className="grid grid-cols-1 gap-2">
         {v.pagador_tipo === 'ALUMNO' && !bloqueado ? (
           <select value={v.alumno_id} className={inp}
             onChange={e => { const a = alumnos.find(x => x.student_id === e.target.value); onChange({ ...v, alumno_id: e.target.value, pagador_nombre: a?.nombre ?? '' }); }}>
@@ -865,7 +887,7 @@ const PagadorFields: React.FC<{
           ? <input value={v.cuenta_origen} onChange={e => set('cuenta_origen', e.target.value)} placeholder={origen.toUpperCase()} className={inp} style={noUpper} />
           : <input value={v.pagador_contacto} onChange={e => set('pagador_contacto', e.target.value)} placeholder="TELÉFONO / EMAIL (opcional)" className={inp} style={noUpper} />}
         {origen && <input value={v.pagador_contacto} onChange={e => set('pagador_contacto', e.target.value)} placeholder="TELÉFONO / EMAIL (opcional)" className={inp} style={noUpper} />}
-        <input value={v.recibido_por} onChange={e => set('recibido_por', e.target.value)} placeholder="RECIBIDO POR (ADMINISTRACIÓN) *" className={`${inp} ${origen ? '' : 'md:col-span-2'}`} />
+        <input value={v.recibido_por} onChange={e => set('recibido_por', e.target.value)} placeholder="RECIBIDO POR (ADMINISTRACIÓN) *" className={inp} />
       </div>
     </div>
   );
@@ -878,10 +900,10 @@ const ClaseFields: React.FC<{
 }> = ({ value: v, onChange, flota, pilotos, naturaleza = 'TODOS', className = '', titulo = 'Clase contable (P&L por clase)' }) => {
   const set = (k: keyof ClaseForm, val: string) => onChange({ ...v, [k]: val });
   const servicios = SERVICIOS_PL.filter(s => s.n !== 'NEUTRO' && (naturaleza === 'TODOS' || s.n === naturaleza));
-  const sel = 'bg-black/50 border border-white/10 px-3 py-2.5 rounded-xl text-white text-[10px] font-mono outline-none focus:border-[#E1AD01]/60 w-full uppercase';
+  const sel = 'bg-white border border-bm-field px-3 min-h-11 rounded-xl text-bm-ink text-base outline-none focus:border-bm-red w-full uppercase';   // [v17.1]
   return (
-    <div className={`rounded-2xl border border-teal-500/20 bg-teal-500/[0.03] p-3 space-y-2 ${className}`}>
-      <p className="text-[8px] text-teal-400 font-black uppercase tracking-widest flex items-center gap-2"><Tag size={11} /> {titulo}</p>
+    <div className={`rounded-2xl border border-[#0F766E]/25 bg-[#E6F4F2]/60 p-3 space-y-2 ${className}`}>
+      <p className="text-xs text-[#0F766E] font-semibold flex items-center gap-2"><Tag size={11} /> {titulo}</p>
       <div className="grid grid-cols-2 gap-2">
         <select value={v.servicio} onChange={e => set('servicio', e.target.value)} className={sel}>
           <option value="">— SERVICIO / CUENTA —</option>
@@ -908,41 +930,43 @@ const ClaseFields: React.FC<{
 };
 
 const AMOUNT_SIZE = {
-  xl: { input: 'py-8 pl-14 pr-6 text-3xl bg-white/5', prefix: 'left-5 text-xl' },
-  lg: { input: 'py-6 pl-14 pr-6 text-2xl bg-white/5', prefix: 'left-5 text-xl' },
-  md: { input: 'py-4 pl-10 pr-4 text-xl bg-black/50', prefix: 'left-4' },
+  xl: { input: 'py-8 pl-14 pr-6 text-3xl bg-bm-canvas', prefix: 'left-5 text-xl' },
+  lg: { input: 'py-6 pl-14 pr-6 text-2xl bg-bm-canvas', prefix: 'left-5 text-xl' },
+  md: { input: 'py-4 pl-10 pr-4 text-xl bg-white', prefix: 'left-4' },
 } as const;
 
 /** Input de monto con prefijo de moneda y redondeo a 2 decimales al salir del campo */
 const AmountInput: React.FC<{
   value: string; onChange: (v: string) => void; moneda: PaymentMethod;
   size?: keyof typeof AMOUNT_SIZE; prefixCls?: string; focusCls?: string; disabled?: boolean;
-}> = ({ value, onChange, moneda, size = 'md', prefixCls, focusCls = 'focus:border-[#E1AD01]', disabled }) => (
+}> = ({ value, onChange, moneda, size = 'md', prefixCls, focusCls = 'focus:border-bm-red', disabled }) => (
   <div className="relative">
-    <span className={`absolute top-1/2 -translate-y-1/2 font-black ${AMOUNT_SIZE[size].prefix} ${prefixCls ?? MONEDA_COLOR[moneda]}`}>{prefijo(moneda)}</span>
+    <span className={`absolute top-1/2 -translate-y-1/2 font-semibold ${AMOUNT_SIZE[size].prefix} ${prefixCls ?? MONEDA_COLOR[moneda]}`}>{prefijo(moneda)}</span>
     <input type="number" step="0.01" min="0.01" required value={value} disabled={disabled} placeholder="0.00"
       onChange={e => onChange(e.target.value)}
       onBlur={e => { const n = parseFloat(e.target.value); if (!isNaN(n)) onChange(round2(n).toString()); }}
-      className={`w-full border border-white/10 rounded-2xl font-black italic outline-none text-white ${AMOUNT_SIZE[size].input} ${focusCls}`} />
+      className={`w-full border border-bm-line rounded-2xl font-semibold outline-none text-bm-ink bm-num ${AMOUNT_SIZE[size].input} ${focusCls}`} />
   </div>
 );
 
 const ModalShell: React.FC<{ accent: string; maxW?: string; z?: string; children: React.ReactNode }> = ({ accent, maxW = 'max-w-md', z = 'z-[95]', children }) => (
-  <div className={`fixed inset-0 ${z} bg-black/80 backdrop-blur-md flex items-center justify-center p-4`}>
-    <div className={`${glass} w-full ${maxW} rounded-3xl p-7 border-t-2 ${accent} max-h-[92vh] overflow-y-auto`}>{children}</div>
+  // [v17.1] Hoja inferior en móvil · diálogo centrado desde md
+  <div className={`fixed inset-0 ${z} flex items-end justify-center md:items-center md:p-4`} role="dialog" aria-modal="true">
+    <div className="bm-backdrop absolute inset-0 bg-[rgba(27,29,34,0.45)] backdrop-blur-[2px]" aria-hidden="true" />
+    <div className={`bm-sheet relative w-full ${maxW} max-h-[92dvh] overflow-y-auto rounded-t-[28px] md:rounded-[28px] bg-white p-5 sm:p-7 text-bm-ink shadow-bm-sheet border-t-4 ${accent}`}>{children}</div>
   </div>
 );
 
 const ModalHeader: React.FC<{ icon: LucideIcon; tone: string; title: string; subtitle?: string; onClose?: () => void }> = ({ icon: Icon, tone, title, subtitle, onClose }) => (
-  <div className="flex items-center justify-between mb-6">
-    <div className="flex items-center gap-3">
-      <div className={`w-10 h-10 rounded-2xl border flex items-center justify-center ${tone}`}><Icon className="h-5 w-5" /></div>
-      <div>
-        <h3 className="text-[11px] font-black uppercase tracking-widest">{title}</h3>
-        {subtitle && <p className="text-[8px] text-zinc-600 mt-1">{subtitle}</p>}
+  <div className="flex items-start justify-between gap-3 mb-5">
+    <div className="flex min-w-0 items-center gap-3">
+      <div className={`w-11 h-11 shrink-0 rounded-2xl border flex items-center justify-center ${tone}`}><Icon className="h-5 w-5" /></div>
+      <div className="min-w-0">
+        <h3 className="bm-heading text-lg leading-tight">{title}</h3>
+        {subtitle && <p className="text-[13px] text-bm-steel mt-0.5">{subtitle}</p>}
       </div>
     </div>
-    {onClose && <button type="button" onClick={onClose} className="text-zinc-600 hover:text-white"><X size={18} /></button>}
+    {onClose && <button type="button" onClick={onClose} aria-label="Cerrar" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-bm-canvas text-bm-steel hover:text-bm-ink"><X size={18} /></button>}
   </div>
 );
 
@@ -951,10 +975,10 @@ const ModalActions: React.FC<{
   onCancel: () => void; submitCls: string; busy: boolean; disabled?: boolean;
   label: React.ReactNode; onSubmit?: () => void;
 }> = ({ onCancel, submitCls, busy, disabled, label, onSubmit }) => (
-  <div className="flex gap-3">
-    <button type="button" onClick={onCancel} className="flex-1 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5">Cancelar</button>
+  <div className="flex flex-col-reverse gap-3 sm:flex-row">
+    <button type="button" onClick={onCancel} className="sm:flex-1 h-12 border border-bm-field bg-white rounded-xl text-bm-ink text-[15px] font-semibold hover:bg-bm-canvas">Cancelar</button>
     <button type={onSubmit ? 'button' : 'submit'} onClick={onSubmit} disabled={busy || disabled}
-      className={`flex-[2] py-4 rounded-2xl text-[10px] font-black uppercase disabled:opacity-40 flex items-center justify-center gap-2 ${submitCls}`}>
+      className={`sm:flex-[2] h-12 rounded-xl text-[15px] font-semibold disabled:opacity-40 flex items-center justify-center gap-2 ${submitCls}`}>
       {busy ? <Loader2 className="animate-spin h-4 w-4" /> : label}
     </button>
   </div>
@@ -1448,11 +1472,11 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
   };
 
   // ── Render ──────────────────────────────────────────────────────────────
-  const chip = (on: boolean) => `px-3 py-2 rounded-xl text-[9px] font-black uppercase border transition-all ${on ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`;
+  const chip = (on: boolean) => `px-3 py-2 rounded-xl text-xs font-semibold border transition-all ${on ? 'bg-bm-red-tint text-bm-red border-bm-red/25' : optOff}`;
   const fila = (l: string, v: number, extra = '', bold = false) => (
-    <div className={`flex justify-between items-center py-2 border-b border-white/[0.04] ${bold ? 'font-black' : ''}`}>
-      <span className={`text-[10px] uppercase ${bold ? 'text-white' : 'text-zinc-400'}`}>{l}</span>
-      <span className={`text-[11px] font-black italic ${extra || (v < 0 ? 'text-red-400' : 'text-white')}`}>{usd(v)}</span>
+    <div className={`flex justify-between items-center py-2 border-b border-bm-line ${bold ? 'font-semibold' : ''}`}>
+      <span className={`text-[13px] ${bold ? 'text-bm-ink' : 'text-bm-steel'}`}>{l}</span>
+      <span className={`text-sm font-semibold bm-num ${extra || (v < 0 ? 'text-bm-red' : 'text-bm-ink')}`}>{usd(v)}</span>
     </div>
   );
   const usaPeriodo = rep !== 'BALANCE' && rep !== 'AGING';
@@ -1461,9 +1485,9 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
   return (
     <div className="space-y-5">
       {!v17 && (
-        <div className="flex items-start gap-3 p-4 rounded-xl bg-orange-500/10 border border-orange-500/30">
-          <Info size={14} className="text-orange-400 shrink-0 mt-0.5" />
-          <p className="text-[9px] text-orange-200 font-mono">Migración v17 no instalada: los reportes usan solo el Diario y CxC/CxP con clases inferidas. Billeteras, consumos y clases explícitas no están disponibles.</p>
+        <div className="flex items-start gap-3 p-4 rounded-xl bg-bm-warn-tint border border-bm-warn/25">
+          <Info size={14} className="text-bm-warn shrink-0 mt-0.5" />
+          <p className="text-xs text-bm-warn font-mono">Migración v17 no instalada: los reportes usan solo el Diario y CxC/CxP con clases inferidas. Billeteras, consumos y clases explícitas no están disponibles.</p>
         </div>
       )}
       <div className={`${glass} rounded-3xl p-5 space-y-4`}>
@@ -1493,14 +1517,14 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
           {rep !== 'IMPRESION' && (
             <div className="flex gap-2 ml-auto">
               {(rep === 'PL' || rep === 'PL_CLASE') && (
-                <button type="button" onClick={exportarCSV} className="bg-emerald-500/10 text-emerald-400 px-4 py-2.5 rounded-xl border border-emerald-500/20 text-[9px] font-black uppercase flex items-center gap-2 hover:bg-emerald-500/20"><Download size={12} /> CSV</button>
+                <button type="button" onClick={exportarCSV} className="bg-bm-ok-tint text-bm-ok px-4 py-2.5 rounded-xl border border-bm-ok/25 text-xs font-semibold flex items-center gap-2 hover:bg-bm-ok-tint"><Download size={12} /> CSV</button>
               )}
-              <button type="button" onClick={imprimirReporte} className="bg-[#E1AD01] text-black px-4 py-2.5 rounded-xl text-[9px] font-black uppercase flex items-center gap-2 hover:bg-white"><Printer size={12} /> Imprimir / PDF</button>
+              <button type="button" onClick={imprimirReporte} className="bg-bm-red text-white px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2 hover:bg-bm-red-deep"><Printer size={12} /> Imprimir / PDF</button>
             </div>
           )}
         </div>
         {usaBase && (
-          <p className="text-[8px] text-zinc-600 font-mono">
+          <p className="text-xs text-bm-steel font-mono">
             {base === 'DEVENGADO'
               ? 'Devengado: ingreso cuando el alumno consume (vuelo, simulador, curso) o se le factura a crédito; gasto cuando se recibe la factura (CxP). Recargas de billetera y anticipos son pasivo, no ingreso.'
               : 'Efectivo: ingreso/gasto cuando el dinero entra o sale de bóveda. Recargas de billetera y reembolsos se muestran en líneas propias.'}
@@ -1511,28 +1535,28 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
       {rep === 'PL' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
           <div className="lg:col-span-4 grid grid-cols-2 lg:grid-cols-1 gap-3">
-            {([['Ingresos', resumen.totIng, 'text-emerald-400'], ['Gastos', resumen.totGas, 'text-red-400'],
-               ['Resultado neto', resumen.utilidad, resumen.utilidad >= 0 ? 'text-[#E1AD01]' : 'text-red-400']] as const).map(([l, v, c]) => (
+            {([['Ingresos', resumen.totIng, 'text-bm-ok'], ['Gastos', resumen.totGas, 'text-bm-red'],
+               ['Resultado neto', resumen.utilidad, resumen.utilidad >= 0 ? 'text-bm-red' : 'text-bm-red']] as const).map(([l, v, c]) => (
               <div key={l} className={`${glass} rounded-2xl p-5`}>
-                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">{l}</p>
-                <p className={`text-2xl font-black italic mt-1 ${c}`}>{usd(v)}</p>
+                <p className="text-xs text-bm-steel font-semibold">{l}</p>
+                <p className={`text-2xl mt-1 bm-figure ${c}`}>{usd(v)}</p>
               </div>
             ))}
             <div className={`${glass} rounded-2xl p-5`}>
-              <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">Margen neto</p>
-              <p className="text-2xl font-black italic mt-1 text-white">{pct(resumen.utilidad, resumen.totIng)}</p>
+              <p className="text-xs text-bm-steel font-semibold">Margen neto</p>
+              <p className="text-2xl mt-1 text-bm-ink bm-figure">{pct(resumen.utilidad, resumen.totIng)}</p>
             </div>
           </div>
           <div className={`lg:col-span-8 ${glass} rounded-3xl p-6`}>
-            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400 mb-2">Ingresos</p>
+            <p className="text-[13px] font-semibold text-bm-ok mb-2">Ingresos</p>
             {resumen.ingresos.length === 0 && <EmptyState text="Sin ingresos en el período" py="py-6" />}
             {resumen.ingresos.map(x => <React.Fragment key={x.servicio}>{fila(`${labelServicio(x.servicio)}${x.inferidas ? ` · ${x.inferidas} inferida${x.inferidas === 1 ? '' : 's'}` : ''}`, x.usd)}</React.Fragment>)}
-            {fila('Total ingresos', resumen.totIng, 'text-emerald-400', true)}
-            <p className="text-[10px] font-black uppercase tracking-widest text-red-400 mt-6 mb-2">Gastos</p>
+            {fila('Total ingresos', resumen.totIng, 'text-bm-ok', true)}
+            <p className="text-[13px] font-semibold text-bm-red mt-6 mb-2">Gastos</p>
             {resumen.gastos.length === 0 && <EmptyState text="Sin gastos en el período" py="py-6" />}
             {resumen.gastos.map(x => <React.Fragment key={x.servicio}>{fila(`${labelServicio(x.servicio)}${x.inferidas ? ` · ${x.inferidas} inferida${x.inferidas === 1 ? '' : 's'}` : ''}`, x.usd)}</React.Fragment>)}
-            {fila('Total gastos', resumen.totGas, 'text-red-400', true)}
-            <div className="mt-4">{fila('Resultado neto del período', resumen.utilidad, resumen.utilidad >= 0 ? 'text-[#E1AD01]' : 'text-red-400', true)}</div>
+            {fila('Total gastos', resumen.totGas, 'text-bm-red', true)}
+            <div className="mt-4">{fila('Resultado neto del período', resumen.utilidad, resumen.utilidad >= 0 ? 'text-bm-red' : 'text-bm-red', true)}</div>
           </div>
         </div>
       )}
@@ -1540,12 +1564,12 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
       {rep === 'PL_CLASE' && (
         <div className={`${glass} rounded-3xl overflow-hidden`}>
           <div className="overflow-x-auto">
-            <table className="w-full text-[10px] font-mono">
+            <table className="w-full text-[13px] font-mono">
               <thead>
-                <tr className="text-zinc-500 text-[8px] uppercase tracking-widest border-b border-white/10">
-                  <th className="text-left p-3 font-black sticky left-0 bg-[#0b0b0b]">Cuenta</th>
-                  {porClase.cols.map(c => <th key={c} className={`text-right p-3 font-black whitespace-nowrap ${c === 'SIN CLASE' ? 'text-zinc-700' : 'text-[#E1AD01]'}`}>{c}</th>)}
-                  <th className="text-right p-3 font-black text-white">Total</th>
+                <tr className="text-bm-steel text-xs border-b border-bm-line">
+                  <th className="text-left p-3 font-semibold sticky left-0 bg-white">Cuenta</th>
+                  {porClase.cols.map(c => <th key={c} className={`text-right p-3 font-semibold whitespace-nowrap ${c === 'SIN CLASE' ? 'text-bm-hint' : 'text-bm-red'}`}>{c}</th>)}
+                  <th className="text-right p-3 font-semibold text-bm-ink">Total</th>
                 </tr>
               </thead>
               <tbody>
@@ -1554,33 +1578,33 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
                   const tot = nat === 'INGRESO' ? porClase.totIng : porClase.totGas;
                   return (
                     <React.Fragment key={nat}>
-                      <tr><td colSpan={porClase.cols.length + 2} className={`p-3 text-[9px] font-black uppercase tracking-widest ${nat === 'INGRESO' ? 'text-emerald-400' : 'text-red-400'}`}>{nat === 'INGRESO' ? 'Ingresos' : 'Gastos'}</td></tr>
+                      <tr><td colSpan={porClase.cols.length + 2} className={`p-3 text-xs font-semibold ${nat === 'INGRESO' ? 'text-bm-ok' : 'text-bm-red'}`}>{nat === 'INGRESO' ? 'Ingresos' : 'Gastos'}</td></tr>
                       {fs.map(f => (
-                        <tr key={`${nat}${f.servicio}`} className="border-t border-white/[0.04] hover:bg-white/[0.02]">
-                          <td className="p-3 uppercase text-zinc-300 sticky left-0 bg-[#0b0b0b] whitespace-nowrap">{labelServicio(f.servicio)}</td>
-                          {porClase.cols.map(c => { const v = f.m.get(c) ?? 0; return <td key={c} className={`p-3 text-right ${Math.abs(v) < 0.005 ? 'text-zinc-800' : 'text-white'}`}>{usd(v)}</td>; })}
-                          <td className="p-3 text-right font-black">{usd(f.total)}</td>
+                        <tr key={`${nat}${f.servicio}`} className="border-t border-bm-line hover:bg-bm-canvas">
+                          <td className="p-3 text-bm-ink sticky left-0 bg-white whitespace-nowrap">{labelServicio(f.servicio)}</td>
+                          {porClase.cols.map(c => { const v = f.m.get(c) ?? 0; return <td key={c} className={`p-3 text-right ${Math.abs(v) < 0.005 ? 'text-bm-hint' : 'text-bm-ink'}`}>{usd(v)}</td>; })}
+                          <td className="p-3 text-right font-semibold">{usd(f.total)}</td>
                         </tr>
                       ))}
-                      <tr className="border-t border-white/10">
-                        <td className="p-3 font-black uppercase sticky left-0 bg-[#0b0b0b]">Total {nat === 'INGRESO' ? 'ingresos' : 'gastos'}</td>
-                        {porClase.cols.map(c => <td key={c} className={`p-3 text-right font-black ${nat === 'INGRESO' ? 'text-emerald-400' : 'text-red-400'}`}>{usd(tot.get(c) ?? 0)}</td>)}
-                        <td className="p-3 text-right font-black">{usd(nat === 'INGRESO' ? resumen.totIng : resumen.totGas)}</td>
+                      <tr className="border-t border-bm-line">
+                        <td className="p-3 font-semibold sticky left-0 bg-white">Total {nat === 'INGRESO' ? 'ingresos' : 'gastos'}</td>
+                        {porClase.cols.map(c => <td key={c} className={`p-3 text-right font-semibold ${nat === 'INGRESO' ? 'text-bm-ok' : 'text-bm-red'}`}>{usd(tot.get(c) ?? 0)}</td>)}
+                        <td className="p-3 text-right font-semibold">{usd(nat === 'INGRESO' ? resumen.totIng : resumen.totGas)}</td>
                       </tr>
                     </React.Fragment>
                   );
                 })}
               </tbody>
               <tfoot>
-                <tr className="border-t-2 border-[#E1AD01]/40">
-                  <td className="p-3 font-black uppercase text-[#E1AD01] sticky left-0 bg-[#0b0b0b]">Resultado</td>
-                  {porClase.cols.map(c => { const v = porClase.util.get(c) ?? 0; return <td key={c} className={`p-3 text-right font-black italic ${v >= 0 ? 'text-[#E1AD01]' : 'text-red-400'}`}>{usd(v)}</td>; })}
-                  <td className={`p-3 text-right font-black italic ${resumen.utilidad >= 0 ? 'text-[#E1AD01]' : 'text-red-400'}`}>{usd(resumen.utilidad)}</td>
+                <tr className="border-t-2 border-bm-red/25">
+                  <td className="p-3 font-semibold text-bm-red sticky left-0 bg-white">Resultado</td>
+                  {porClase.cols.map(c => { const v = porClase.util.get(c) ?? 0; return <td key={c} className={`p-3 text-right font-semibold bm-num ${v >= 0 ? 'text-bm-red' : 'text-bm-red'}`}>{usd(v)}</td>; })}
+                  <td className={`p-3 text-right font-semibold bm-num ${resumen.utilidad >= 0 ? 'text-bm-red' : 'text-bm-red'}`}>{usd(resumen.utilidad)}</td>
                 </tr>
                 <tr>
-                  <td className="p-3 text-[8px] uppercase text-zinc-600 sticky left-0 bg-[#0b0b0b]">Margen</td>
-                  {porClase.cols.map(c => <td key={c} className="p-3 text-right text-[9px] text-zinc-500">{pct(porClase.util.get(c) ?? 0, porClase.totIng.get(c) ?? 0)}</td>)}
-                  <td className="p-3 text-right text-[9px] text-zinc-400">{pct(resumen.utilidad, resumen.totIng)}</td>
+                  <td className="p-3 text-xs text-bm-steel sticky left-0 bg-white">Margen</td>
+                  {porClase.cols.map(c => <td key={c} className="p-3 text-right text-xs text-bm-steel">{pct(porClase.util.get(c) ?? 0, porClase.totIng.get(c) ?? 0)}</td>)}
+                  <td className="p-3 text-right text-xs text-bm-steel">{pct(resumen.utilidad, resumen.totIng)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -1592,24 +1616,24 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
       {rep === 'BALANCE' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
           <div className={`${glass} rounded-3xl p-6`}>
-            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400 mb-3">Activos</p>
+            <p className="text-[13px] font-semibold text-bm-ok mb-3">Activos</p>
             {balance.bovedas.map(b => <React.Fragment key={b.m}>{fila(`Bóveda ${b.m}${b.m === 'BS' ? ` (${fmtMonto(b.nativo, 'BS')})` : ''}`, b.usd)}</React.Fragment>)}
             {fila('CxC · consumos de billetera', balance.cxcBill)}
             {fila('CxC · alumnos (otras)', balance.cxcOtras)}
-            {fila('Total activos', balance.activos, 'text-emerald-400', true)}
+            {fila('Total activos', balance.activos, 'text-bm-ok', true)}
           </div>
           <div className={`${glass} rounded-3xl p-6`}>
-            <p className="text-[10px] font-black uppercase tracking-widest text-orange-400 mb-3">Pasivos</p>
+            <p className="text-[13px] font-semibold text-bm-warn mb-3">Pasivos</p>
             {fila('CxP · proveedores', balance.cxpProv)}
             {fila('Préstamos por pagar', balance.prestamos)}
             {fila('Anticipos · billeteras de alumnos', balance.billeteras)}
             {fila('Anticipos sin matrícula por aplicar', balance.provPend)}
-            {fila('Total pasivos', balance.pasivos, 'text-orange-400', true)}
+            {fila('Total pasivos', balance.pasivos, 'text-bm-warn', true)}
           </div>
           <div className={`${glass} rounded-3xl p-6`}>
-            <p className="text-[10px] font-black uppercase tracking-widest text-[#E1AD01] mb-3">Patrimonio</p>
-            {fila('Patrimonio neto', balance.patrimonio, balance.patrimonio >= 0 ? 'text-[#E1AD01]' : 'text-red-400', true)}
-            <div className="mt-4 space-y-1 text-[8px] text-zinc-600 font-mono">
+            <p className="text-[13px] font-semibold text-bm-red mb-3">Patrimonio</p>
+            {fila('Patrimonio neto', balance.patrimonio, balance.patrimonio >= 0 ? 'text-bm-red' : 'text-bm-red', true)}
+            <div className="mt-4 space-y-1 text-xs text-bm-steel font-mono">
               <p>Memo · reposiciones internas: {usd(balance.reposiciones)} (no es deuda con terceros).</p>
               {balance.inventario.n > 0 && <p>Memo · inventario MRO estimado: {usd(balance.inventario.total)} ({balance.inventario.n} ítems, no incluido en totales).</p>}
               <p>No incluye aeronaves ni activos fijos. BS a tasa {tasaBCV}.</p>
@@ -1623,41 +1647,41 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
           <div className="lg:col-span-4 grid grid-cols-3 lg:grid-cols-1 gap-3">
             {([['Saldo inicial', flujo.inicial], ['Variación neta', flujo.neto], ['Saldo final', flujo.final]] as const).map(([l, v]) => (
               <div key={l} className={`${glass} rounded-2xl p-5`}>
-                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest">{l}</p>
-                <p className={`text-xl font-black italic mt-1 ${v >= 0 ? 'text-white' : 'text-red-400'}`}>{usd(v)}</p>
+                <p className="text-xs text-bm-steel font-semibold">{l}</p>
+                <p className={`text-xl mt-1 bm-figure ${v >= 0 ? 'text-bm-ink' : 'text-bm-red'}`}>{usd(v)}</p>
               </div>
             ))}
           </div>
           <div className={`lg:col-span-8 ${glass} rounded-3xl p-6`}>
-            <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400 mb-2">Operación</p>
+            <p className="text-[13px] font-semibold text-bm-ok mb-2">Operación</p>
             {flujo.filas.filter(f => f.k.startsWith('OP_')).map(f => <React.Fragment key={f.k}>{fila(f.l, f.v)}</React.Fragment>)}
-            {fila('Flujo operativo', flujo.op, flujo.op >= 0 ? 'text-emerald-400' : 'text-red-400', true)}
-            <p className="text-[10px] font-black uppercase tracking-widest text-violet-400 mt-5 mb-2">Financiamiento</p>
+            {fila('Flujo operativo', flujo.op, flujo.op >= 0 ? 'text-bm-ok' : 'text-bm-red', true)}
+            <p className="text-[13px] font-semibold text-[#6D28D9] mt-5 mb-2">Financiamiento</p>
             {flujo.filas.filter(f => f.k.startsWith('FIN_')).map(f => <React.Fragment key={f.k}>{fila(f.l, f.v)}</React.Fragment>)}
-            {fila('Flujo de financiamiento', flujo.fin, 'text-violet-400', true)}
-            <div className="mt-5">{fila('Cambio de moneda (FX)', flujo.fx, 'text-teal-400')}</div>
-            <div className="mt-2">{fila('Saldo final de efectivo (USD eq.)', flujo.final, 'text-[#E1AD01]', true)}</div>
+            {fila('Flujo de financiamiento', flujo.fin, 'text-[#6D28D9]', true)}
+            <div className="mt-5">{fila('Cambio de moneda (FX)', flujo.fx, 'text-[#0F766E]')}</div>
+            <div className="mt-2">{fila('Saldo final de efectivo (USD eq.)', flujo.final, 'text-bm-red', true)}</div>
           </div>
         </div>
       )}
 
       {rep === 'AGING' && (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-          {([['Por cobrar · alumnos', aging.cxc, aging.totCxc, 'text-yellow-400'], ['Por pagar · proveedores y préstamos', aging.cxp, aging.totCxp, 'text-orange-400']] as const).map(([t, rows, tot, c]) => (
+          {([['Por cobrar · alumnos', aging.cxc, aging.totCxc, 'text-[#8A6100]'], ['Por pagar · proveedores y préstamos', aging.cxp, aging.totCxp, 'text-bm-warn']] as const).map(([t, rows, tot, c]) => (
             <div key={t} className={`${glass} rounded-3xl overflow-hidden`}>
-              <p className={`p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest ${c}`}>{t}</p>
+              <p className={`p-5 border-b border-bm-line text-[13px] font-semibold ${c}`}>{t}</p>
               <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
-                <table className="w-full text-[10px] font-mono">
-                  <thead><tr className="text-zinc-600 text-[8px] uppercase">{['Entidad', '0–30', '31–60', '61–90', '+90', 'Total'].map((h, i) => <th key={h} className={`p-3 font-black ${i ? 'text-right' : 'text-left'}`}>{h}</th>)}</tr></thead>
+                <table className="w-full text-[13px] font-mono">
+                  <thead><tr className="text-bm-steel text-xs">{['Entidad', '0–30', '31–60', '61–90', '+90', 'Total'].map((h, i) => <th key={h} className={`p-3 font-semibold ${i ? 'text-right' : 'text-left'}`}>{h}</th>)}</tr></thead>
                   <tbody>
                     {rows.map(([k, v]) => (
-                      <tr key={k} className="border-t border-white/[0.04]">
-                        <td className="p-3 uppercase truncate max-w-[200px]">{k}</td>
-                        {v.map((x, i) => <td key={i} className={`p-3 text-right ${i === 3 && x > 0 ? 'text-red-400 font-black' : i === 4 ? 'font-black' : ''}`}>{usd(x)}</td>)}
+                      <tr key={k} className="border-t border-bm-line">
+                        <td className="p-3 truncate max-w-[200px]">{k}</td>
+                        {v.map((x, i) => <td key={i} className={`p-3 text-right ${i === 3 && x > 0 ? 'text-bm-red font-semibold' : i === 4 ? 'font-semibold' : ''}`}>{usd(x)}</td>)}
                       </tr>
                     ))}
                   </tbody>
-                  <tfoot><tr className="border-t border-white/10">{['Total', ...tot.map(usd)].map((x, i) => <td key={i} className={`p-3 font-black ${i ? 'text-right' : ''}`}>{x}</td>)}</tr></tfoot>
+                  <tfoot><tr className="border-t border-bm-line">{['Total', ...tot.map(usd)].map((x, i) => <td key={i} className={`p-3 font-semibold ${i ? 'text-right' : ''}`}>{x}</td>)}</tr></tfoot>
                 </table>
                 {rows.length === 0 && <EmptyState text="Sin saldos pendientes" />}
               </div>
@@ -1668,8 +1692,8 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
 
       {rep === 'SIN_CLASE' && (
         <div className={`${glass} rounded-3xl overflow-hidden`}>
-          <div className="p-5 border-b border-white/5 flex flex-wrap gap-3 items-center justify-between">
-            <p className="text-[10px] font-black uppercase tracking-widest">{sinClase.length} movimientos con clase inferida · {selSinClase.size} seleccionados</p>
+          <div className="p-5 border-b border-bm-line flex flex-wrap gap-3 items-center justify-between">
+            <p className="text-[13px] font-semibold">{sinClase.length} movimientos con clase inferida · {selSinClase.size} seleccionados</p>
             <div className="flex gap-2">
               <button type="button" onClick={() => setSelSinClase(new Set(sinClase.map(l => `${l.tabla}:${l.registroId}`)))} className={chip(false)}>Seleccionar todo</button>
               <button type="button" disabled={!selSinClase.size || !canEdit || !v17}
@@ -1679,7 +1703,7 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
                   onReclasificar({ items, titulo: `${items.length} movimiento(s)`, inicial: primero ? { servicio: primero.servicio, aeronave: primero.aeronave, sede: primero.sede, piloto: primero.piloto, proyecto: primero.proyecto } : CLASE_VACIA });
                   setSelSinClase(new Set());
                 }}
-                className="bg-teal-500/15 text-teal-400 border border-teal-500/30 px-4 py-2 rounded-xl text-[9px] font-black uppercase disabled:opacity-30 flex items-center gap-2"><Tag size={12} /> Clasificar seleccionados</button>
+                className="bg-[#E6F4F2] text-[#0F766E] border border-[#0F766E]/25 px-4 py-2 rounded-xl text-xs font-semibold disabled:opacity-30 flex items-center gap-2"><Tag size={12} /> Clasificar seleccionados</button>
             </div>
           </div>
           <div className="max-h-[560px] overflow-y-auto p-4 space-y-1.5">
@@ -1687,13 +1711,13 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
               const k = `${l.tabla}:${l.registroId}`;
               const on = selSinClase.has(k);
               return (
-                <label key={k} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${on ? 'border-teal-500/40 bg-teal-500/5' : 'border-white/[0.05] hover:bg-white/[0.02]'}`}>
+                <label key={k} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${on ? 'border-[#0F766E]/25 bg-[#E6F4F2]/60' : 'border-bm-line hover:bg-bm-canvas'}`}>
                   <input type="checkbox" checked={on} onChange={() => setSelSinClase(p => { const n = new Set(p); if (n.has(k)) n.delete(k); else n.add(k); return n; })} />
                   <div className="flex-1 min-w-0">
-                    <p className="text-[10px] font-black uppercase truncate">{l.detalle}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(l.fecha)} · {l.origen} · {l.ref} · inferido: <span className="text-teal-400">{labelServicio(l.servicio)}</span>{l.aeronave ? ` · ${l.aeronave}` : ''}</p>
+                    <p className="text-[13px] font-semibold truncate">{l.detalle}</p>
+                    <p className="text-xs text-bm-steel font-mono">{fmtDate(l.fecha)} · {l.origen} · {l.ref} · inferido: <span className="text-[#0F766E]">{labelServicio(l.servicio)}</span>{l.aeronave ? ` · ${l.aeronave}` : ''}</p>
                   </div>
-                  <span className={`text-[11px] font-black italic ${l.nat === 'INGRESO' ? 'text-emerald-400' : 'text-red-400'}`}>{l.nat === 'INGRESO' ? '+' : '−'}{usd(l.usd)}</span>
+                  <span className={`text-sm font-semibold bm-num ${l.nat === 'INGRESO' ? 'text-bm-ok' : 'text-bm-red'}`}>{l.nat === 'INGRESO' ? '+' : '−'}{usd(l.usd)}</span>
                 </label>
               );
             })}
@@ -1705,7 +1729,7 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
       {rep === 'IMPRESION' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
           <div className={`${glass} rounded-3xl p-6 space-y-4`}>
-            <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Banknote size={14} className="text-[#E1AD01]" /> Movimientos de caja</h3>
+            <h3 className="text-[13px] font-semibold flex items-center gap-2"><Banknote size={14} className="text-bm-red" /> Movimientos de caja</h3>
             <select value={cajaImp} onChange={e => setCajaImp(e.target.value)} className={inp}>
               <option value="">TODAS LAS CAJAS (GLOBAL)</option>
               {cajas.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
@@ -1714,16 +1738,16 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
               <div><Lbl>Desde</Lbl><input type="date" value={desde} onChange={e => setDesde(e.target.value)} className={inp} style={noUpper} /></div>
               <div><Lbl>Hasta</Lbl><input type="date" value={hasta} onChange={e => setHasta(e.target.value)} className={inp} style={noUpper} /></div>
             </div>
-            <button type="button" onClick={() => onImprimirCaja(cajaImp || null, desde, hasta)} className="w-full py-4 bg-[#E1AD01] text-black rounded-2xl font-black text-[10px] uppercase flex items-center justify-center gap-2 hover:bg-white"><Printer size={14} /> Imprimir movimientos</button>
+            <button type="button" onClick={() => onImprimirCaja(cajaImp || null, desde, hasta)} className="w-full py-4 bg-bm-red text-white rounded-2xl font-semibold text-[13px] flex items-center justify-center gap-2 hover:bg-bm-red-deep"><Printer size={14} /> Imprimir movimientos</button>
           </div>
           <div className={`${glass} rounded-3xl p-6 space-y-4`}>
-            <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Receipt size={14} className="text-[#E1AD01]" /> Estado de cuenta por alumno</h3>
+            <h3 className="text-[13px] font-semibold flex items-center gap-2"><Receipt size={14} className="text-bm-red" /> Estado de cuenta por alumno</h3>
             <select value={alumnoImp} onChange={e => setAlumnoImp(e.target.value)} className={inp}>
               <option value="">— SELECCIONE ALUMNO —</option>
               {alumnos.map(a => <option key={a.student_id} value={a.student_id}>{a.nombre} · {a.serial} · {a.sede}</option>)}
             </select>
-            <p className="text-[8px] text-zinc-600 font-mono">Incluye billetera, consumos, cuentas por cobrar y pagos con trazabilidad del alumno.</p>
-            <button type="button" disabled={!alumnoImp} onClick={() => onImprimirAlumno(alumnoImp)} className="w-full py-4 bg-[#E1AD01] text-black rounded-2xl font-black text-[10px] uppercase flex items-center justify-center gap-2 hover:bg-white disabled:opacity-30"><Printer size={14} /> Imprimir estado de cuenta</button>
+            <p className="text-xs text-bm-steel font-mono">Incluye billetera, consumos, cuentas por cobrar y pagos con trazabilidad del alumno.</p>
+            <button type="button" disabled={!alumnoImp} onClick={() => onImprimirAlumno(alumnoImp)} className="w-full py-4 bg-bm-red text-white rounded-2xl font-semibold text-[13px] flex items-center justify-center gap-2 hover:bg-bm-red-deep disabled:opacity-30"><Printer size={14} /> Imprimir estado de cuenta</button>
           </div>
         </div>
       )}
@@ -1734,6 +1758,18 @@ const ReportesFinancieros: React.FC<ReportesProps> = ({
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 
 export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory = [], userRole = 'SIN_RANGO', setGlobalFinance = NOOP }) => {
+  // [v17.1] Confirmación B&M con el mismo texto que window.confirm (await → true / false)
+  const [preguntarBm, confirmDialogBm] = useBmConfirm();
+  const confirmarTexto = useCallback(async (mensaje: string): Promise<boolean> => {
+    const alerta = /^\s*⚠/.test(mensaje);
+    return (await preguntarBm({
+      title: alerta ? 'Revise antes de continuar' : 'Confirmar operación',
+      body: <p className="whitespace-pre-line break-words">{mensaje.replace(/^\s*⚠\uFE0F?\s*/, '')}</p>,
+      confirmLabel: 'Continuar',
+      tone: alerta ? 'warn' : 'neutral',
+      icon: alerta ? <AlertTriangle className="h-5 w-5" /> : <Info className="h-5 w-5" />,
+    })) === 'confirm';
+  }, [preguntarBm]);
   const [activeTab, setActiveTab] = useState<TabType>('LEDGER');
   const [tasaBCV,   setTasaBCV]   = useState(DEFAULT_TASA_BS);
 
@@ -2546,11 +2582,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
   });
 
   /** [CHG v17] Recargas/reembolsos de billetera se revierten desde su flujo (mantiene coherente el saldo del alumno). */
-  const anularAsiento = (asientoId: string) => {
+  const anularAsiento = async (asientoId: string) => {   // [v17.1] async: espera la confirmación B&M
     const wm = walletMovPorAsiento.get(asientoId);
     if (wm) {
       const alumno = alumnos.find(a => a.student_id === wm.student_id)?.nombre ?? 'ALUMNO';
-      if (!window.confirm(`Este asiento es una ${WALLET_MOV_LABEL[wm.tipo].toUpperCase()} de billetera de ${alumno} (${usd(wm.monto_usd)}).\n\nSe revertirá en la billetera y se anulará su asiento de caja en una sola operación. ¿Continuar?`)) return;
+      if (!await confirmarTexto(`Este asiento es una ${WALLET_MOV_LABEL[wm.tipo].toUpperCase()} de billetera de ${alumno} (${usd(wm.monto_usd)}).\n\nSe revertirá en la billetera y se anulará su asiento de caja en una sola operación. ¿Continuar?`)) return;
       setMotivoTexto('');
       setMotivoAccion({ tipo: 'REVERTIR', id: wm.id, titulo: `Revertir ${WALLET_MOV_LABEL[wm.tipo]}`, detalle: `${alumno} · ${wm.referencia} · ${usd(wm.monto_usd)}` });
       return;
@@ -2808,7 +2844,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
     if (movForm.clase === 'UBICACION' && movForm.tipo === 'ENTRADA') {
       const sinU = sinUbicar(movForm.moneda);
-      if (num > sinU + 0.01 && !window.confirm(`⚠️ Solo hay ${fmtMonto(sinU, movForm.moneda)} sin ubicar en la bóveda ${movForm.moneda}.\nUbicar ${fmtMonto(num, movForm.moneda)} dejará Σ Cajas > Bóveda.\n\nSi es dinero nuevo use clase OPERATIVO. ¿Continuar?`)) return;
+      if (num > sinU + 0.01 && !await confirmarTexto(`⚠️ Solo hay ${fmtMonto(sinU, movForm.moneda)} sin ubicar en la bóveda ${movForm.moneda}.\nUbicar ${fmtMonto(num, movForm.moneda)} dejará Σ Cajas > Bóveda.\n\nSi es dinero nuevo use clase OPERATIVO. ¿Continuar?`)) return;
     }
     if (movForm.tipo === 'SALIDA') {
       const saldo = saldoCustodia(cajaActiva, movForm.moneda, subcaja);
@@ -3116,7 +3152,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
     if (cajaErr) { setCobroError(cajaErr); return; }
     const cajaObj = cajaById(cajaId);
     const subcaja = cajaEsEfectivo(cajaId) ? cobroForm.subcaja : null;
-    if (!cajaObj && !window.confirm('Sin caja: el dinero quedará en bóveda "sin ubicar" (no se sabe quién lo custodia). ¿Continuar?')) return;
+    if (!cajaObj && !await confirmarTexto('Sin caja: el dinero quedará en bóveda "sin ubicar" (no se sabe quién lo custodia). ¿Continuar?')) return;
     if (cxc) {   // [NEW v16.5] todo cobro exige pagador
       const errPago = validarPago(cobroPago, cobroForm.moneda);
       if (errPago) { setCobroError(errPago); return; }
@@ -3223,7 +3259,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
     const p = provisionales.find(x => x.id === provisionalLinkId);
     const a = alumnos.find(x => x.student_id === provisionalStudentId);
     if (!p || !a || p.estado !== 'PENDIENTE') { setProvisionalError('Seleccione un pago pendiente y un estudiante válido.'); return; }
-    if (!window.confirm(`Vincular el anticipo de ${p.beneficiario_nombre} (${p.beneficiario_documento}) a ${a.nombre} (${a.serial})?\n\nSolo documenta la identidad. NO acredita horas, NO aplica la CxC y NO vuelve a recibir dinero.`)) return;
+    if (!await confirmarTexto(`Vincular el anticipo de ${p.beneficiario_nombre} (${p.beneficiario_documento}) a ${a.nombre} (${a.serial})?\n\nSolo documenta la identidad. NO acredita horas, NO aplica la CxC y NO vuelve a recibir dinero.`)) return;
     setSavingProvisionalLink(true); setProvisionalError(null);
     try {
       const { error } = await supabase.rpc('fn_vincular_pago_provisional', {
@@ -3420,7 +3456,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         if (errF) throw new Error(errF);
       } else {
         const sinU = sinUbicar(moneda);
-        if (sinU < cuenta.monto_total && !window.confirm(`⚠️ Solo hay ${fmtMonto(sinU, moneda)} sin ubicar en bóveda ${moneda}. ¿Reponer de todas formas?`)) return;
+        if (sinU < cuenta.monto_total && !await confirmarTexto(`⚠️ Solo hay ${fmtMonto(sinU, moneda)} sin ubicar en bóveda ${moneda}. ¿Reponer de todas formas?`)) return;
       }
       const referencia = `REP-${genHash(cuenta.id)}`;
       const base = { moneda, monto: cuenta.monto_total, referencia, fecha: new Date().toISOString(), registrado_por: auditRole };
@@ -3876,7 +3912,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
     const saldo = saldoWallet.get(studentId) ?? 0;
     if (saldo <= 0) { alert('El alumno no tiene saldo en su billetera.'); return; }
     const nombre = alumnoPorId(studentId)?.nombre ?? 'ALUMNO';
-    if (!window.confirm(`Aplicar hasta ${usd(saldo)} de la billetera de ${nombre} a ${cxcId ? 'esta cuenta por cobrar' : 'sus deudas (más antiguas primero)'}?\n\nNo mueve caja: el dinero ya fue recibido como anticipo.`)) return;
+    if (!await confirmarTexto(`Aplicar hasta ${usd(saldo)} de la billetera de ${nombre} a ${cxcId ? 'esta cuenta por cobrar' : 'sus deudas (más antiguas primero)'}?\n\nNo mueve caja: el dinero ya fue recibido como anticipo.`)) return;
     setSavingAction(cxcId ?? studentId);
     try {
       const r = await rpcV17('fn_wallet_aplicar_cxc', { p_student: studentId, p_cxc_id: cxcId ?? null, p_monto: null });
@@ -3911,7 +3947,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
     if (g) { setWalletError(g); return; }
     const lista = vuelosPorCargar.filter(v => tarifaVuelo(v.matricula));
     if (!lista.length) { setWalletError('No hay vuelos con tarifa configurada para cargar.'); return; }
-    if (!window.confirm(`Cargar ${lista.length} vuelo(s) a las billeteras con la tarifa vigente de cada aeronave?\nLo que no cubra el saldo pasará a cuentas por cobrar.`)) return;
+    if (!await confirmarTexto(`Cargar ${lista.length} vuelo(s) a las billeteras con la tarifa vigente de cada aeronave?\nLo que no cubra el saldo pasará a cuentas por cobrar.`)) return;
     setVueloCargando('ALL'); setWalletError(null);
     const errores: string[] = [];
     let ok = 0;
@@ -3975,7 +4011,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
     }
     const montoUsd = p.moneda === 'BS' && tasa ? round2(p.monto / tasa) : p.monto;
     const al = alumnoPorId(p.student_id);
-    if (!window.confirm(`Aplicar el anticipo ${p.referencia_pago} (${fmtMonto(p.monto, p.moneda)} ≈ ${usd(montoUsd)}) a la billetera de ${al?.nombre ?? 'el alumno'}?\n\nNo vuelve a recibir dinero: convierte el anticipo en saldo disponible.`)) return;
+    if (!await confirmarTexto(`Aplicar el anticipo ${p.referencia_pago} (${fmtMonto(p.monto, p.moneda)} ≈ ${usd(montoUsd)}) a la billetera de ${al?.nombre ?? 'el alumno'}?\n\nNo vuelve a recibir dinero: convierte el anticipo en saldo disponible.`)) return;
     setSavingProvisionalLink(true); setProvisionalError(null);
     try {
       await rpcV17('fn_wallet_aplicar_provisional', { p_pago_id: p.id, p_tasa: tasa });
@@ -4185,9 +4221,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
   // ─── LOADING ──────────────────────────────────────────────────────────────
 
   if (loading) return (
-    <div className="p-20 text-center bg-[#020202] h-screen flex flex-col justify-center items-center">
-      <Loader2 className="h-12 w-12 text-[#E1AD01] animate-spin mb-6" />
-      <p className="text-[10px] font-black uppercase tracking-[0.8em] text-[#E1AD01]">Valkyron Financial Core v17.0...</p>
+    <div className="p-20 text-center bg-white h-screen flex flex-col justify-center items-center">
+      <Loader2 className="h-12 w-12 text-bm-red animate-spin mb-6" />
+      <p className="text-[13px] font-semibold text-bm-red">Valkyron Financial Core v17.0...</p>
     </div>
   );
 
@@ -4201,22 +4237,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
     return [t.entityName, t.invoiceNumber, t.description, pg?.pagador_nombre, pg?.pagador_documento, pg?.referencia_pago, pg?.recibido_por, pg?.cuenta_origen]
       .some(v => String(v ?? '').toUpperCase().includes(qLedger));
   });
-  const btnIcon = 'opacity-0 group-hover:opacity-100 text-zinc-600 transition-all p-1.5 rounded-lg disabled:opacity-30';
+  const btnIcon = 'opacity-0 group-hover:opacity-100 text-bm-steel transition-all p-1.5 rounded-lg disabled:opacity-30';
 
   /** Fila del Libro Mayor (Diario y auditoría de Bóvedas) */
   const renderTx = (t: LedgerTx, mode: 'DIARIO' | 'BOVEDA') => {
     const s = signedLedgerAmount(t), fx = isFxTx(t), fin = isFinancingTx(t), legacy = esReposicionLegacy(t);
     const movLig = t.asiento_id ? movCajas.find(m => m.asiento_id === t.asiento_id) : null;
     const busy   = savingAction === t.id || (!!t.fx_id && savingAction === t.fx_id) || (!!t.asiento_id && savingAction === t.asiento_id);
-    const color  = fx ? (s >= 0 ? 'text-teal-300' : 'text-teal-600') : fin ? (s >= 0 ? 'text-violet-300' : 'text-violet-500') : (s >= 0 ? 'text-emerald-400' : 'text-red-400');
-    const border = legacy ? 'border-red-500/30' : fx ? 'border-teal-500/15' : fin ? 'border-violet-500/15' : 'border-white/[0.05]';
+    const color  = fx ? (s >= 0 ? 'text-[#0F766E]' : 'text-[#0F766E]') : fin ? (s >= 0 ? 'text-[#6D28D9]' : 'text-[#6D28D9]') : (s >= 0 ? 'text-bm-ok' : 'text-bm-red');
+    const border = legacy ? 'border-bm-red/25' : fx ? 'border-[#0F766E]/25' : fin ? 'border-[#6D28D9]/25' : 'border-bm-line';
     const pm     = t.payment_method as PaymentMethod;
     const pagoTx = t.asiento_id ? pagoPorAsiento.get(t.asiento_id) : undefined;   // [NEW v16.5]
     const clTx   = clasifMap.get(`transacciones_finanzas:${t.id}`);                // [NEW v17]
     return (
-      <div key={t.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group hover:bg-white/[0.04] transition-all ${border}`}>
+      <div key={t.id} className={`bg-bm-canvas/60 border p-4 rounded-2xl flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center group hover:bg-bm-canvas transition-all ${border}`}>   {/* [v17.1] apilada en móvil */}
         <div className="flex-1 min-w-0">
-          <p className="text-[10px] font-black uppercase flex items-center gap-2">
+          <p className="text-[13px] font-semibold flex items-center gap-2">
             {fx && <Badge tone={TONE.fx}>FX {t.fx_leg ?? 'LEGACY'}</Badge>}
             {fin && <Badge tone={TONE.fin}>FINANC.</Badge>}
             {legacy && <Badge tone={TONE.red}>REPOSICIÓN LEGACY</Badge>}
@@ -4225,26 +4261,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             {clTx?.servicio && <Badge tone={TONE.fx} title="Clase contable explícita"><Tag size={8} /> {labelServicio(clTx.servicio)}{clTx.aeronave ? ` · ${clTx.aeronave}` : ''}</Badge>}
             <span className="truncate">{t.entityName}</span>
           </p>
-          <p className="text-[8px] text-zinc-600 font-mono mt-0.5 truncate">
+          <p className="text-xs text-bm-steel font-mono mt-0.5 truncate">
             {mode === 'BOVEDA' ? <>{fmtDate(t.issueDate)} · {t.description}</> : <>
-              {fmtDate(t.issueDate)} · {t.invoiceNumber} · <span className={MONEDA_COLOR[pm] || 'text-zinc-500'}>{String(t.payment_method)}</span>
-              {t.asiento_id && <> · <span className="text-zinc-500">{movLig ? `CAJA ${cajaNombre(movLig.caja_id)}${movLig.subcaja ? ` (${movLig.subcaja})` : ''}` : 'SIN CAJA'}</span></>}
+              {fmtDate(t.issueDate)} · {t.invoiceNumber} · <span className={MONEDA_COLOR[pm] || 'text-bm-steel'}>{String(t.payment_method)}</span>
+              {t.asiento_id && <> · <span className="text-bm-steel">{movLig ? `CAJA ${cajaNombre(movLig.caja_id)}${movLig.subcaja ? ` (${movLig.subcaja})` : ''}` : 'SIN CAJA'}</span></>}
             </>}
           </p>
-          {pagoTx && <p className="text-[8px] text-[#E1AD01]/80 font-mono mt-0.5 truncate" title={lineaPago(pagoTx)}>{lineaPago(pagoTx)}</p>}
+          {pagoTx && <p className="text-xs text-bm-red font-mono mt-0.5 truncate" title={lineaPago(pagoTx)}>{lineaPago(pagoTx)}</p>}
         </div>
-        <div className="flex items-center gap-3 ml-4">
-          <span className={`font-black text-lg italic ${color}`}>{s >= 0 ? '+' : '-'}{fmtMonto(t.amount, pm)}</span>
-          {mode === 'DIARIO' && <CheckCircle2 className={`h-4 w-4 shrink-0 ${t.status === 'PAID' ? 'text-emerald-500/40' : 'text-zinc-700'}`} />}
+        <div className="flex items-center gap-3 sm:ml-4">
+          <span className={`text-lg bm-figure ${color}`}>{s >= 0 ? '+' : '-'}{fmtMonto(t.amount, pm)}</span>
+          {mode === 'DIARIO' && <CheckCircle2 className={`h-4 w-4 shrink-0 ${t.status === 'PAID' ? 'text-bm-ok' : 'text-bm-hint'}`} />}
           {mode === 'DIARIO' && !t.fx_id && !t.asiento_id && (
-            <button onClick={() => openEditTx(t)} className={`${btnIcon} hover:text-[#E1AD01] hover:bg-[#E1AD01]/10`}><Pencil size={13} /></button>
+            <button onClick={() => openEditTx(t)} className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}><Pencil size={13} /></button>
           )}
           {mode === 'DIARIO' && v17Instalado && canManageFinance && !fx && !fin && (   // [NEW v17] clase contable
             <button onClick={() => abrirReclas({ items: [{ tabla: 'transacciones_finanzas', id: t.id }], titulo: `${t.entityName} · ${t.invoiceNumber}`, inicial: claseDeRow(clTx) })}
-              title="Clase contable (servicio · aeronave · sede · piloto · proyecto)" className={`${btnIcon} hover:text-teal-400 hover:bg-teal-500/10`}><Tag size={13} /></button>
+              title="Clase contable (servicio · aeronave · sede · piloto · proyecto)" className={`${btnIcon} hover:text-[#0F766E] hover:bg-[#D5ECE9]`}><Tag size={13} /></button>
           )}
           <button onClick={() => deleteTxProtected(t.id)} disabled={busy} title={t.asiento_id ? 'Anular asiento completo' : 'Eliminar'}
-            className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+            className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}>
             {busy ? <Loader2 size={13} className="animate-spin" /> : t.asiento_id ? <Ban size={13} /> : <Trash2 size={13} />}
           </button>
         </div>
@@ -4255,11 +4291,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
   /** Chips de saldo ADM / CEO de la caja efectivo */
   const chipsEfectivo = (
     <>
-      {([['ADM', saldoEfectivoADM, TONE.blue, 'bg-blue-400'], ['CEO', saldoEfectivoCEO, TONE.yellow, 'bg-yellow-400']] as const).map(([sc, saldo, tone, dot]) => (
+      {([['ADM', saldoEfectivoADM, TONE.blue, 'bg-[#2F5BB7]'], ['CEO', saldoEfectivoCEO, TONE.yellow, 'bg-[#C99700]']] as const).map(([sc, saldo, tone, dot]) => (
         <div key={sc} className={`px-3 py-1.5 rounded-xl border flex items-center gap-2 ${tone}`}>
           <div className={`w-1.5 h-1.5 rounded-full ${dot}`} />
-          <span className="text-[8px] font-black uppercase">{sc}</span>
-          <span className={`text-[10px] font-black italic ${saldo >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>{fmtMonto(saldo, 'CASH')}</span>
+          <span className="text-xs font-semibold">{sc}</span>
+          <span className={`text-[13px] font-semibold bm-num ${saldo >= 0 ? 'text-[#8A6100]' : 'text-bm-red'}`}>{fmtMonto(saldo, 'CASH')}</span>
         </div>
       ))}
     </>
@@ -4274,12 +4310,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
   ];
 
   const KPI_CUENTAS = [
-    { label: 'Por Cobrar (Alumnos)', value: `$${fmtNum(totalCxC)}`, sub: `${cxcPendientes.length} pendientes · USD eq.`, icon: ArrowUpCircle, card: 'bg-yellow-500/5 border-yellow-500/10', txt: 'text-yellow-400', ico: 'text-yellow-400/20' },
-    { label: 'Horas Acreditadas', value: `${totalHorasAcred.toFixed(1)}h`, sub: `${horasPagadas.length} pagados · incluye parciales`, icon: Plane, card: 'bg-emerald-500/5 border-emerald-500/10', txt: 'text-emerald-400', ico: 'text-emerald-400/20' },
-    { label: 'Por Pagar (Proveedores + Préstamos)', value: `$${fmtNum(totalCxP)}`, sub: `${cuentasProveedores.filter(c => c.estatus !== 'PAGADO').length} pendientes · USD eq.`, icon: ArrowDownCircle, card: 'bg-orange-500/5 border-orange-500/10', txt: 'text-orange-400', ico: 'text-orange-400/20' },
-    { label: 'Reposiciones Internas', value: `$${fmtNum(totalReposiciones)}`, sub: `${cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').length} entre cajas`, icon: ArrowLeftRight, card: 'bg-purple-500/5 border-purple-500/10', txt: 'text-purple-400', ico: 'text-purple-400/20' },
+    { label: 'Por Cobrar (Alumnos)', value: `$${fmtNum(totalCxC)}`, sub: `${cxcPendientes.length} pendientes · USD eq.`, icon: ArrowUpCircle, card: 'bg-[#FDF3D8]/60 border-[#8A6100]/25', txt: 'text-[#8A6100]', ico: 'text-[#8A6100]' },
+    { label: 'Horas Acreditadas', value: `${totalHorasAcred.toFixed(1)}h`, sub: `${horasPagadas.length} pagados · incluye parciales`, icon: Plane, card: 'bg-bm-ok-tint/60 border-bm-ok/25', txt: 'text-bm-ok', ico: 'text-bm-ok' },
+    { label: 'Por Pagar (Proveedores + Préstamos)', value: `$${fmtNum(totalCxP)}`, sub: `${cuentasProveedores.filter(c => c.estatus !== 'PAGADO').length} pendientes · USD eq.`, icon: ArrowDownCircle, card: 'bg-bm-warn-tint/60 border-bm-warn/25', txt: 'text-bm-warn', ico: 'text-bm-warn' },
+    { label: 'Reposiciones Internas', value: `$${fmtNum(totalReposiciones)}`, sub: `${cuentasReposiciones.filter(c => c.estatus !== 'PAGADO').length} entre cajas`, icon: ArrowLeftRight, card: 'bg-[#F1ECFB]/60 border-[#6D28D9]/25', txt: 'text-[#6D28D9]', ico: 'text-[#6D28D9]' },
     // [NEW v17] billeteras = anticipos de alumnos (pasivo)
-    { label: 'Billeteras (Anticipos)', value: `$${fmtNum(totalBilleteras)}`, sub: `${walletCuentas.filter(w => w.saldo_usd > 0).length} con saldo · ${vuelosPorCargar.length} vuelos por cargar`, icon: Wallet, card: 'bg-teal-500/5 border-teal-500/10', txt: 'text-teal-400', ico: 'text-teal-400/20' },
+    { label: 'Billeteras (Anticipos)', value: `$${fmtNum(totalBilleteras)}`, sub: `${walletCuentas.filter(w => w.saldo_usd > 0).length} con saldo · ${vuelosPorCargar.length} vuelos por cargar`, icon: Wallet, card: 'bg-[#E6F4F2]/60 border-[#0F766E]/25', txt: 'text-[#0F766E]', ico: 'text-[#0F766E]' },
   ];
 
   const provisionPendientes = provisionales.filter(p => p.estado === 'PENDIENTE' || p.estado === 'VINCULADO');
@@ -4290,22 +4326,23 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
   // ─── RENDER ───────────────────────────────────────────────────────────────
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-700 font-mono text-white">
+    <div className="bm-app space-y-5 sm:space-y-6 text-left text-bm-ink">
 
-      {/* HEADER */}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-        <div className="flex items-center gap-3">
-          <div>
-            <p className="text-zinc-600 text-[9px] font-black uppercase tracking-[0.4em]">Valkyron Financial Core v17.0</p>
-            <p className="text-[7px] text-[#E1AD01]/60 font-black uppercase tracking-[0.25em] mt-1">Motor de asientos · Bóveda ↔ Caja ↔ CxC/CxP ↔ Billetera en una sola operación · P&amp;L por clase</p>
-          </div>
-          <button onClick={() => refresh()} title="Recargar" className="text-zinc-700 hover:text-[#E1AD01] transition-colors"><RefreshCw size={12} /></button>
+      {/* HEADER [v17.1] — la sección "Dinero" ya titula: aquí solo motor y pestañas */}
+      <div className="rounded-[24px] border border-bm-line bg-white p-3 sm:p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3 px-1">
+          <p className="min-w-0 text-[13px] text-bm-steel">
+            <span className="font-semibold text-bm-ink">Valkyron Financial Core v17.1</span>
+            <span className="hidden sm:inline"> · Bóveda ↔ Caja ↔ CxC/CxP ↔ Billetera en una sola operación · P&amp;L por clase</span>
+          </p>
+          <button onClick={() => refresh()} title="Recargar" aria-label="Recargar datos financieros"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-bm-line text-bm-steel hover:text-bm-red hover:border-bm-field transition-colors"><RefreshCw size={16} /></button>
         </div>
-        <div className="flex flex-wrap gap-1 p-1.5 bg-black/60 rounded-2xl border border-white/5">
+        <div role="tablist" aria-label="Secciones de finanzas" className="flex gap-1 overflow-x-auto pb-0.5">
           {TABS.map(({ key, label, icon: Icon }) => (
-            <button key={key} onClick={() => setActiveTab(key)}
-              className={`flex items-center gap-2 px-4 py-3 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all ${activeTab === key ? 'bg-[#E1AD01] text-black shadow-lg' : 'text-zinc-500 hover:text-white hover:bg-white/5'}`}>
-              <Icon size={12} /> {label}
+            <button key={key} role="tab" aria-selected={activeTab === key} onClick={() => setActiveTab(key)}
+              className={`flex h-10 shrink-0 items-center gap-2 px-3.5 rounded-xl text-sm transition-colors ${activeTab === key ? 'bg-bm-ink text-white font-semibold' : 'border border-bm-line text-bm-steel font-medium hover:text-bm-ink hover:border-bm-field'}`}>
+              <Icon size={15} /> {label}
             </button>
           ))}
         </div>
@@ -4313,58 +4350,58 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
       {/* [NEW v16.2] AVISOS DE SESIÓN / CONSULTAS */}
       {sinSesion && (
-        <div className="flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/30">
-          <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
+        <div className="flex items-start gap-3 p-4 rounded-xl bg-bm-red-tint border border-bm-red/25">
+          <AlertTriangle size={14} className="text-bm-red shrink-0 mt-0.5" />
           <div className="flex-1">
-            <p className="text-[10px] text-red-400 font-black uppercase">Sesión expirada</p>
-            <p className="text-[9px] text-red-300/80 font-mono mt-1">Sin sesión válida la base de datos oculta cajas, movimientos y cuentas. Inicia sesión de nuevo para ver los datos.</p>
+            <p className="text-[13px] text-bm-red font-semibold">Sesión expirada</p>
+            <p className="text-xs text-bm-red font-mono mt-1">Sin sesión válida la base de datos oculta cajas, movimientos y cuentas. Inicia sesión de nuevo para ver los datos.</p>
           </div>
-          <button onClick={reiniciarSesion} className="px-4 py-2 rounded-xl bg-red-500 text-white text-[9px] font-black uppercase hover:bg-red-400 transition-all">Reiniciar sesión</button>
+          <button onClick={reiniciarSesion} className="px-4 py-2 rounded-xl bg-bm-red text-white text-xs font-semibold hover:bg-bm-red-deep transition-all">Reiniciar sesión</button>
         </div>
       )}
       {fetchErrors.length > 0 && (
-        <div className="flex items-start gap-3 p-4 rounded-xl bg-orange-500/10 border border-orange-500/30">
-          <AlertTriangle size={14} className="text-orange-400 shrink-0 mt-0.5" />
+        <div className="flex items-start gap-3 p-4 rounded-xl bg-bm-warn-tint border border-bm-warn/25">
+          <AlertTriangle size={14} className="text-bm-warn shrink-0 mt-0.5" />
           <div className="flex-1 min-w-0">
-            <p className="text-[10px] text-orange-400 font-black uppercase">{fetchErrors.length} consulta{fetchErrors.length === 1 ? '' : 's'} con error</p>
-            {fetchErrors.map(e => <p key={e} className="text-[9px] text-orange-300/80 font-mono mt-1 break-words">{e}</p>)}
+            <p className="text-[13px] text-bm-warn font-semibold">{fetchErrors.length} consulta{fetchErrors.length === 1 ? '' : 's'} con error</p>
+            {fetchErrors.map(e => <p key={e} className="text-xs text-bm-warn font-mono mt-1 break-words">{e}</p>)}
           </div>
-          <button onClick={() => refresh()} title="Reintentar" className="text-orange-400 hover:text-white transition-colors"><RefreshCw size={12} /></button>
+          <button onClick={() => refresh()} title="Reintentar" className="text-bm-warn hover:text-bm-ink transition-colors"><RefreshCw size={12} /></button>
         </div>
       )}
 
       {fetchErrors.length > 0 && (
-        <div className="p-4 border border-red-500/40 rounded-xl bg-red-500/10 text-red-300 text-[10px] font-black">
+        <div className="p-4 border border-bm-red/25 rounded-xl bg-bm-red-tint text-bm-red text-[13px] font-semibold">
           DATOS FINANCIEROS NO VERIFICADOS: existe al menos una consulta fallida. No certifique saldos ni realice cierres.
         </div>
       )}
       {/* [v16.8] Integridad visible, nunca conciliación silenciosa */}
       {(alertasIntegridad.length > 0 || historicosRevisar > 0) && (
-        <div className="p-5 rounded-2xl bg-orange-500/5 border border-orange-500/25 space-y-2">
-          <p className="text-[10px] text-orange-400 font-black uppercase flex items-center gap-2"><AlertTriangle size={15} /> Revisión de integridad pendiente</p>
-          {historicosRevisar > 0 && <p className="text-[9px] text-orange-200">{historicosRevisar} CxC históricas cobradas sin vínculo al motor de asientos/abonos. No se ha creado ningún movimiento automático.</p>}
-          <p className="text-[9px] text-orange-200">{alertasIntegridad.length} posibles anomalías en trazabilidad, asientos o transferencias. No implica fraude ni confirma descuadre.</p>
-          {alertasIntegridad.slice(0, 8).map((a, i) => <p key={i} className="text-[8px] text-orange-300/80 font-mono">• {a}</p>)}
-          {alertasIntegridad.length > 8 && <p className="text-[8px] text-orange-300">+ {alertasIntegridad.length - 8} hallazgos adicionales. Revisión manual requerida.</p>}
+        <div className="p-5 rounded-2xl bg-bm-warn-tint/60 border border-bm-warn/25 space-y-2">
+          <p className="text-[13px] text-bm-warn font-semibold flex items-center gap-2"><AlertTriangle size={15} /> Revisión de integridad pendiente</p>
+          {historicosRevisar > 0 && <p className="text-xs text-bm-warn">{historicosRevisar} CxC históricas cobradas sin vínculo al motor de asientos/abonos. No se ha creado ningún movimiento automático.</p>}
+          <p className="text-xs text-bm-warn">{alertasIntegridad.length} posibles anomalías en trazabilidad, asientos o transferencias. No implica fraude ni confirma descuadre.</p>
+          {alertasIntegridad.slice(0, 8).map((a, i) => <p key={i} className="text-xs text-bm-warn font-mono">• {a}</p>)}
+          {alertasIntegridad.length > 8 && <p className="text-xs text-bm-warn">+ {alertasIntegridad.length - 8} hallazgos adicionales. Revisión manual requerida.</p>}
         </div>
       )}
 
       {/* [NEW v17] estado de la migración v17 (no bloquea el panel v16.8) */}
       {!v17Instalado && (
-        <div className="flex items-start gap-3 p-4 rounded-xl bg-teal-500/5 border border-teal-500/25">
-          <Info size={14} className="text-teal-400 shrink-0 mt-0.5" />
-          <p className="text-[9px] text-teal-200 font-mono flex-1">Billeteras, consumos y clases contables requieren <b>migracion_finance_v17_billetera_clases.sql</b>. El resto del panel opera como v16.8.</p>
+        <div className="flex items-start gap-3 p-4 rounded-xl bg-[#E6F4F2]/60 border border-[#0F766E]/25">
+          <Info size={14} className="text-[#0F766E] shrink-0 mt-0.5" />
+          <p className="text-xs text-[#0F766E] font-mono flex-1">Billeteras, consumos y clases contables requieren <b>migracion_finance_v17_billetera_clases.sql</b>. El resto del panel opera como v16.8.</p>
         </div>
       )}
       {v17Instalado && v17Avisos.length > 0 && (
-        <div className="p-4 rounded-xl bg-teal-500/5 border border-teal-500/25 space-y-1">
-          <p className="text-[9px] text-teal-400 font-black uppercase">Avisos de billeteras / clases</p>
-          {v17Avisos.map(a => <p key={a} className="text-[8px] text-teal-200/80 font-mono break-words">• {a}</p>)}
+        <div className="p-4 rounded-xl bg-[#E6F4F2]/60 border border-[#0F766E]/25 space-y-1">
+          <p className="text-xs text-[#0F766E] font-semibold">Avisos de billeteras / clases</p>
+          {v17Avisos.map(a => <p key={a} className="text-xs text-[#0F766E] font-mono break-words">• {a}</p>)}
         </div>
       )}
 
       {/* KPI BÓVEDAS — operativos vs no operativos (FX + financiamiento) */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">   {/* [v17.1] 1 columna en móvil */}
         {ALL_METHODS.map(m => {
           const paid  = transactions.filter(t => t.payment_method === m && t.status === 'PAID' && !isNonOperativeTx(t) && t.category !== 'Anticipos sin matrícula');
           const ing   = paid.filter(t => signedLedgerAmount(t) > 0).reduce((a, t) => round2(a + t.amount), 0);
@@ -4375,18 +4412,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           return (
             <div key={m} className={`${glass} ${MONEDA_BG[m]} rounded-2xl p-5 border space-y-3`}>
               <div className="flex items-center justify-between">
-                <span className={`text-[9px] font-black uppercase tracking-widest ${MONEDA_COLOR[m]}`}>{m}</span>
-                <span className={`text-[7px] font-black px-2 py-1 rounded-full border ${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`}>{saldo >= 0 ? 'POSITIVO' : 'NEGATIVO'}</span>
+                <span className={`text-xs font-semibold ${MONEDA_COLOR[m]}`}>{m}</span>
+                <span className={`text-[11px] font-semibold px-2 py-1 rounded-full border ${MONEDA_BG[m]} ${MONEDA_COLOR[m]}`}>{saldo >= 0 ? 'POSITIVO' : 'NEGATIVO'}</span>
               </div>
               <div className="grid grid-cols-3 gap-2 text-center">
-                {([['Ingresado', fmt(ing), 'text-emerald-400'], ['Egresado', fmt(egr), 'text-red-400'],
-                   ['FX / Financ. / Anticipos', `${fxNet >= 0 ? '+' : '−'}${fmt(Math.abs(fxNet))}`, fxNet >= 0 ? 'text-teal-400' : 'text-teal-600']] as const).map(([l, v, c]) => (
-                  <div key={l}><p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">{l}</p><p className={`font-black text-[11px] italic ${c}`}>{v}</p></div>
+                {([['Ingresado', fmt(ing), 'text-bm-ok'], ['Egresado', fmt(egr), 'text-bm-red'],
+                   ['FX / Financ. / Anticipos', `${fxNet >= 0 ? '+' : '−'}${fmt(Math.abs(fxNet))}`, fxNet >= 0 ? 'text-[#0F766E]' : 'text-[#0F766E]']] as const).map(([l, v, c]) => (
+                  <div key={l}><p className="text-[11px] text-bm-steel font-semibold mb-1">{l}</p><p className={`font-semibold text-sm bm-num ${c}`}>{v}</p></div>
                 ))}
               </div>
-              <div className="border-t border-white/5 pt-2 text-center">
-                <p className="text-[7px] text-zinc-600 uppercase font-black tracking-widest mb-1">Saldo Neto</p>
-                <p className={`font-black text-base italic ${saldo >= 0 ? MONEDA_COLOR[m] : 'text-red-400'}`}>{fmt(saldo)}</p>
+              <div className="border-t border-bm-line pt-2 text-center">
+                <p className="text-[11px] text-bm-steel font-semibold mb-1">Saldo Neto</p>
+                <p className={`text-base bm-figure ${saldo >= 0 ? MONEDA_COLOR[m] : 'text-bm-red'}`}>{fmt(saldo)}</p>
               </div>
             </div>
           );
@@ -4395,27 +4432,27 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
       {/* CAJA EFECTIVO — PANEL ADM/CEO */}
       {(efectivoDual || cajaEfectivo) && (
-        <div className={`${glass} bg-yellow-500/5 border border-yellow-500/20 rounded-2xl p-5`}>
+        <div className={`${glass} bg-[#FDF3D8]/60 border border-[#8A6100]/25 rounded-2xl p-5`}>
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-xl bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center"><Banknote className="text-yellow-400 h-4 w-4" /></div>
+              <div className="w-8 h-8 rounded-xl bg-[#FDF3D8] border border-[#8A6100]/25 flex items-center justify-center"><Banknote className="text-[#8A6100] h-4 w-4" /></div>
               <div>
-                <p className="text-[10px] font-black uppercase tracking-widest text-yellow-400">Caja Efectivo — Trazabilidad</p>
-                <p className="text-[8px] text-zinc-600 font-mono">{efectivoDual ? `${cajaEfectivoADM?.nombre} → ${cajaEfectivoCEO?.nombre}` : 'Administración → Custodia CEO'}</p>
+                <p className="text-[13px] font-semibold text-[#8A6100]">Caja Efectivo — Trazabilidad</p>
+                <p className="text-xs text-bm-steel font-mono">{efectivoDual ? `${cajaEfectivoADM?.nombre} → ${cajaEfectivoCEO?.nombre}` : 'Administración → Custodia CEO'}</p>
               </div>
             </div>
             <button onClick={() => setEntregaCEOModal(true)}
-              className="bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest hover:bg-yellow-500/20 transition-all flex items-center gap-2">
+              className="bg-[#FDF3D8] text-[#8A6100] border border-[#8A6100]/25 px-4 py-2 rounded-xl text-xs font-semibold hover:bg-[#FBEBC0] transition-all flex items-center gap-2">
               <ArrowLeftRight size={12} /> Entregar a CEO
             </button>
           </div>
           <div className="grid grid-cols-2 gap-4">
-            {([['Stand-By · Administración', saldoEfectivoADM, 'bg-blue-400', 'Pendiente de entrega a CEO', 'border-yellow-500/10'],
-               ['Custodia · CEO', saldoEfectivoCEO, 'bg-yellow-400', 'En caja de los directores', 'border-yellow-500/20']] as const).map(([l, s, dot, sub, bd]) => (
-              <div key={l} className={`bg-black/30 rounded-xl p-4 border ${bd}`}>
-                <div className="flex items-center gap-2 mb-2"><div className={`w-2 h-2 rounded-full ${dot}`} /><p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">{l}</p></div>
-                <p className={`text-xl font-black italic ${s >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>{fmtMonto(s, 'CASH')}</p>
-                <p className="text-[8px] text-zinc-600 font-mono mt-1">{sub}</p>
+            {([['Stand-By · Administración', saldoEfectivoADM, 'bg-[#2F5BB7]', 'Pendiente de entrega a CEO', 'border-[#8A6100]/25'],
+               ['Custodia · CEO', saldoEfectivoCEO, 'bg-[#C99700]', 'En caja de los directores', 'border-[#8A6100]/25']] as const).map(([l, s, dot, sub, bd]) => (
+              <div key={l} className={`bg-bm-canvas rounded-xl p-4 border ${bd}`}>
+                <div className="flex items-center gap-2 mb-2"><div className={`w-2 h-2 rounded-full ${dot}`} /><p className="text-xs text-bm-steel font-semibold">{l}</p></div>
+                <p className={`text-xl bm-figure ${s >= 0 ? 'text-[#8A6100]' : 'text-bm-red'}`}>{fmtMonto(s, 'CASH')}</p>
+                <p className="text-xs text-bm-steel font-mono mt-1">{sub}</p>
               </div>
             ))}
           </div>
@@ -4427,9 +4464,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         {KPI_CUENTAS.map(({ label, value, sub, icon: Icon, card, txt, ico }) => (
           <div key={label} className={`${glass} ${card} border rounded-2xl p-4 flex items-center justify-between`}>
             <div>
-              <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">{label}</p>
-              <p className={`${txt} font-black text-lg italic`}>{value}</p>
-              <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{sub}</p>
+              <p className="text-xs text-bm-steel font-semibold mb-1">{label}</p>
+              <p className={`${txt} text-lg bm-figure`}>{value}</p>
+              <p className="text-xs text-bm-steel font-mono mt-0.5">{sub}</p>
             </div>
             <Icon className={`${ico} h-9 w-9`} />
           </div>
@@ -4442,17 +4479,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {resumenProvisional.map(({ moneda, saldo }) => (
               <div key={moneda} className={`${glass} rounded-2xl p-4`}>
-                <p className={`text-[9px] font-black ${MONEDA_COLOR[moneda]}`}>{moneda} · POR APLICAR</p>
-                <p className="text-xl font-black mt-2">{fmtMonto(saldo, moneda)}</p>
+                <p className={`text-xs font-semibold ${MONEDA_COLOR[moneda]}`}>{moneda} · POR APLICAR</p>
+                <p className="text-xl font-semibold mt-2">{fmtMonto(saldo, moneda)}</p>
               </div>
             ))}
           </div>
-          <div className="border border-orange-500/20 bg-orange-500/5 rounded-xl p-4 text-[9px] text-orange-200">
+          <div className="border border-bm-warn/25 bg-bm-warn-tint/60 rounded-xl p-4 text-xs text-bm-warn">
             Anticipos cobrados, NO ingresos académicos devengados. Vincular un estudiante NO acredita horas ni aplica cuentas por cobrar. No registre nuevamente este dinero al matricularlo.
           </div>
           <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
             <form onSubmit={handlePagoProvisional} className={`${glass} xl:col-span-5 rounded-3xl p-6 space-y-4`}>
-              <h2 className="text-[11px] font-black text-[#E1AD01] flex items-center gap-2"><UserCheck size={16} /> Recibir anticipo · Sin matrícula</h2>
+              <h2 className="text-sm font-semibold text-bm-red flex items-center gap-2"><UserCheck size={16} /> Recibir anticipo · Sin matrícula</h2>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div><Lbl>Nombre completo del aspirante *</Lbl><input required value={provisionalForm.beneficiario_nombre} onChange={e => setProvisionalForm(p=>({...p, beneficiario_nombre:e.target.value}))} className={inp} placeholder="BENEFICIARIO" /></div>
                 <div><Lbl>Cédula / documento del aspirante *</Lbl><input required value={provisionalForm.beneficiario_documento} onChange={e => setProvisionalForm(p=>({...p, beneficiario_documento:e.target.value}))} className={inp} placeholder="CÉDULA / PASAPORTE" /></div>
@@ -4471,45 +4508,45 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               {cajaEsEfectivo(provisionalForm.caja_id) && <SubcajaToggle value={provisionalForm.subcaja} onChange={sc=>setProvisionalForm(p=>({...p,subcaja:sc}))} />}
               <div><Lbl>Fecha del pago</Lbl><input type="date" required value={provisionalForm.fecha} onChange={e=>setProvisionalForm(p=>({...p,fecha:e.target.value}))} className={inp} style={noUpper} /></div>
               <PagadorFields value={provisionalPago} onChange={setProvisionalPago} moneda={provisionalForm.moneda} sinPerfil />
-              <p className="text-[8px] text-yellow-400">Referencia / número de recibo obligatorio también para efectivo. Una referencia no puede registrarse dos veces.</p>
+              <p className="text-xs text-[#8A6100]">Referencia / número de recibo obligatorio también para efectivo. Una referencia no puede registrarse dos veces.</p>
               <ErrorBanner msg={provisionalError} onClose={()=>setProvisionalError(null)} />
               <button type="submit" disabled={savingProvisional || sinSesion || !canManageFinance || fetchErrors.length>0}
-                className="w-full py-4 bg-[#E1AD01] text-black rounded-xl font-black text-[10px] uppercase disabled:opacity-40">
+                className="w-full py-4 bg-bm-red text-white rounded-xl font-semibold text-[13px] disabled:opacity-40">
                 {savingProvisional?'Registrando anticipo...':'Registrar pago y generar trazabilidad'}
               </button>
             </form>
             <div className={`${glass} xl:col-span-7 rounded-3xl p-6 space-y-4`}>
               <div className="flex justify-between items-center gap-2 flex-wrap">
-                <h2 className="text-[11px] font-black uppercase">Registro de anticipos · {provisionales.length} operaciones</h2>
-                <button type="button" onClick={exportProvisionalesCSV} disabled={provisionales.length===0} className="px-3 py-2 rounded-xl text-[9px] border border-white/20 text-[#E1AD01] disabled:opacity-30 flex gap-2 items-center"><Download size={12}/> Exportar CSV</button>
+                <h2 className="text-sm font-semibold">Registro de anticipos · {provisionales.length} operaciones</h2>
+                <button type="button" onClick={exportProvisionalesCSV} disabled={provisionales.length===0} className="px-3 py-2 rounded-xl text-xs border border-bm-field text-bm-red disabled:opacity-30 flex gap-2 items-center"><Download size={12}/> Exportar CSV</button>
               </div>
               <div className="max-h-[680px] overflow-y-auto space-y-2">
                 {provisionales.length===0 && <EmptyState text="Sin anticipos registrados" />}
                 {provisionales.map(p=>{
                   const pagador = pagoPorAsiento.get(p.asiento_id);
                   const alumno = p.student_id ? alumnos.find(a=>a.student_id===p.student_id) : null;
-                  return <div key={p.id} className="border border-white/10 bg-black/30 rounded-2xl p-4 space-y-2">
+                  return <div key={p.id} className="border border-bm-line bg-bm-canvas rounded-2xl p-4 space-y-2">
                     <div className="flex flex-wrap gap-2 items-center justify-between">
-                      <p className="text-[10px] font-black">{p.beneficiario_nombre}</p>
+                      <p className="text-[13px] font-semibold">{p.beneficiario_nombre}</p>
                       <Badge tone={p.estado==='ANULADO'?TONE.red:p.estado==='VINCULADO'?TONE.blue:TONE.yellow}>{p.estado==='VINCULADO'?'Vinculado · NO aplicado':p.estado}</Badge>
                     </div>
-                    <p className="text-[9px] text-zinc-400">{p.beneficiario_documento} · {p.sede||'Sede no definida'} · {fmtDate(p.fecha_pago)}</p>
-                    <p className="text-[12px] font-black text-emerald-400">{fmtMonto(p.monto,p.moneda)} · REF {p.referencia_pago}</p>
-                    <p className="text-[8px] text-zinc-500">{p.concepto}</p>
-                    <p className="text-[8px] text-yellow-300">Pagó: {pagador?.pagador_nombre??'REVISAR TRAZABILIDAD'} · Recibió: {pagador?.recibido_por??'REVISAR'} · Caja: {cajaNombre(p.caja_id)}</p>
-                    <p className="text-[8px] text-zinc-600 break-all">Asiento: {p.asiento_id} · Registro: {p.creado_en}</p>
-                    {alumno && <p className="text-[9px] text-blue-400">Perfil vinculado: {alumno.nombre} · {alumno.serial}. Sin aplicación de CxC/horas.</p>}
+                    <p className="text-xs text-bm-steel">{p.beneficiario_documento} · {p.sede||'Sede no definida'} · {fmtDate(p.fecha_pago)}</p>
+                    <p className="text-[12px] font-semibold text-bm-ok">{fmtMonto(p.monto,p.moneda)} · REF {p.referencia_pago}</p>
+                    <p className="text-xs text-bm-steel">{p.concepto}</p>
+                    <p className="text-xs text-[#8A6100]">Pagó: {pagador?.pagador_nombre??'REVISAR TRAZABILIDAD'} · Recibió: {pagador?.recibido_por??'REVISAR'} · Caja: {cajaNombre(p.caja_id)}</p>
+                    <p className="text-xs text-bm-steel break-all">Asiento: {p.asiento_id} · Registro: {p.creado_en}</p>
+                    {alumno && <p className="text-xs text-[#2F5BB7]">Perfil vinculado: {alumno.nombre} · {alumno.serial}. Sin aplicación de CxC/horas.</p>}
                     {/* [NEW v17] anticipo vinculado → saldo de billetera */}
                     {provisionalAplicado.has(p.id) && <Badge tone={TONE.emerald}><Wallet size={8} /> Aplicado a billetera</Badge>}
                     {p.estado === 'VINCULADO' && p.student_id && !provisionalAplicado.has(p.id) && v17Instalado && canManageFinance && (
                       <button type="button" onClick={() => aplicarProvisionalBilletera(p)} disabled={savingProvisionalLink}
-                        className="border border-teal-500/30 text-teal-300 rounded-xl px-3 py-2 text-[9px] font-black flex items-center gap-2 disabled:opacity-30">
+                        className="border border-[#0F766E]/25 text-[#0F766E] rounded-xl px-3 py-2 text-xs font-semibold flex items-center gap-2 disabled:opacity-30">
                         <Wallet size={11} /> Aplicar a billetera del alumno
                       </button>
                     )}
                     {p.estado==='PENDIENTE' && (
                       <button type="button" onClick={()=>{setProvisionalLinkId(p.id);setProvisionalStudentId('');setProvisionalError(null);}}
-                        className="border border-blue-500/30 text-blue-300 rounded-xl px-3 py-2 text-[9px] font-black">Vincular a estudiante matriculado</button>
+                        className="border border-[#2F5BB7]/25 text-[#2F5BB7] rounded-xl px-3 py-2 text-xs font-semibold">Vincular a estudiante matriculado</button>
                     )}
                   </div>;
                 })}
@@ -4517,15 +4554,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             </div>
           </div>
           {provisionalLinkId && (
-            <ModalShell accent="border-t-blue-500">
+            <ModalShell accent="border-t-[#2F5BB7]">
               <ModalHeader icon={Link2} tone={TONE.blue} title="Vincular identidad" subtitle="No mueve dinero ni acredita horas" onClose={()=>setProvisionalLinkId(null)} />
-              <p className="text-[9px] text-zinc-400 mb-4">Verifique el documento del aspirante y su perfil. Esta acción se audita y no permite reutilizar el cobro como uno nuevo.</p>
+              <p className="text-xs text-bm-steel mb-4">Verifique el documento del aspirante y su perfil. Esta acción se audita y no permite reutilizar el cobro como uno nuevo.</p>
               <select value={provisionalStudentId} onChange={e=>setProvisionalStudentId(e.target.value)} className={inp}>
                 <option value="">— SELECCIONE PERFIL MATRICULADO —</option>
                 {alumnos.map(a=><option key={a.student_id} value={a.student_id}>{a.nombre} · {a.serial} · {a.sede}</option>)}
               </select>
               <div className="mt-4"><ErrorBanner msg={provisionalError} onClose={()=>setProvisionalError(null)} /></div>
-              <div className="mt-5"><ModalActions onCancel={()=>setProvisionalLinkId(null)} submitCls="bg-blue-500 text-black" busy={savingProvisionalLink}
+              <div className="mt-5"><ModalActions onCancel={()=>setProvisionalLinkId(null)} submitCls="bg-[#2F5BB7] text-white" busy={savingProvisionalLink}
                 disabled={!provisionalStudentId} onSubmit={vincularProvisional} label="Confirmar vínculo documental" /></div>
             </ModalShell>
           )}
@@ -4535,10 +4572,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
       {/* ══ TAB: DIARIO ══════════════════════════════════════════════════════ */}
       {activeTab === 'LEDGER' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className={`lg:col-span-4 ${glass} rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
+          <div className={`lg:col-span-4 ${glass} rounded-3xl p-7 border-t-2 border-t-bm-red`}>
             <div className="flex items-center gap-3 mb-7">
-              <Calculator className="text-[#E1AD01] h-4 w-4" />
-              <h2 className="text-[10px] font-black uppercase tracking-widest">Registrar Movimiento</h2>
+              <Calculator className="text-bm-red h-4 w-4" />
+              <h2 className="text-[13px] font-semibold">Registrar Movimiento</h2>
             </div>
             <form onSubmit={handleLedger} className="space-y-4">
               <input type="date" required value={ledger.fecha} onChange={e => setLedger(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
@@ -4565,7 +4602,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 </select>
               )}
               <div>
-                <Lbl cls="text-zinc-600">{ledger.type === 'INCOME' ? 'Caja donde entra el dinero' : 'Caja de donde sale el dinero'}</Lbl>
+                <Lbl cls="text-bm-steel">{ledger.type === 'INCOME' ? 'Caja donde entra el dinero' : 'Caja de donde sale el dinero'}</Lbl>
                 <select value={ledger.caja_id} onChange={e => setLedger(p => ({ ...p, caja_id: e.target.value }))} className={inp} disabled={savingLedger}>
                   <option value="">SOLO BÓVEDA · queda sin ubicar</option>
                   {cajas.length === 0 && <option value="" disabled>SIN CAJAS VISIBLES · REVISE RLS</option>}
@@ -4577,7 +4614,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               </div>
               {ledgerCajaEfe && <SubcajaToggle value={ledger.subcaja} onChange={sc => setLedger(p => ({ ...p, subcaja: sc }))} />}
               {ledger.type === 'INCOME' && <PagadorFields value={ledgerPago} onChange={setLedgerPago} moneda={ledger.currency} alumnos={alumnos} />}
-              <AmountInput size="xl" value={ledger.amount} moneda={ledger.currency} prefixCls="text-[#E1AD01]" disabled={savingLedger}
+              <AmountInput size="xl" value={ledger.amount} moneda={ledger.currency} prefixCls="text-bm-red" disabled={savingLedger}
                 onChange={v => setLedger(p => ({ ...p, amount: v }))} />
               <input value={ledger.reference} onChange={e => setLedger(p => ({ ...p, reference: e.target.value }))} placeholder="REFERENCIA / TRAZABILIDAD" className={inp} disabled={savingLedger} />
               {/* [NEW v17] clase contable del movimiento */}
@@ -4585,25 +4622,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 <ClaseFields value={ledgerClase} onChange={setLedgerClase} flota={flota} pilotos={pilotosLista}
                   naturaleza={ledger.type === 'INCOME' ? 'INGRESO' : 'GASTO'} />
               )}
-              <p className="text-[8px] text-zinc-600 font-mono">Cobros de alumnos y pagos a proveedores se registran desde CxC/CxP para que rebajen la cuenta. Pagos que el alumno deja como saldo: Billeteras → Recargar.</p>
+              <p className="text-xs text-bm-steel font-mono">Cobros de alumnos y pagos a proveedores se registran desde CxC/CxP para que rebajen la cuenta. Pagos que el alumno deja como saldo: Billeteras → Recargar.</p>
               <ErrorBanner msg={ledgerError} onClose={() => setLedgerError(null)} />
               <button type="submit" disabled={savingLedger}
-                className="w-full py-5 bg-[#E1AD01] text-black rounded-2xl font-black uppercase text-[10px] tracking-widest hover:bg-white transition-all flex items-center justify-center gap-2 disabled:opacity-40">
+                className="w-full py-5 bg-bm-red text-white rounded-2xl font-semibold text-[13px] hover:bg-bm-red-deep transition-all flex items-center justify-center gap-2 disabled:opacity-40">
                 {savingLedger ? <><Loader2 className="animate-spin h-4 w-4" />Sellando...</> : 'Sellar Registro'}
               </button>
             </form>
           </div>
 
           <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
-            <div className="p-6 border-b border-white/5 flex justify-between items-center">
-              <h3 className="text-[10px] font-black uppercase tracking-widest italic">Libro Mayor</h3>
-              <div className="flex gap-2 items-center">
+            <div className="p-4 sm:p-6 border-b border-bm-line flex flex-wrap gap-3 justify-between items-center">
+              <h3 className="bm-heading text-base">Libro Mayor</h3>
+              <div className="flex flex-wrap gap-2 items-center">
                 <input value={ledgerQuery} onChange={e => setLedgerQuery(e.target.value)} placeholder="BUSCAR PAGADOR · CÉDULA · REF"
-                  className="bg-black/50 border border-white/10 px-3 py-2 rounded-xl text-[9px] font-mono text-white outline-none focus:border-[#E1AD01]/60 w-44 uppercase placeholder:text-white/20" />
-                <button onClick={() => openFxDesk()} className="bg-teal-500/10 text-teal-400 px-4 py-2 rounded-xl border border-teal-500/20 text-[9px] font-black uppercase hover:bg-teal-500/20 flex items-center gap-2 transition-all">
+                  className="bg-white border border-bm-field px-3 h-10 rounded-xl text-base text-bm-ink outline-none focus:border-bm-red w-full sm:w-56 uppercase placeholder:text-bm-hint" />
+                <button onClick={() => openFxDesk()} className="bg-[#E6F4F2] text-[#0F766E] px-4 py-2 rounded-xl border border-[#0F766E]/25 text-xs font-semibold hover:bg-[#D5ECE9] flex items-center gap-2 transition-all">
                   <TrendingUp size={11} /> FX Desk
                 </button>
-                <button onClick={handleExportCSV} className="bg-[#E1AD01]/10 text-[#E1AD01] px-4 py-2 rounded-xl border border-[#E1AD01]/20 text-[9px] font-black uppercase hover:bg-[#E1AD01] hover:text-black flex items-center gap-2 transition-all">
+                <button onClick={handleExportCSV} className="bg-bm-red-tint text-bm-red px-4 py-2 rounded-xl border border-bm-red/25 text-xs font-semibold hover:bg-bm-red hover:text-white flex items-center gap-2 transition-all">
                   <Download size={11} /> CSV
                 </button>
               </div>
@@ -4611,26 +4648,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
             {fxRegistros.length > 0 && (
               <div className="px-4 pt-4">
-                <p className="text-[8px] text-teal-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1"><TrendingUp size={10} /> Operaciones FX recientes</p>
+                <p className="text-xs text-[#0F766E] font-semibold mb-2 flex items-center gap-1"><TrendingUp size={10} /> Operaciones FX recientes</p>
                 <div className="space-y-1 max-h-[160px] overflow-y-auto">
                   {fxRegistros.slice(0, 8).map(fx => (
-                    <div key={fx.id} className="bg-teal-500/5 border border-teal-500/10 p-3 rounded-xl flex justify-between items-center group">
+                    <div key={fx.id} className="bg-[#E6F4F2]/60 border border-[#0F766E]/25 p-3 rounded-xl flex justify-between items-center group">
                       <div className="min-w-0">
-                        <p className="text-[9px] font-black uppercase text-teal-400 flex items-center gap-2">
+                        <p className="text-xs font-semibold text-[#0F766E] flex items-center gap-2">
                           {fx.moneda_origen} → {fx.moneda_destino}
                           {!transactions.some(t => t.fx_id === fx.id && !!t.fx_leg) && <Badge tone={TONE.red}>LEGACY · anular y re-registrar</Badge>}
                         </p>
-                        <p className="text-[8px] text-zinc-500 font-mono truncate">
+                        <p className="text-xs text-bm-steel font-mono truncate">
                           {cajaNombre(fx.caja_origen_id)}{fx.subcaja_origen ? ` (${fx.subcaja_origen})` : ''} → {cajaNombre(fx.caja_destino_id)}{fx.subcaja_destino ? ` (${fx.subcaja_destino})` : ''}
                         </p>
-                        <p className="text-[8px] text-zinc-600 font-mono truncate">{fmtDate(fx.fecha)} · {fx.referencia ?? '—'} · {fx.concepto}</p>
+                        <p className="text-xs text-bm-steel font-mono truncate">{fmtDate(fx.fecha)} · {fx.referencia ?? '—'} · {fx.concepto}</p>
                       </div>
                       <div className="flex items-center gap-3 ml-3">
                         <div className="text-right">
-                          <p className="text-[10px] font-black italic text-white whitespace-nowrap">{fmtMonto(fx.monto_origen, fx.moneda_origen)} → {fmtMonto(fx.monto_destino, fx.moneda_destino)}</p>
-                          <p className="text-[8px] text-zinc-600 font-mono">@ {fx.tasa}</p>
+                          <p className="text-[13px] font-semibold text-bm-ink whitespace-nowrap bm-num">{fmtMonto(fx.monto_origen, fx.moneda_origen)} → {fmtMonto(fx.monto_destino, fx.moneda_destino)}</p>
+                          <p className="text-xs text-bm-steel font-mono">@ {fx.tasa}</p>
                         </div>
-                        <button onClick={() => anularFX(fx.id)} disabled={savingAction === fx.id} title="Anular FX completo" className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+                        <button onClick={() => anularFX(fx.id)} disabled={savingAction === fx.id} title="Anular FX completo" className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}>
                           {savingAction === fx.id ? <Loader2 size={13} className="animate-spin" /> : <Ban size={13} />}
                         </button>
                       </div>
@@ -4653,18 +4690,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-4 space-y-6">
             <div className={`${glass} rounded-3xl p-7`}>
-              <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 flex items-center gap-2 italic"><Wallet className="text-[#E1AD01] h-4 w-4" /> Bóvedas Principales</h3>
+              <h3 className="text-[13px] font-semibold mb-6 flex items-center gap-2 bm-num"><Wallet className="text-bm-red h-4 w-4" /> Bóvedas Principales</h3>
               <div className="space-y-3">
                 {ALL_METHODS.map(curr => {
                   const active = selectedVault === curr;
                   return (
                     <button key={curr} onClick={() => setSelectedVault(curr)}
-                      className={`w-full p-5 rounded-2xl flex justify-between items-center border transition-all ${active ? `${MONEDA_BG[curr]} ${MONEDA_COLOR[curr]}` : 'bg-white/[0.02] border-white/[0.05] text-zinc-500 hover:text-white hover:bg-white/[0.04]'}`}>
+                      className={`w-full p-5 rounded-2xl flex justify-between items-center border transition-all ${active ? `${MONEDA_BG[curr]} ${MONEDA_COLOR[curr]}` : 'bg-bm-canvas/60 border-bm-line text-bm-steel hover:text-bm-ink hover:bg-bm-canvas'}`}>
                       <div className="flex items-center gap-3">
-                        <Coins className={`h-4 w-4 ${active ? '' : 'text-zinc-700'}`} />
-                        <span className="font-black uppercase tracking-widest text-[10px]">{curr}</span>
+                        <Coins className={`h-4 w-4 ${active ? '' : 'text-bm-hint'}`} />
+                        <span className="font-semibold text-[13px]">{curr}</span>
                       </div>
-                      <span className={`font-mono font-black text-lg italic ${active ? '' : 'text-zinc-400'}`}>{fmtMonto(getVaultBalance(curr), curr)}</span>
+                      <span className={`font-mono text-lg bm-figure ${active ? '' : 'text-bm-steel'}`}>{fmtMonto(getVaultBalance(curr), curr)}</span>
                     </button>
                   );
                 })}
@@ -4672,22 +4709,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             </div>
 
             <div className={`${glass} rounded-3xl p-7`}>
-              <h3 className="text-[10px] font-black uppercase tracking-widest mb-2 flex items-center gap-2 italic"><Scale className="text-teal-400 h-4 w-4" /> Conciliación Bóveda ↔ Cajas</h3>
-              <p className="text-[8px] text-zinc-600 font-mono mb-5">Bóveda = posición total por moneda. Cajas = dónde está físicamente. La diferencia es saldo aún no ubicado en una caja; se ubica con un movimiento de clase UBICACIÓN.</p>
+              <h3 className="text-[13px] font-semibold mb-2 flex items-center gap-2 bm-num"><Scale className="text-[#0F766E] h-4 w-4" /> Conciliación Bóveda ↔ Cajas</h3>
+              <p className="text-xs text-bm-steel font-mono mb-5">Bóveda = posición total por moneda. Cajas = dónde está físicamente. La diferencia es saldo aún no ubicado en una caja; se ubica con un movimiento de clase UBICACIÓN.</p>
               <div className="space-y-2">
                 {conciliacion.map(({ m, boveda, enCajas, sinAsignar }) => {
                   const cuadra = Math.abs(sinAsignar) <= 0.01;
                   return (
                     <div key={m} className={`rounded-xl border p-3 ${MONEDA_BG[m]}`}>
                       <div className="flex justify-between items-center mb-1">
-                        <span className={`text-[9px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
-                        <span className={`text-[8px] font-black uppercase px-2 py-0.5 rounded-full ${cuadra ? 'bg-emerald-500/10 text-emerald-400' : sinAsignar < 0 ? 'bg-red-500/10 text-red-400' : 'bg-white/5 text-zinc-400'}`}>
+                        <span className={`text-xs font-semibold ${MONEDA_COLOR[m]}`}>{m}</span>
+                        <span className={`text-xs font-semibold uppercase px-2 py-0.5 rounded-full ${cuadra ? 'bg-bm-ok-tint text-bm-ok' : sinAsignar < 0 ? 'bg-bm-red-tint text-bm-red' : 'bg-bm-canvas text-bm-steel'}`}>
                           {cuadra ? 'Cuadrado' : sinAsignar < 0 ? 'Cajas > Bóveda' : 'Sin ubicar'}
                         </span>
                       </div>
                       <div className="grid grid-cols-3 gap-2 text-center">
-                        {([['Bóveda', boveda, ''], ['En cajas', enCajas, ''], ['Diferencia', sinAsignar, sinAsignar < -0.01 ? 'text-red-400' : '']] as const).map(([l, v, c]) => (
-                          <div key={l}><p className="text-[7px] text-zinc-600 font-black uppercase">{l}</p><p className={`text-[10px] font-black italic ${c}`}>{fmtMonto(v, m)}</p></div>
+                        {([['Bóveda', boveda, ''], ['En cajas', enCajas, ''], ['Diferencia', sinAsignar, sinAsignar < -0.01 ? 'text-bm-red' : '']] as const).map(([l, v, c]) => (
+                          <div key={l}><p className="text-[11px] text-bm-steel font-semibold">{l}</p><p className={`text-[13px] font-semibold bm-num ${c}`}>{fmtMonto(v, m)}</p></div>
                         ))}
                       </div>
                     </div>
@@ -4695,9 +4732,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 })}
               </div>
               {reposicionesLegacyLedger.length > 0 && (
-                <div className="mt-4 bg-red-500/5 border border-red-500/20 rounded-xl p-3">
-                  <p className="text-[9px] text-red-400 font-black uppercase flex items-center gap-2"><AlertTriangle size={11} /> {reposicionesLegacyLedger.length} reposiciones legacy como egreso</p>
-                  <p className="text-[8px] text-zinc-500 font-mono mt-1">
+                <div className="mt-4 bg-bm-red-tint/60 border border-bm-red/25 rounded-xl p-3">
+                  <p className="text-xs text-bm-red font-semibold flex items-center gap-2"><AlertTriangle size={11} /> {reposicionesLegacyLedger.length} reposiciones legacy como egreso</p>
+                  <p className="text-xs text-bm-steel font-mono mt-1">
                     Versiones anteriores registraron reposiciones internas como EXPENSE ({ALL_METHODS.map(m => {
                       const tot = reposicionesLegacyLedger.filter(t => t.payment_method === m).reduce((a, t) => round2(a + t.amount), 0);
                       return tot > 0 ? fmtMonto(tot, m) : null;
@@ -4709,8 +4746,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           </div>
 
           <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
-            <div className="p-6 border-b border-white/5">
-              <h3 className="text-[10px] font-black uppercase tracking-widest italic">Auditoría Bóveda: <span className={MONEDA_COLOR[selectedVault]}>{selectedVault}</span></h3>
+            <div className="p-6 border-b border-bm-line">
+              <h3 className="text-[13px] font-semibold bm-num">Auditoría Bóveda: <span className={MONEDA_COLOR[selectedVault]}>{selectedVault}</span></h3>
             </div>
             <div className="flex-1 overflow-y-auto max-h-[720px] p-4 space-y-2">
               {transactions.filter(t => t.payment_method === selectedVault).map(t => renderTx(t, 'BOVEDA'))}
@@ -4723,17 +4760,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
       {activeTab === 'CAJAS' && (
         <div className="space-y-6">
           <div className="flex justify-between items-center flex-wrap gap-3">
-            <p className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">{cajas.length} cajas operativas</p>
+            <p className="text-xs text-bm-steel font-semibold">{cajas.length} cajas operativas</p>
             <div className="flex gap-2 flex-wrap">
               {([
-                { l: 'FX Desk',          icon: TrendingUp,     cls: 'bg-teal-500/10 text-teal-400 border-teal-500/20 hover:bg-teal-500/20',          on: () => openFxDesk() },
-                { l: 'Préstamo Externo', icon: HandCoins,      cls: 'bg-violet-500/10 text-violet-400 border-violet-500/20 hover:bg-violet-500/20',  on: () => { setCajaError(null); setPrestamoModal(true); } },
-                { l: 'Transferir',       icon: ArrowLeftRight, cls: 'bg-purple-500/10 text-purple-400 border-purple-500/20 hover:bg-purple-500/20',  on: () => setTransferModalOpen(true) },
-                { l: 'Exportar',         icon: Download,       cls: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/20', on: handleExportCajasExcel },
+                { l: 'FX Desk',          icon: TrendingUp,     cls: 'bg-[#E6F4F2] text-[#0F766E] border-[#0F766E]/25 hover:bg-[#D5ECE9]',          on: () => openFxDesk() },
+                { l: 'Préstamo Externo', icon: HandCoins,      cls: 'bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25 hover:bg-[#E7DFF8]',  on: () => { setCajaError(null); setPrestamoModal(true); } },
+                { l: 'Transferir',       icon: ArrowLeftRight, cls: 'bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25 hover:bg-[#E7DFF8]',  on: () => setTransferModalOpen(true) },
+                { l: 'Exportar',         icon: Download,       cls: 'bg-bm-ok-tint text-bm-ok border-bm-ok/25 hover:bg-bm-ok-tint', on: handleExportCajasExcel },
                 // [NEW v17] impresión global del mes en curso (otros períodos: Reportes → Imprimir movimientos)
-                { l: 'Imprimir mes',     icon: Printer,        cls: 'bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/20 hover:bg-[#E1AD01]/20', on: () => imprimirMovimientosCaja(null, `${hoyISO().slice(0, 7)}-01`, hoyISO()) },
+                { l: 'Imprimir mes',     icon: Printer,        cls: 'bg-bm-red-tint text-bm-red border-bm-red/25 hover:bg-bm-red-tint', on: () => imprimirMovimientosCaja(null, `${hoyISO().slice(0, 7)}-01`, hoyISO()) },
               ] as { l: string; icon: LucideIcon; cls: string; on: () => void }[]).map(({ l, icon: Icon, cls, on }) => (
-                <button key={l} onClick={on} className={`${cls} border px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2`}>
+                <button key={l} onClick={on} className={`${cls} border px-5 py-3 rounded-xl text-[13px] font-semibold transition-all flex items-center gap-2`}>
                   <Icon size={13} /> {l}
                 </button>
               ))}
@@ -4743,39 +4780,39 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           {/* [NEW v16.4] MATRIZ CAJAS ↔ BÓVEDAS: Σ cajas + sin ubicar = bóveda, por moneda */}
           {cajas.length > 0 && (
             <div className={`${glass} rounded-3xl overflow-hidden`}>
-              <div className="p-5 border-b border-white/5 flex items-center justify-between">
-                <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2"><Scale className="text-teal-400 h-4 w-4" /> Cajas ↔ Bóvedas</h3>
-                <p className="text-[8px] text-zinc-600 font-mono">Cada monto existe una sola vez: en una caja o sin ubicar dentro de su bóveda</p>
+              <div className="p-5 border-b border-bm-line flex items-center justify-between">
+                <h3 className="text-[13px] font-semibold flex items-center gap-2 bm-num"><Scale className="text-[#0F766E] h-4 w-4" /> Cajas ↔ Bóvedas</h3>
+                <p className="text-xs text-bm-steel font-mono">Cada monto existe una sola vez: en una caja o sin ubicar dentro de su bóveda</p>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full text-[10px] font-mono">
+                <table className="w-full text-[13px] font-mono">
                   <thead>
-                    <tr className="text-zinc-600 text-[8px] uppercase tracking-widest">
-                      <th className="text-left font-black p-3">Caja</th>
-                      {ALL_METHODS.map(m => <th key={m} className={`text-right font-black p-3 ${MONEDA_COLOR[m]}`}>{m}</th>)}
+                    <tr className="text-bm-steel text-xs">
+                      <th className="text-left font-semibold p-3">Caja</th>
+                      {ALL_METHODS.map(m => <th key={m} className={`text-right font-semibold p-3 ${MONEDA_COLOR[m]}`}>{m}</th>)}
                     </tr>
                   </thead>
                   <tbody>
                     {cajas.map(c => {
                       const conf = getCajaConfig(c);
                       return (
-                        <tr key={c.id} className="border-t border-white/[0.04] hover:bg-white/[0.02] cursor-pointer" onClick={() => toggleCajaActiva(c)}>
-                          <td className="p-3 font-black uppercase truncate max-w-[180px]">{c.nombre}</td>
+                        <tr key={c.id} className="border-t border-bm-line hover:bg-bm-canvas cursor-pointer" onClick={() => toggleCajaActiva(c)}>
+                          <td className="p-3 font-semibold truncate max-w-[180px]">{c.nombre}</td>
                           {ALL_METHODS.map(m => {
-                            if (!conf.monedasPermitidas.includes(m)) return <td key={m} className="p-3 text-right text-zinc-800">—</td>;
+                            if (!conf.monedasPermitidas.includes(m)) return <td key={m} className="p-3 text-right text-bm-hint">—</td>;
                             const sv = getCajaBalance(c.id, m);
-                            return <td key={m} className={`p-3 text-right font-black italic ${Math.abs(sv) < 0.005 ? 'text-zinc-700' : sv > 0 ? MONEDA_COLOR[m] : 'text-red-400'}`}>{fmtMonto(sv, m)}</td>;
+                            return <td key={m} className={`p-3 text-right font-semibold bm-num ${Math.abs(sv) < 0.005 ? 'text-bm-hint' : sv > 0 ? MONEDA_COLOR[m] : 'text-bm-red'}`}>{fmtMonto(sv, m)}</td>;
                           })}
                         </tr>
                       );
                     })}
                   </tbody>
-                  <tfoot className="border-t border-white/10 text-[9px]">
-                    {([['Σ Cajas', 'enCajas', 'text-white'], ['Sin ubicar', 'sinAsignar', 'text-zinc-400'], ['Bóveda', 'boveda', 'text-[#E1AD01]']] as const).map(([l, k, cls]) => (
-                      <tr key={k} className="border-t border-white/[0.04]">
-                        <td className="p-3 font-black uppercase text-zinc-500">{l}</td>
+                  <tfoot className="border-t border-bm-line text-xs">
+                    {([['Σ Cajas', 'enCajas', 'text-bm-ink'], ['Sin ubicar', 'sinAsignar', 'text-bm-steel'], ['Bóveda', 'boveda', 'text-bm-red']] as const).map(([l, k, cls]) => (
+                      <tr key={k} className="border-t border-bm-line">
+                        <td className="p-3 font-semibold text-bm-steel">{l}</td>
                         {conciliacion.map(x => (
-                          <td key={x.m} className={`p-3 text-right font-black italic ${k === 'sinAsignar' && x.sinAsignar < -0.01 ? 'text-red-400' : cls}`}>{fmtMonto(x[k], x.m)}</td>
+                          <td key={x.m} className={`p-3 text-right font-semibold bm-num ${k === 'sinAsignar' && x.sinAsignar < -0.01 ? 'text-bm-red' : cls}`}>{fmtMonto(x[k], x.m)}</td>
                         ))}
                       </tr>
                     ))}
@@ -4791,14 +4828,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           )}
           {/* [NEW v16.3] diagnóstico RLS */}
           {cajas.length === 0 && diagRls && (
-            <div className="bg-black/40 border border-orange-500/20 rounded-2xl p-5 font-mono text-[9px] space-y-1.5">
-              <p className="text-orange-400 font-black uppercase tracking-widest text-[10px] mb-2">Diagnóstico de permisos</p>
-              <p className="text-zinc-400">Usuario autenticado: <span className="text-white">{diagRls.email}</span></p>
-              <p className="text-zinc-400 break-all">auth.uid(): <span className="text-white">{diagRls.uid}</span></p>
-              <p className="text-zinc-400">es_staff_finanzas(): <span className={diagRls.staff ? 'text-emerald-400' : 'text-red-400'}>{diagRls.error ? 'ERROR' : String(diagRls.staff)}</span></p>
-              <p className="text-zinc-400">Rol efectivo UI: <span className={canManageFinance ? 'text-emerald-400' : 'text-red-400'}>{rolUpper || 'SIN_RANGO'}</span> · fuente: <span className="text-white">{roleSource}</span></p>
-              {diagRls.error && <p className="text-red-400 break-words">{diagRls.error}</p>}
-              <p className="text-zinc-500 pt-2 border-t border-white/5">
+            <div className="bg-bm-canvas border border-bm-warn/25 rounded-2xl p-5 font-mono text-xs space-y-1.5">
+              <p className="text-bm-warn font-semibold text-[13px] mb-2">Diagnóstico de permisos</p>
+              <p className="text-bm-steel">Usuario autenticado: <span className="text-bm-ink">{diagRls.email}</span></p>
+              <p className="text-bm-steel break-all">auth.uid(): <span className="text-bm-ink">{diagRls.uid}</span></p>
+              <p className="text-bm-steel">es_staff_finanzas(): <span className={diagRls.staff ? 'text-bm-ok' : 'text-bm-red'}>{diagRls.error ? 'ERROR' : String(diagRls.staff)}</span></p>
+              <p className="text-bm-steel">Rol efectivo UI: <span className={canManageFinance ? 'text-bm-ok' : 'text-bm-red'}>{rolUpper || 'SIN_RANGO'}</span> · fuente: <span className="text-bm-ink">{roleSource}</span></p>
+              {diagRls.error && <p className="text-bm-red break-words">{diagRls.error}</p>}
+              <p className="text-bm-steel pt-2 border-t border-bm-line">
                 {diagRls.error
                   ? 'La función es_staff_finanzas() no existe en este proyecto: ejecute la migración de cajas + RLS.'
                   : diagRls.staff
@@ -4816,23 +4853,23 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               const Icon       = conf.esCajaEfectivo || conf.efectivoRol ? Banknote : esCustodia ? UserCheck : Coins;
               return (
                 <button key={caja.id} onClick={() => toggleCajaActiva(caja)}
-                  className={`${glass} rounded-2xl p-5 text-left border transition-all ${active ? 'border-[#E1AD01]/50 bg-[#E1AD01]/5' : esCustodia ? 'border-violet-500/20 hover:border-violet-500/40' : 'border-white/[0.07] hover:border-white/20'}`}>
+                  className={`${glass} rounded-2xl p-5 text-left border transition-all ${active ? 'border-bm-red/40 bg-bm-red-tint/40' : esCustodia ? 'border-[#6D28D9]/25 hover:border-[#6D28D9]/25' : 'border-bm-line hover:border-bm-field'}`}>
                   <div className="flex justify-between items-center mb-4">
-                    <div className={`w-8 h-8 rounded-xl flex items-center justify-center ${active ? 'bg-[#E1AD01] text-black' : esCustodia ? 'bg-violet-500/10 text-violet-400' : 'bg-white/5 text-zinc-600'}`}><Icon size={15} /></div>
+                    <div className={`w-8 h-8 rounded-xl flex items-center justify-center ${active ? 'bg-bm-red text-white' : esCustodia ? 'bg-[#F1ECFB] text-[#6D28D9]' : 'bg-bm-canvas text-bm-steel'}`}><Icon size={15} /></div>
                     <div className="flex gap-1 flex-wrap justify-end">
                       {conf.monedasPermitidas.length === 1 && <Badge tone={`${MONEDA_BG[conf.monedasPermitidas[0]]} ${MONEDA_COLOR[conf.monedasPermitidas[0]]}`}>{conf.monedasPermitidas[0]} ONLY</Badge>}
                       {esCustodia && <Badge tone={TONE.fin}>CUSTODIA {conf.prestamista ?? 'TERCERO'}</Badge>}
                       {conf.efectivoRol && <Badge tone={conf.efectivoRol === 'CEO' ? TONE.yellow : TONE.blue}>{conf.efectivoRol === 'CEO' ? 'CUSTODIA CEO' : 'STAND-BY ADM'}</Badge>}
-                      {active && <span className="text-[7px] text-[#E1AD01] font-black uppercase tracking-widest">Activa</span>}
+                      {active && <span className="text-[11px] text-bm-red font-semibold">Activa</span>}
                     </div>
                   </div>
-                  <p className="text-[10px] text-zinc-400 font-black uppercase tracking-widest mb-3">{caja.nombre}</p>
+                  <p className="text-[13px] text-bm-steel font-semibold mb-3">{caja.nombre}</p>
                   {conf.esCajaEfectivo ? (
                     <div className="space-y-1.5">
-                      {([['ADM', saldoEfectivoADM, 'text-blue-400', 'bg-blue-400'], ['CEO', saldoEfectivoCEO, 'text-yellow-400', 'bg-yellow-400']] as const).map(([sc, s, tc, dot]) => (
+                      {([['ADM', saldoEfectivoADM, 'text-[#2F5BB7]', 'bg-[#2F5BB7]'], ['CEO', saldoEfectivoCEO, 'text-[#8A6100]', 'bg-[#C99700]']] as const).map(([sc, s, tc, dot]) => (
                         <div key={sc} className="flex justify-between items-center">
-                          <span className={`text-[8px] ${tc} font-black uppercase flex items-center gap-1`}><div className={`w-1.5 h-1.5 rounded-full ${dot}`} /> {sc}</span>
-                          <span className={`text-[9px] font-black italic ${s >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>{fmtMonto(s, 'CASH')}</span>
+                          <span className={`text-xs ${tc} font-semibold flex items-center gap-1`}><div className={`w-1.5 h-1.5 rounded-full ${dot}`} /> {sc}</span>
+                          <span className={`text-xs font-semibold bm-num ${s >= 0 ? 'text-[#8A6100]' : 'text-bm-red'}`}>{fmtMonto(s, 'CASH')}</span>
                         </div>
                       ))}
                     </div>
@@ -4840,12 +4877,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     <div className="space-y-1.5">
                       {monedas.map(({ m, s }) => (
                         <div key={m} className="flex justify-between items-center">
-                          <span className={`text-[8px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
-                          <span className={`text-[10px] font-black italic ${s >= 0 ? MONEDA_COLOR[m] : 'text-red-400'}`}>{fmtMonto(s, m)}</span>
+                          <span className={`text-xs font-semibold ${MONEDA_COLOR[m]}`}>{m}</span>
+                          <span className={`text-[13px] font-semibold bm-num ${s >= 0 ? MONEDA_COLOR[m] : 'text-bm-red'}`}>{fmtMonto(s, m)}</span>
                         </div>
                       ))}
                     </div>
-                  ) : <p className="text-[9px] text-zinc-700 font-mono italic">Sin movimientos</p>}
+                  ) : <p className="text-xs text-bm-hint font-mono bm-num">Sin movimientos</p>}
                 </button>
               );
             })}
@@ -4858,38 +4895,38 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             const movs = movCajas.filter(m => m.caja_id === cajaActiva);
             return (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-                <div className={`lg:col-span-4 ${glass} rounded-3xl p-7 border-t-2 border-t-[#E1AD01]`}>
-                  <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic">Caja: <span className="text-[#E1AD01]">{caja.nombre}</span></h3>
+                <div className={`lg:col-span-4 ${glass} rounded-3xl p-7 border-t-2 border-t-bm-red`}>
+                  <h3 className="text-[13px] font-semibold mb-6 bm-num">Caja: <span className="text-bm-red">{caja.nombre}</span></h3>
                   <form onSubmit={handleMovCaja} className="space-y-4">
-                    <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10">
+                    <div className="flex bg-white rounded-2xl p-1 border border-bm-line">
                       {(['ENTRADA', 'SALIDA'] as const).map(tipo => (
                         <button key={tipo} type="button" onClick={() => setMovForm(p => ({ ...p, tipo }))}
-                          className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${movForm.tipo === tipo ? (tipo === 'ENTRADA' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30') : 'text-zinc-600 hover:text-zinc-400'}`}>
+                          className={`flex-1 py-3 rounded-xl text-[13px] font-semibold transition-all ${movForm.tipo === tipo ? (tipo === 'ENTRADA' ? 'bg-bm-ok-tint text-bm-ok border border-bm-ok/25' : 'bg-bm-red-tint text-bm-red border border-bm-red/25') : 'text-bm-steel hover:text-bm-ink'}`}>
                           {tipo === 'ENTRADA' ? '+ Entrada' : '- Salida'}
                         </button>
                       ))}
                     </div>
                     <div>
-                      <Lbl cls="text-zinc-600">Qué es este movimiento</Lbl>
+                      <Lbl cls="text-bm-steel">Qué es este movimiento</Lbl>
                       <div className="grid grid-cols-2 gap-1.5">
                         {([
                           { k: 'OPERATIVO', t: movForm.tipo === 'ENTRADA' ? 'Ingreso real' : 'Gasto real', h: 'Afecta bóveda y caja' },
                           { k: 'UBICACION', t: 'Ubicar saldo', h: 'Solo custodia, bóveda igual' },
                         ] as { k: ClaseMovCaja; t: string; h: string }[]).map(o => (
                           <button key={o.k} type="button" onClick={() => setMovForm(p => ({ ...p, clase: o.k }))}
-                            className={`py-2.5 px-3 rounded-xl text-left border transition-all ${movForm.clase === o.k ? 'bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`}>
-                            <p className="text-[9px] font-black uppercase">{o.t}</p>
-                            <p className="text-[7px] opacity-70 normal-case mt-0.5">{o.h}</p>
+                            className={`py-2.5 px-3 rounded-xl text-left border transition-all ${movForm.clase === o.k ? 'bg-bm-red-tint text-bm-red border-bm-red/25' : optOff}`}>
+                            <p className="text-xs font-semibold">{o.t}</p>
+                            <p className="text-[11px] opacity-70 normal-case mt-0.5">{o.h}</p>
                           </button>
                         ))}
                       </div>
                     </div>
                     {conf.esCajaEfectivo && (
-                      <div><Lbl cls="text-zinc-600">Registrar en</Lbl><SubcajaToggle value={movForm.subcaja} onChange={sc => setMovForm(p => ({ ...p, subcaja: sc }))} /></div>
+                      <div><Lbl cls="text-bm-steel">Registrar en</Lbl><SubcajaToggle value={movForm.subcaja} onChange={sc => setMovForm(p => ({ ...p, subcaja: sc }))} /></div>
                     )}
-                    <div><Lbl cls="text-zinc-600">Moneda</Lbl><MonedaPicker value={movForm.moneda} options={conf.monedasPermitidas} onChange={m => setMovForm(p => ({ ...p, moneda: m }))} /></div>
+                    <div><Lbl cls="text-bm-steel">Moneda</Lbl><MonedaPicker value={movForm.moneda} options={conf.monedasPermitidas} onChange={m => setMovForm(p => ({ ...p, moneda: m }))} /></div>
                     <input type="date" required value={movForm.fecha} onChange={e => setMovForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} disabled={savingCaja} />
-                    <AmountInput size="xl" value={movForm.monto} moneda={movForm.moneda} prefixCls="text-[#E1AD01]" disabled={savingCaja} onChange={v => setMovForm(p => ({ ...p, monto: v }))} />
+                    <AmountInput size="xl" value={movForm.monto} moneda={movForm.moneda} prefixCls="text-bm-red" disabled={savingCaja} onChange={v => setMovForm(p => ({ ...p, monto: v }))} />
                     <input value={movForm.concepto} onChange={e => setMovForm(p => ({ ...p, concepto: e.target.value }))} placeholder="CONCEPTO *" className={inp} disabled={savingCaja} />
                     {movForm.clase === 'OPERATIVO' && movForm.tipo === 'ENTRADA'
                       ? <PagadorFields value={movPago} onChange={setMovPago} moneda={movForm.moneda} alumnos={alumnos} />
@@ -4901,22 +4938,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     )}
                     <ErrorBanner msg={cajaError} onClose={() => setCajaError(null)} />
                     <button type="submit" disabled={savingCaja}
-                      className={`w-full py-5 rounded-2xl font-black uppercase text-[10px] tracking-widest transition-all flex items-center justify-center gap-2 disabled:opacity-40 ${movForm.tipo === 'ENTRADA' ? 'bg-emerald-500 text-black hover:bg-emerald-400' : 'bg-red-500 text-white hover:bg-red-400'}`}>
+                      className={`w-full py-5 rounded-2xl font-semibold text-[13px] transition-all flex items-center justify-center gap-2 disabled:opacity-40 ${movForm.tipo === 'ENTRADA' ? 'bg-bm-ok text-white hover:bg-[#13643F]' : 'bg-bm-red text-white hover:bg-bm-red-deep'}`}>
                       {savingCaja ? <Loader2 className="animate-spin h-4 w-4" /> : movForm.tipo === 'ENTRADA' ? '+ Registrar Entrada' : '- Registrar Salida'}
                     </button>
                   </form>
                 </div>
 
                 <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
-                  <div className="p-6 border-b border-white/5">
+                  <div className="p-6 border-b border-bm-line">
                     <div className="flex justify-between items-center mb-3">
-                      <h3 className="text-[10px] font-black uppercase tracking-widest italic">Historial · {caja.nombre}</h3>
+                      <h3 className="text-[13px] font-semibold bm-num">Historial · {caja.nombre}</h3>
                       <div className="flex gap-2">
-                        <button onClick={() => handleExportCajaIndividual(caja.id)} className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/20 text-[8px] font-black uppercase hover:bg-emerald-500/20 transition-all flex items-center gap-1.5">
+                        <button onClick={() => handleExportCajaIndividual(caja.id)} className="bg-bm-ok-tint text-bm-ok px-3 py-1.5 rounded-lg border border-bm-ok/25 text-xs font-semibold hover:bg-bm-ok-tint transition-all flex items-center gap-1.5">
                           <Download size={10} /> Exportar
                         </button>
                         {/* [NEW v17] */}
-                        <button onClick={() => imprimirMovimientosCaja(caja.id, '2000-01-01', hoyISO())} className="bg-[#E1AD01]/10 text-[#E1AD01] px-3 py-1.5 rounded-lg border border-[#E1AD01]/20 text-[8px] font-black uppercase hover:bg-[#E1AD01]/20 transition-all flex items-center gap-1.5">
+                        <button onClick={() => imprimirMovimientosCaja(caja.id, '2000-01-01', hoyISO())} className="bg-bm-red-tint text-bm-red px-3 py-1.5 rounded-lg border border-bm-red/25 text-xs font-semibold hover:bg-bm-red-tint transition-all flex items-center gap-1.5">
                           <Printer size={10} /> Imprimir
                         </button>
                       </div>
@@ -4926,8 +4963,8 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                         const s = getCajaBalance(caja.id, m);
                         return (
                           <div key={m} className={`px-3 py-1.5 rounded-xl border ${MONEDA_BG[m]} flex items-center gap-2`}>
-                            <span className={`text-[8px] font-black uppercase ${MONEDA_COLOR[m]}`}>{m}</span>
-                            <span className={`text-[10px] font-black italic ${s >= 0 ? MONEDA_COLOR[m] : 'text-red-400'}`}>{fmtMonto(s, m)}</span>
+                            <span className={`text-xs font-semibold ${MONEDA_COLOR[m]}`}>{m}</span>
+                            <span className={`text-[13px] font-semibold bm-num ${s >= 0 ? MONEDA_COLOR[m] : 'text-bm-red'}`}>{fmtMonto(s, m)}</span>
                           </div>
                         );
                       })}
@@ -4941,9 +4978,9 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                         : `← ${cajaNombre(fxRec.caja_origen_id)} · ${fmtMonto(fxRec.monto_origen, fxRec.moneda_origen)} @ ${fxRec.tasa}`) : null;
                       const accionPar = m.fx_id ?? m.asiento_id ?? null;
                       const busy      = savingAction === m.id || (!!accionPar && savingAction === accionPar);
-                      const border    = m.transfer_id ? 'border-purple-500/20' : m.es_prestamo ? 'border-violet-500/20' : m.fx_id ? 'border-teal-500/20' : m.asiento_id ? 'border-[#E1AD01]/15' : 'border-white/[0.05]';
+                      const border    = m.transfer_id ? 'border-[#6D28D9]/25' : m.es_prestamo ? 'border-[#6D28D9]/25' : m.fx_id ? 'border-[#0F766E]/25' : m.asiento_id ? 'border-bm-red/25' : 'border-bm-line';
                       return (
-                        <div key={m.id} className={`bg-white/[0.02] border p-4 rounded-2xl flex justify-between items-center group ${border}`}>
+                        <div key={m.id} className={`bg-bm-canvas/60 border p-4 rounded-2xl flex justify-between items-center group ${border}`}>
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                               <Badge tone={`${MONEDA_BG[m.moneda]} ${MONEDA_COLOR[m.moneda]}`}>{m.moneda}</Badge>
@@ -4952,22 +4989,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                               {m.es_prestamo && <Badge tone={TONE.fin}><HandCoins size={8} /> {m.prestamista}</Badge>}
                               {m.fx_id && <Badge tone={TONE.fx}><TrendingUp size={8} /> FX</Badge>}
                               {m.asiento_id && <Badge tone={TONE.asiento}><Link2 size={8} /> Asiento</Badge>}
-                              <p className="text-[10px] font-black uppercase truncate">{m.concepto || '—'}</p>
+                              <p className="text-[13px] font-semibold truncate">{m.concepto || '—'}</p>
                             </div>
-                            <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(m.fecha)}{m.referencia ? ` · ${m.referencia}` : ''}</p>
-                            {fxPeer && <p className="text-[8px] text-teal-400/70 font-mono mt-0.5">{fxPeer}</p>}
+                            <p className="text-xs text-bm-steel font-mono">{fmtDate(m.fecha)}{m.referencia ? ` · ${m.referencia}` : ''}</p>
+                            {fxPeer && <p className="text-xs text-[#0F766E] font-mono mt-0.5">{fxPeer}</p>}
                             {m.asiento_id && pagoPorAsiento.get(m.asiento_id) && (
-                              <p className="text-[8px] text-[#E1AD01]/80 font-mono mt-0.5 truncate">{lineaPago(pagoPorAsiento.get(m.asiento_id) as PagoTraza)}</p>
+                              <p className="text-xs text-bm-red font-mono mt-0.5 truncate">{lineaPago(pagoPorAsiento.get(m.asiento_id) as PagoTraza)}</p>
                             )}
                           </div>
                           <div className="flex items-center gap-3 ml-3">
-                            <span className={`font-black text-base italic ${m.tipo === 'ENTRADA' ? 'text-emerald-400' : 'text-red-400'}`}>{m.tipo === 'ENTRADA' ? '+' : '-'}{fmtMonto(m.monto, m.moneda)}</span>
+                            <span className={`text-base bm-figure ${m.tipo === 'ENTRADA' ? 'text-bm-ok' : 'text-bm-red'}`}>{m.tipo === 'ENTRADA' ? '+' : '-'}{fmtMonto(m.monto, m.moneda)}</span>
                             {!m.transfer_id && !accionPar && (
-                              <button onClick={() => openEditMov(m)} className={`${btnIcon} hover:text-[#E1AD01] hover:bg-[#E1AD01]/10`}><Pencil size={13} /></button>
+                              <button onClick={() => openEditMov(m)} className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}><Pencil size={13} /></button>
                             )}
                             <button onClick={() => deleteMovProtected(m.id)} disabled={busy}
                               title={m.fx_id ? 'Anular FX completo' : m.asiento_id ? 'Anular asiento completo' : 'Eliminar'}
-                              className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+                              className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}>
                               {busy ? <Loader2 size={13} className="animate-spin" /> : accionPar ? <Ban size={13} /> : <Trash2 size={13} />}
                             </button>
                           </div>
@@ -4993,25 +5030,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         return (
           <div className="space-y-6">
             <div className="flex justify-end">
-              <button onClick={() => setShowCuentaForm(!showCuentaForm)} className="bg-[#E1AD01] text-black px-6 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-white transition-all flex items-center gap-2">
+              <button onClick={() => setShowCuentaForm(!showCuentaForm)} className="bg-bm-red text-white px-6 py-3 rounded-xl font-semibold text-[13px] hover:bg-bm-red-deep transition-all flex items-center gap-2">
                 <PlusCircle size={14} /> Nuevo Registro
               </button>
             </div>
 
             {showCuentaForm && (
-              <div className={`${glass} rounded-3xl p-7 border-t-2 border-t-[#E1AD01] animate-in slide-in-from-top-4 duration-300`}>
-                <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic flex items-center gap-2"><ReceiptText className="text-[#E1AD01] h-4 w-4" /> Registrar</h3>
+              <div className={`${glass} rounded-3xl p-7 border-t-2 border-t-bm-red animate-in slide-in-from-top-4 duration-300`}>
+                <h3 className="text-[13px] font-semibold mb-6 flex items-center gap-2 bm-num"><ReceiptText className="text-bm-red h-4 w-4" /> Registrar</h3>
                 <form onSubmit={handleCuenta} className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div className="md:col-span-3 flex bg-black/50 rounded-2xl p-1 border border-white/10 gap-1">
+                  <div className="md:col-span-3 flex bg-white rounded-2xl p-1 border border-bm-line gap-1">
                     {([
-                      { key: 'HORAS_PAGADAS', label: '✓ Horas Pagadas',     hint: 'Alumno pagó ahora — entra a caja y acredita horas', on: 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' },
-                      { key: 'CXC',           label: '⏳ Cuenta por Cobrar', hint: 'Alumno debe — se cobra luego (abonos parciales)',   on: 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30' },
-                      { key: 'CXP',           label: '↙ Cuenta por Pagar',  hint: 'Proveedor / gasto externo',                         on: 'bg-red-500/20 text-red-400 border border-red-500/30' },
+                      { key: 'HORAS_PAGADAS', label: '✓ Horas Pagadas',     hint: 'Alumno pagó ahora — entra a caja y acredita horas', on: 'bg-bm-ok-tint text-bm-ok border border-bm-ok/25' },
+                      { key: 'CXC',           label: '⏳ Cuenta por Cobrar', hint: 'Alumno debe — se cobra luego (abonos parciales)',   on: 'bg-[#FDF3D8] text-[#8A6100] border border-[#8A6100]/25' },
+                      { key: 'CXP',           label: '↙ Cuenta por Pagar',  hint: 'Proveedor / gasto externo',                         on: 'bg-bm-red-tint text-bm-red border border-bm-red/25' },
                     ] as { key: FormTipo; label: string; hint: string; on: string }[]).map(({ key, label, hint, on }) => (
                       <button key={key} type="button" onClick={() => setCuentaForm(p => ({ ...p, tipo: key }))}
-                        className={`flex-1 py-3 px-4 rounded-xl transition-all text-left ${cuentaForm.tipo === key ? on : 'text-zinc-600 hover:text-zinc-400'}`}>
-                        <p className="text-[10px] font-black uppercase">{label}</p>
-                        <p className="text-[8px] opacity-60 mt-0.5 normal-case font-normal">{hint}</p>
+                        className={`flex-1 py-3 px-4 rounded-xl transition-all text-left ${cuentaForm.tipo === key ? on : 'text-bm-steel hover:text-bm-ink'}`}>
+                        <p className="text-[13px] font-semibold">{label}</p>
+                        <p className="text-xs opacity-60 mt-0.5 normal-case font-normal">{hint}</p>
                       </button>
                     ))}
                   </div>
@@ -5038,7 +5075,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                       <div className="flex gap-2 flex-wrap">
                         {['USD', 'USDT', 'ZELLE', 'CASH', 'BS'].map(mp => (
                           <button key={mp} type="button" onClick={() => setCuentaForm(p => ({ ...p, moneda_pago: mp, caja_id: ajustarCaja(p.caja_id, normalizePaymentMethod(mp)) }))}
-                            className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase border transition-all ${cuentaForm.moneda_pago === mp ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : 'bg-white/[0.02] border-white/10 text-zinc-600 hover:text-zinc-400'}`}>{mp}</button>
+                            className={`px-4 py-2 rounded-xl text-xs font-semibold border transition-all ${cuentaForm.moneda_pago === mp ? 'bg-bm-red-tint text-bm-red border-bm-red/25' : 'bg-bm-canvas/60 border-bm-line text-bm-steel hover:text-bm-ink'}`}>{mp}</button>
                         ))}
                       </div>
                     </div>
@@ -5061,10 +5098,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                       {cajaHorasEf && <SubcajaToggle className="md:col-span-3" value={cuentaForm.subcaja} onChange={sc => setCuentaForm(p => ({ ...p, subcaja: sc }))} />}
                       <PagadorFields className="md:col-span-3" value={cuentaPago} onChange={setCuentaPago} moneda={mpForm} alumnos={alumnos} />
                       {recibidoHrs !== null && (
-                        <div className="md:col-span-3 bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-3 gap-2 text-[9px] font-mono">
-                          <p className="text-emerald-400">+ {fmtMonto(recibidoHrs, mpForm)} · Bóveda {mpForm}</p>
-                          <p className={cajaHoras ? 'text-emerald-400' : 'text-zinc-600'}>{cajaHoras ? `+ ${fmtMonto(recibidoHrs, mpForm)} · Caja ${cajaHoras.nombre}${cajaHorasEf ? ` (${cuentaForm.subcaja})` : ''}` : 'Sin caja: saldo sin ubicar'}</p>
-                          <p className="text-[#E1AD01]">+ {parseFloat(cuentaForm.horas_prometidas) || 0}h al perfil del alumno</p>
+                        <div className="md:col-span-3 bg-bm-ok-tint/60 border border-bm-ok/25 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-3 gap-2 text-xs font-mono">
+                          <p className="text-bm-ok">+ {fmtMonto(recibidoHrs, mpForm)} · Bóveda {mpForm}</p>
+                          <p className={cajaHoras ? 'text-bm-ok' : 'text-bm-steel'}>{cajaHoras ? `+ ${fmtMonto(recibidoHrs, mpForm)} · Caja ${cajaHoras.nombre}${cajaHorasEf ? ` (${cuentaForm.subcaja})` : ''}` : 'Sin caja: saldo sin ubicar'}</p>
+                          <p className="text-bm-red">+ {parseFloat(cuentaForm.horas_prometidas) || 0}h al perfil del alumno</p>
                         </div>
                       )}
                     </>)}
@@ -5093,7 +5130,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     <input type="date" required value={cuentaForm.fecha_emision} onChange={e => setCuentaForm(p => ({ ...p, fecha_emision: e.target.value }))} className={inp} style={noUpper} />
                     <input type="date" value={cuentaForm.fecha_vencimiento} onChange={e => setCuentaForm(p => ({ ...p, fecha_vencimiento: e.target.value }))} className={inp} style={noUpper} />
                     <input value={cuentaForm.notas} onChange={e => setCuentaForm(p => ({ ...p, notas: e.target.value }))} placeholder="NOTAS (opcional)" className={inp} />
-                    <p className="md:col-span-3 text-[8px] text-zinc-600 font-mono">Los préstamos de Barquisimeto/Roberto se registran en Cajas → Préstamo Externo (crean su CxP y la entrada de dinero en un solo asiento).</p>
+                    <p className="md:col-span-3 text-xs text-bm-steel font-mono">Los préstamos de Barquisimeto/Roberto se registran en Cajas → Préstamo Externo (crean su CxP y la entrada de dinero en un solo asiento).</p>
                     {/* [NEW v17] clase de la factura: el pago la hereda y el P&L devengado la usa */}
                     {v17Instalado && (
                       <ClaseFields className="md:col-span-3" value={cuentaClase} onChange={setCuentaClase} flota={flota} pilotos={pilotosLista}
@@ -5103,10 +5140,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
                   <div className="md:col-span-3"><ErrorBanner msg={cuentaError} onClose={() => setCuentaError(null)} /></div>
                   <div className="md:col-span-3 flex gap-3">
-                    <button type="submit" disabled={savingCuenta} className="flex-1 py-4 bg-[#E1AD01] text-black rounded-2xl font-black uppercase text-[10px] tracking-widest hover:bg-white transition-all flex items-center justify-center gap-2 disabled:opacity-40">
+                    <button type="submit" disabled={savingCuenta} className="flex-1 py-4 bg-bm-red text-white rounded-2xl font-semibold text-[13px] hover:bg-bm-red-deep transition-all flex items-center justify-center gap-2 disabled:opacity-40">
                       {savingCuenta ? <Loader2 className="animate-spin h-4 w-4" /> : <><ShieldCheck size={14} /> Sellar</>}
                     </button>
-                    <button type="button" onClick={() => { setShowCuentaForm(false); setCuentaError(null); }} className="px-6 py-4 border border-white/10 rounded-2xl text-zinc-500 text-[10px] font-black uppercase hover:bg-white/5 transition-all">Cancelar</button>
+                    <button type="button" onClick={() => { setShowCuentaForm(false); setCuentaError(null); }} className="px-6 py-4 border border-bm-line rounded-2xl text-bm-steel text-[13px] font-semibold hover:bg-bm-canvas transition-all">Cancelar</button>
                   </div>
                 </form>
               </div>
@@ -5116,29 +5153,29 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
             {/* POSICIÓN CON TERCEROS */}
             {posicionTerceros.some(pt => pt.filas.length > 0 || pt.cajasP.length > 0) && (
-              <div className={`${glass} rounded-3xl p-6 border border-violet-500/15`}>
-                <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2 mb-1"><Users className="text-violet-400 h-4 w-4" /> Posición con terceros</h3>
-                <p className="text-[8px] text-zinc-600 font-mono mb-4">Custodia = dinero de Águilas que el tercero tiene (su caja). Deuda = préstamos pendientes con él. Neto positivo: el tercero debe entregar; negativo: Águilas le debe.</p>
+              <div className={`${glass} rounded-3xl p-6 border border-[#6D28D9]/25`}>
+                <h3 className="text-[13px] font-semibold flex items-center gap-2 mb-1 bm-num"><Users className="text-[#6D28D9] h-4 w-4" /> Posición con terceros</h3>
+                <p className="text-xs text-bm-steel font-mono mb-4">Custodia = dinero de {EMPRESA_CORTA} que el tercero tiene (su caja). Deuda = préstamos pendientes con él. Neto positivo: el tercero debe entregar; negativo: {EMPRESA_CORTA} le debe.</p>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {posicionTerceros.map(({ p, cajasP, filas }) => (
-                    <div key={p} className="bg-black/30 rounded-2xl border border-violet-500/10 p-4">
+                    <div key={p} className="bg-bm-canvas rounded-2xl border border-[#6D28D9]/25 p-4">
                       <div className="flex justify-between items-center mb-3">
-                        <p className="text-[10px] font-black uppercase text-violet-400">{p}</p>
-                        <p className="text-[8px] text-zinc-600 font-mono">{cajasP.length ? cajasP.map(c => c.nombre).join(' · ') : 'Sin caja de custodia'}</p>
+                        <p className="text-[13px] font-semibold text-[#6D28D9]">{p}</p>
+                        <p className="text-xs text-bm-steel font-mono">{cajasP.length ? cajasP.map(c => c.nombre).join(' · ') : 'Sin caja de custodia'}</p>
                       </div>
-                      {filas.length === 0 && <p className="text-[9px] text-zinc-700 font-mono italic">Sin custodia ni deuda</p>}
+                      {filas.length === 0 && <p className="text-xs text-bm-hint font-mono bm-num">Sin custodia ni deuda</p>}
                       <div className="space-y-2">
                         {filas.map(f => (
                           <div key={f.m} className={`rounded-xl border p-3 ${MONEDA_BG[f.m]}`}>
                             <div className="grid grid-cols-4 gap-2 items-center text-center">
-                              <span className={`text-[9px] font-black uppercase text-left ${MONEDA_COLOR[f.m]}`}>{f.m}</span>
-                              {([['Custodia', f.custodia, ''], ['Deuda', f.deuda, 'text-orange-400'], ['Neto', f.neto, f.neto >= 0 ? 'text-emerald-400' : 'text-red-400']] as const).map(([l, v, c]) => (
-                                <div key={l}><p className="text-[7px] text-zinc-600 font-black uppercase">{l}</p><p className={`text-[10px] font-black italic ${c}`}>{fmtMonto(v, f.m)}</p></div>
+                              <span className={`text-xs font-semibold text-left ${MONEDA_COLOR[f.m]}`}>{f.m}</span>
+                              {([['Custodia', f.custodia, ''], ['Deuda', f.deuda, 'text-bm-warn'], ['Neto', f.neto, f.neto >= 0 ? 'text-bm-ok' : 'text-bm-red']] as const).map(([l, v, c]) => (
+                                <div key={l}><p className="text-[11px] text-bm-steel font-semibold">{l}</p><p className={`text-[13px] font-semibold bm-num ${c}`}>{fmtMonto(v, f.m)}</p></div>
                               ))}
                             </div>
                             {f.custodia > 0.01 && f.deuda > 0.01 && f.cajaMayor && (
                               <button type="button" onClick={() => openCompensacion(p, f.m, Math.min(f.custodia, f.deuda), f.cajaMayor)}
-                                className="mt-2 w-full py-2 rounded-lg bg-violet-500/10 text-violet-400 border border-violet-500/20 text-[8px] font-black uppercase hover:bg-violet-500/20 transition-all flex items-center justify-center gap-1">
+                                className="mt-2 w-full py-2 rounded-lg bg-[#F1ECFB] text-[#6D28D9] border border-[#6D28D9]/25 text-xs font-semibold hover:bg-[#E7DFF8] transition-all flex items-center justify-center gap-1">
                                 <Repeat size={10} /> Aplicar custodia a la deuda ({fmtMonto(Math.min(f.custodia, f.deuda), f.m)})
                               </button>
                             )}
@@ -5154,10 +5191,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-4 gap-6">
               {/* CxC Pendientes / Parciales */}
               <div className={`${glass} rounded-3xl overflow-hidden`}>
-                <div className="p-5 border-b border-white/5 bg-yellow-500/5">
-                  <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
-                    <ArrowUpCircle className="text-yellow-400 h-4 w-4" /> Por Cobrar
-                    <span className="ml-auto font-mono text-yellow-400 text-[9px]">${fmtNum(totalCxC)}</span>
+                <div className="p-5 border-b border-bm-line bg-[#FDF3D8]/60">
+                  <h3 className="text-[13px] font-semibold flex items-center gap-2 bm-num">
+                    <ArrowUpCircle className="text-[#8A6100] h-4 w-4" /> Por Cobrar
+                    <span className="ml-auto font-mono text-[#8A6100] text-xs">${fmtNum(totalCxC)}</span>
                   </h3>
                 </div>
                 <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
@@ -5165,35 +5202,35 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     const mon = normalizePaymentMethod(c.moneda);
                     const nAb = abonos.filter(a => a.cuenta_tipo === 'CXC' && a.cuenta_id === String(c.id)).length;
                     return (
-                      <div key={c.id} className="bg-white/[0.02] border border-yellow-500/10 rounded-2xl p-4 group hover:bg-white/[0.04] transition-all">
+                      <div key={c.id} className="bg-bm-canvas/60 border border-[#8A6100]/25 rounded-2xl p-4 group hover:bg-bm-canvas transition-all">
                         <div className="flex justify-between items-start mb-2">
                           <div className="flex-1 min-w-0">
-                            <p className="text-[10px] font-black uppercase truncate">{c.nombre_alumno}</p>
-                            <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
-                            <p className="text-[8px] text-yellow-400/70 font-mono mt-0.5">{c.horas_compradas > 0 ? `${c.horas_compradas}/${c.horas_prometidas}h acreditadas` : `${c.horas_prometidas}h`} · {c.moneda || 'USD'}</p>
-                            {c.estatus === 'PARCIAL' && <p className="text-[8px] text-emerald-400/80 font-mono mt-0.5">Pagado {fmtMonto(c.monto_pagado, mon)} · {nAb} abono{nAb === 1 ? '' : 's'}</p>}
+                            <p className="text-[13px] font-semibold truncate">{c.nombre_alumno}</p>
+                            <p className="text-xs text-bm-steel font-mono truncate">{c.concepto}</p>
+                            <p className="text-xs text-[#8A6100] font-mono mt-0.5">{c.horas_compradas > 0 ? `${c.horas_compradas}/${c.horas_prometidas}h acreditadas` : `${c.horas_prometidas}h`} · {c.moneda || 'USD'}</p>
+                            {c.estatus === 'PARCIAL' && <p className="text-xs text-bm-ok font-mono mt-0.5">Pagado {fmtMonto(c.monto_pagado, mon)} · {nAb} abono{nAb === 1 ? '' : 's'}</p>}
                             {/* [NEW v17] deuda generada por consumo sin fondos */}
-                            {consumoPorCxc.has(String(c.id)) && <p className="text-[8px] text-teal-400 font-mono mt-0.5 flex items-center gap-1"><Wallet size={9} /> Consumo sin fondos · billetera</p>}
+                            {consumoPorCxc.has(String(c.id)) && <p className="text-xs text-[#0F766E] font-mono mt-0.5 flex items-center gap-1"><Wallet size={9} /> Consumo sin fondos · billetera</p>}
                           </div>
                           <div className="text-right ml-2">
-                            <p className="font-black italic text-sm text-yellow-400">{fmtMonto(c.monto_pendiente, mon)}</p>
-                            {c.estatus === 'PARCIAL' && <span className="text-[7px] font-black uppercase px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400">Parcial</span>}
+                            <p className="font-semibold text-sm text-[#8A6100] bm-num">{fmtMonto(c.monto_pendiente, mon)}</p>
+                            {c.estatus === 'PARCIAL' && <span className="text-[11px] font-semibold uppercase px-2 py-0.5 rounded-full bg-bm-ok-tint text-bm-ok">Parcial</span>}
                           </div>
                         </div>
                         <div className="flex gap-2 mt-3">
                           <button onClick={() => handlePagarCuenta(c.id, true)} disabled={savingAction === c.id}
-                            className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
+                            className="flex-1 py-2 bg-bm-ok-tint text-bm-ok rounded-xl text-xs font-semibold border border-bm-ok/25 hover:bg-bm-ok-tint transition-all flex items-center justify-center gap-1 disabled:opacity-30">
                             {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><CheckCircle2 size={11} /> Cobrar</>}
                           </button>
                           {/* [NEW v17] aplicar saldo de billetera (sin mover caja) */}
                           {(saldoWallet.get(c.student_id) ?? 0) > 0 && c.horas_prometidas === 0 && mon !== 'BS' && (
                             <button onClick={() => aplicarBilleteraADeuda(c.student_id, String(c.id))} disabled={savingAction === c.id}
                               title={`Saldo billetera: ${usd(saldoWallet.get(c.student_id) ?? 0)}`}
-                              className="px-3 py-2 bg-teal-500/10 text-teal-400 rounded-xl border border-teal-500/20 hover:bg-teal-500/20 transition-all disabled:opacity-30 text-[8px] font-black uppercase flex items-center gap-1">
+                              className="px-3 py-2 bg-[#E6F4F2] text-[#0F766E] rounded-xl border border-[#0F766E]/25 hover:bg-[#D5ECE9] transition-all disabled:opacity-30 text-xs font-semibold flex items-center gap-1">
                               <Wallet size={11} /> Billetera
                             </button>
                           )}
-                          <button onClick={() => deleteCuentaProtected(c.id, true)} disabled={savingAction === c.id} className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
+                          <button onClick={() => deleteCuentaProtected(c.id, true)} disabled={savingAction === c.id} className="px-3 py-2 bg-bm-red-tint text-bm-red rounded-xl border border-bm-red/25 hover:bg-bm-red-tint transition-all disabled:opacity-30">
                             <Trash2 size={12} />
                           </button>
                         </div>
@@ -5206,35 +5243,35 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
               {/* Horas Pagadas */}
               <div className={`${glass} rounded-3xl overflow-hidden`}>
-                <div className="p-5 border-b border-white/5 bg-emerald-500/5">
-                  <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
-                    <Plane className="text-emerald-400 h-4 w-4" /> Horas Pagadas
-                    <span className="ml-auto font-mono text-emerald-400 text-[9px]">{totalHorasAcred.toFixed(1)}h</span>
+                <div className="p-5 border-b border-bm-line bg-bm-ok-tint/60">
+                  <h3 className="text-[13px] font-semibold flex items-center gap-2 bm-num">
+                    <Plane className="text-bm-ok h-4 w-4" /> Horas Pagadas
+                    <span className="ml-auto font-mono text-bm-ok text-xs">{totalHorasAcred.toFixed(1)}h</span>
                   </h3>
                 </div>
                 <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
                   {horasPagadas.map(c => (
-                    <div key={c.id} className="bg-white/[0.02] border border-emerald-500/10 rounded-2xl p-4 group transition-all hover:bg-white/[0.04]">
+                    <div key={c.id} className="bg-bm-canvas/60 border border-bm-ok/25 rounded-2xl p-4 group transition-all hover:bg-bm-canvas">
                       <div className="flex justify-between items-start">
                         <div className="flex-1 min-w-0">
-                          <p className="text-[10px] font-black uppercase truncate">{c.nombre_alumno}</p>
-                          <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
-                          <p className="text-[8px] text-emerald-400 font-mono mt-0.5 flex items-center gap-1">
+                          <p className="text-[13px] font-semibold truncate">{c.nombre_alumno}</p>
+                          <p className="text-xs text-bm-steel font-mono truncate">{c.concepto}</p>
+                          <p className="text-xs text-bm-ok font-mono mt-0.5 flex items-center gap-1">
                             <CheckCircle2 size={9} /> {c.horas_compradas}h
                             {c.asiento_origen_id || abonos.some(a => a.cuenta_tipo === 'CXC' && a.cuenta_id === String(c.id))
-                              ? <span className="text-[#E1AD01] ml-1 flex items-center gap-0.5"><Link2 size={8} /> asiento</span>
-                              : <span className="text-zinc-600 ml-1">legacy</span>}
+                              ? <span className="text-bm-red ml-1 flex items-center gap-0.5"><Link2 size={8} /> asiento</span>
+                              : <span className="text-bm-steel ml-1">legacy</span>}
                           </p>
                         </div>
-                        <p className="font-black italic text-sm text-emerald-400 ml-2">{fmtMonto(c.monto_total, normalizePaymentMethod(c.moneda))}</p>
+                        <p className="font-semibold text-sm text-bm-ok ml-2 bm-num">{fmtMonto(c.monto_total, normalizePaymentMethod(c.moneda))}</p>
                       </div>
                       {/* [NEW v16.5] quién pagó cada abono de estas horas */}
                       {abonos.filter(a => a.cuenta_tipo === 'CXC' && a.cuenta_id === String(c.id)).map(a => pagoPorAsiento.get(a.asiento_id)).filter((x): x is PagoTraza => !!x).map(pg => (
-                        <p key={pg.id} className="text-[8px] text-[#E1AD01]/80 font-mono mt-1 truncate" title={lineaPago(pg)}>{lineaPago(pg)}</p>
+                        <p key={pg.id} className="text-xs text-bm-red font-mono mt-1 truncate" title={lineaPago(pg)}>{lineaPago(pg)}</p>
                       ))}
                       <div className="flex gap-2 mt-3 opacity-0 group-hover:opacity-100 transition-all">
                         <button onClick={() => deleteCuentaProtected(c.id, true)} disabled={savingAction === c.id}
-                          className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30 text-[8px] font-black uppercase flex items-center gap-1">
+                          className="px-3 py-2 bg-bm-red-tint text-bm-red rounded-xl border border-bm-red/25 hover:bg-bm-red-tint transition-all disabled:opacity-30 text-xs font-semibold flex items-center gap-1">
                           <Trash2 size={11} /> Anular / Eliminar
                         </button>
                       </div>
@@ -5246,10 +5283,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
               {/* CxP Proveedores + Préstamos */}
               <div className={`${glass} rounded-3xl overflow-hidden`}>
-                <div className="p-5 border-b border-white/5 bg-orange-500/5">
-                  <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
-                    <ArrowDownCircle className="text-orange-400 h-4 w-4" /> Por Pagar
-                    <span className="ml-auto font-mono text-orange-400 text-[9px]">${fmtNum(totalCxP)}</span>
+                <div className="p-5 border-b border-bm-line bg-bm-warn-tint/60">
+                  <h3 className="text-[13px] font-semibold flex items-center gap-2 bm-num">
+                    <ArrowDownCircle className="text-bm-warn h-4 w-4" /> Por Pagar
+                    <span className="ml-auto font-mono text-bm-warn text-xs">${fmtNum(totalCxP)}</span>
                   </h3>
                 </div>
                 <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
@@ -5257,26 +5294,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     const esPrest = c.entidad_tipo === 'PRESTAMISTA';
                     const pagado  = c.estatus === 'PAGADO';
                     return (
-                      <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all ${pagado ? 'border-emerald-500/10 opacity-50' : esPrest ? 'border-violet-500/15 hover:bg-white/[0.04]' : 'border-orange-500/10 hover:bg-white/[0.04]'}`}>
+                      <div key={c.id} className={`bg-bm-canvas/60 border rounded-2xl p-4 group transition-all ${pagado ? 'border-bm-ok/25 opacity-50' : esPrest ? 'border-[#6D28D9]/25 hover:bg-bm-canvas' : 'border-bm-warn/25 hover:bg-bm-canvas'}`}>
                         <div className="flex justify-between items-start mb-2">
                           <div className="flex-1 min-w-0">
-                            <p className="text-[10px] font-black uppercase truncate flex items-center gap-1.5">{esPrest && <HandCoins size={10} className="text-violet-400 shrink-0" />}{c.entidad_nombre}</p>
-                            <p className="text-[8px] text-zinc-600 font-mono truncate">{c.concepto}</p>
-                            {c.estatus === 'PARCIAL' && <p className="text-[8px] text-emerald-400/80 font-mono mt-0.5">Abonado {fmtMonto(round2(c.monto_total - c.monto_pendiente), c.moneda)} de {fmtMonto(c.monto_total, c.moneda)}</p>}
-                            {c.fecha_vencimiento && <p className="text-[8px] text-orange-400/70 font-mono mt-0.5">Vence: {fmtDate(c.fecha_vencimiento)}</p>}
+                            <p className="text-[13px] font-semibold truncate flex items-center gap-1.5">{esPrest && <HandCoins size={10} className="text-[#6D28D9] shrink-0" />}{c.entidad_nombre}</p>
+                            <p className="text-xs text-bm-steel font-mono truncate">{c.concepto}</p>
+                            {c.estatus === 'PARCIAL' && <p className="text-xs text-bm-ok font-mono mt-0.5">Abonado {fmtMonto(round2(c.monto_total - c.monto_pendiente), c.moneda)} de {fmtMonto(c.monto_total, c.moneda)}</p>}
+                            {c.fecha_vencimiento && <p className="text-xs text-bm-warn font-mono mt-0.5">Vence: {fmtDate(c.fecha_vencimiento)}</p>}
                           </div>
                           <div className="text-right ml-2">
-                            <p className={`font-black italic text-sm ${pagado ? 'text-emerald-400' : esPrest ? 'text-violet-400' : 'text-orange-400'}`}>{fmtMonto(c.monto_pendiente, c.moneda)}</p>
-                            <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${pagado ? 'bg-emerald-500/10 text-emerald-500' : c.estatus === 'PARCIAL' ? 'bg-yellow-500/10 text-yellow-400' : 'bg-orange-500/10 text-orange-500'}`}>{c.estatus}</span>
+                            <p className={`font-semibold text-sm bm-num ${pagado ? 'text-bm-ok' : esPrest ? 'text-[#6D28D9]' : 'text-bm-warn'}`}>{fmtMonto(c.monto_pendiente, c.moneda)}</p>
+                            <span className={`text-[11px] font-semibold uppercase px-2 py-0.5 rounded-full ${pagado ? 'bg-bm-ok-tint text-bm-ok' : c.estatus === 'PARCIAL' ? 'bg-[#FDF3D8] text-[#8A6100]' : 'bg-bm-warn-tint text-bm-warn'}`}>{c.estatus}</span>
                           </div>
                         </div>
                         {!pagado && (
                           <div className="flex gap-2 mt-3">
                             <button onClick={() => handlePagarCuenta(c.id, false)} disabled={savingAction === c.id}
-                              className="flex-1 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl text-[9px] font-black uppercase border border-emerald-500/20 hover:bg-emerald-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
+                              className="flex-1 py-2 bg-bm-ok-tint text-bm-ok rounded-xl text-xs font-semibold border border-bm-ok/25 hover:bg-bm-ok-tint transition-all flex items-center justify-center gap-1 disabled:opacity-30">
                               {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><CheckCircle2 size={11} /> {esPrest ? 'Devolver' : 'Pagar'}</>}
                             </button>
-                            <button onClick={() => deleteCuentaProtected(c.id, false)} disabled={savingAction === c.id} className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
+                            <button onClick={() => deleteCuentaProtected(c.id, false)} disabled={savingAction === c.id} className="px-3 py-2 bg-bm-red-tint text-bm-red rounded-xl border border-bm-red/25 hover:bg-bm-red-tint transition-all disabled:opacity-30">
                               <Trash2 size={12} />
                             </button>
                           </div>
@@ -5289,11 +5326,11 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               </div>
 
               {/* Reposiciones Internas */}
-              <div className={`${glass} rounded-3xl overflow-hidden border-purple-500/10`}>
-                <div className="p-5 border-b border-white/5 bg-purple-500/5">
-                  <h3 className="text-[10px] font-black uppercase tracking-widest italic flex items-center gap-2">
-                    <ArrowLeftRight className="text-purple-400 h-4 w-4" /> Reposiciones
-                    <span className="ml-auto font-mono text-purple-400 text-[9px]">${fmtNum(totalReposiciones)}</span>
+              <div className={`${glass} rounded-3xl overflow-hidden border-[#6D28D9]/25`}>
+                <div className="p-5 border-b border-bm-line bg-[#F1ECFB]/60">
+                  <h3 className="text-[13px] font-semibold flex items-center gap-2 bm-num">
+                    <ArrowLeftRight className="text-[#6D28D9] h-4 w-4" /> Reposiciones
+                    <span className="ml-auto font-mono text-[#6D28D9] text-xs">${fmtNum(totalReposiciones)}</span>
                   </h3>
                 </div>
                 <div className="overflow-y-auto max-h-[420px] p-4 space-y-2">
@@ -5302,27 +5339,27 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     const entrada = movCajas.find(m => m.transfer_id === c.transfer_id && m.transfer_role === 'ENTRADA');
                     const pagado  = c.estatus === 'PAGADO';
                     return (
-                      <div key={c.id} className={`bg-white/[0.02] border rounded-2xl p-4 group transition-all ${pagado ? 'border-emerald-500/10 opacity-60' : 'border-purple-500/10 hover:bg-white/[0.04]'}`}>
+                      <div key={c.id} className={`bg-bm-canvas/60 border rounded-2xl p-4 group transition-all ${pagado ? 'border-bm-ok/25 opacity-60' : 'border-[#6D28D9]/25 hover:bg-bm-canvas'}`}>
                         <div className="flex justify-between items-start mb-2">
                           <div className="flex-1 min-w-0">
-                            <p className="text-[10px] font-black uppercase truncate">{c.entidad_nombre}</p>
+                            <p className="text-[13px] font-semibold truncate">{c.entidad_nombre}</p>
                             {salida && entrada && (
-                              <p className="text-[8px] text-purple-400/80 font-mono flex items-center gap-1 mt-0.5">{cajaById(salida.caja_id)?.nombre} <ArrowLeftRight size={8} /> {cajaById(entrada.caja_id)?.nombre}</p>
+                              <p className="text-xs text-[#6D28D9] font-mono flex items-center gap-1 mt-0.5">{cajaById(salida.caja_id)?.nombre} <ArrowLeftRight size={8} /> {cajaById(entrada.caja_id)?.nombre}</p>
                             )}
-                            <p className="text-[8px] text-zinc-600 font-mono truncate mt-0.5">{c.concepto}</p>
+                            <p className="text-xs text-bm-steel font-mono truncate mt-0.5">{c.concepto}</p>
                           </div>
                           <div className="text-right ml-2">
-                            <p className={`font-black italic text-sm ${pagado ? 'text-emerald-400' : 'text-purple-400'}`}>{fmtMonto(c.monto_pendiente, c.moneda)}</p>
-                            <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${pagado ? 'bg-emerald-500/10 text-emerald-500' : 'bg-purple-500/10 text-purple-400'}`}>{pagado ? 'Repuesta' : 'Pendiente'}</span>
+                            <p className={`font-semibold text-sm bm-num ${pagado ? 'text-bm-ok' : 'text-[#6D28D9]'}`}>{fmtMonto(c.monto_pendiente, c.moneda)}</p>
+                            <span className={`text-[11px] font-semibold uppercase px-2 py-0.5 rounded-full ${pagado ? 'bg-bm-ok-tint text-bm-ok' : 'bg-[#F1ECFB] text-[#6D28D9]'}`}>{pagado ? 'Repuesta' : 'Pendiente'}</span>
                           </div>
                         </div>
                         {!pagado && (
                           <div className="flex gap-2 mt-3">
                             <button onClick={() => openPagarReposicion(c)} disabled={savingAction === c.id}
-                              className="flex-1 py-2 bg-purple-500/20 text-purple-400 rounded-xl text-[9px] font-black uppercase border border-purple-500/20 hover:bg-purple-500/30 transition-all flex items-center justify-center gap-1 disabled:opacity-30">
+                              className="flex-1 py-2 bg-[#F1ECFB] text-[#6D28D9] rounded-xl text-xs font-semibold border border-[#6D28D9]/25 hover:bg-[#E7DFF8] transition-all flex items-center justify-center gap-1 disabled:opacity-30">
                               {savingAction === c.id ? <Loader2 size={11} className="animate-spin" /> : <><Repeat size={11} /> Reponer</>}
                             </button>
-                            <button onClick={() => deleteCuentaProtected(c.id, false)} disabled={savingAction === c.id} className="px-3 py-2 bg-red-500/10 text-red-400 rounded-xl border border-red-500/10 hover:bg-red-500/20 transition-all disabled:opacity-30">
+                            <button onClick={() => deleteCuentaProtected(c.id, false)} disabled={savingAction === c.id} className="px-3 py-2 bg-bm-red-tint text-bm-red rounded-xl border border-bm-red/25 hover:bg-bm-red-tint transition-all disabled:opacity-30">
                               <Trash2 size={12} />
                             </button>
                           </div>
@@ -5342,10 +5379,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
       {activeTab === 'REQUISITIONS' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className={`${glass} rounded-3xl p-7`}>
-            <h3 className="text-[10px] font-black uppercase tracking-widest mb-6 italic flex items-center gap-2"><FileSignature className="text-[#E1AD01] h-4 w-4" /> Nueva Requisición</h3>
+            <h3 className="text-[13px] font-semibold mb-6 flex items-center gap-2 bm-num"><FileSignature className="text-bm-red h-4 w-4" /> Nueva Requisición</h3>
             <form onSubmit={handleCreateRequest} className="space-y-4">
               <textarea required value={reqItems} onChange={e => setReqItems(e.target.value)} rows={3} disabled={savingReq} placeholder="DETALLE OPERATIVO..."
-                className="w-full bg-black/50 border border-white/10 p-5 rounded-2xl text-xs font-mono outline-none focus:border-[#E1AD01] text-white uppercase placeholder:text-white/20 resize-none" />
+                className="w-full bg-white border border-bm-line p-5 rounded-2xl text-xs font-mono outline-none focus:border-bm-red text-bm-ink uppercase placeholder:text-bm-hint resize-none" />
               <div className="grid grid-cols-2 gap-3">
                 <input type="number" step="0.01" min="0.01" required value={reqAmount} onChange={e => setReqAmount(e.target.value)} placeholder="COSTO ESTIMADO ($)" className={inp} disabled={savingReq} />
                 <select value={reqPriority} onChange={e => setReqPriority(e.target.value)} className={inp} disabled={savingReq}>
@@ -5355,15 +5392,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 </select>
               </div>
               <ErrorBanner msg={reqError} onClose={() => setReqError(null)} />
-              <button type="submit" disabled={savingReq} className="w-full py-5 bg-[#E1AD01] text-black rounded-2xl font-black uppercase text-[10px] tracking-widest hover:bg-white transition-all disabled:opacity-40 flex items-center justify-center gap-2">
+              <button type="submit" disabled={savingReq} className="w-full py-5 bg-bm-red text-white rounded-2xl font-semibold text-[13px] hover:bg-bm-red-deep transition-all disabled:opacity-40 flex items-center justify-center gap-2">
                 {savingReq ? <Loader2 className="animate-spin h-4 w-4" /> : 'Sellar Requisición'}
               </button>
             </form>
           </div>
           <div className={`${glass} rounded-3xl overflow-hidden flex flex-col`}>
-            <div className="p-6 border-b border-white/5">
-              <h3 className="text-[10px] font-black uppercase tracking-widest italic">Aprobación</h3>
-              <p className="text-[8px] text-zinc-600 font-mono mt-1">Aprobar crea una cuenta por pagar; el dinero sale al pagarla en CxC/CxP.</p>
+            <div className="p-6 border-b border-bm-line">
+              <h3 className="text-[13px] font-semibold bm-num">Aprobación</h3>
+              <p className="text-xs text-bm-steel font-mono mt-1">Aprobar crea una cuenta por pagar; el dinero sale al pagarla en CxC/CxP.</p>
             </div>
             <div className="flex-1 overflow-y-auto max-h-[480px] p-4 space-y-3">
               {requests.map(req => {
@@ -5371,26 +5408,26 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 try { item = JSON.parse(req.items || '{}'); } catch { item = {}; }
                 const puedeAprobar = req.estatus === 'PENDIENTE_REVISION' && ['CEO', 'ADMIN'].includes(rolUpper);   // ▼ v16.6 rol canónico
                 return (
-                  <div key={req.id} className="bg-white/[0.02] border border-white/[0.05] p-5 rounded-2xl">
+                  <div key={req.id} className="bg-bm-canvas/60 border border-bm-line p-5 rounded-2xl">
                     <div className="flex justify-between items-start mb-3">
                       <div>
-                        <span className="text-[8px] font-black text-[#E1AD01] bg-[#E1AD01]/10 px-2 py-1 rounded-full tracking-widest">{req.nro_solicitud || 'REQ'}</span>
-                        <p className="text-[10px] font-mono uppercase mt-2">{item.description}</p>
-                        <p className="text-[#E1AD01] text-xl font-black italic mt-1">${fmtNum(Number(item.estimated_cost) || 0)}</p>
+                        <span className="text-xs font-semibold text-bm-red bg-bm-red-tint px-2 py-1 rounded-full">{req.nro_solicitud || 'REQ'}</span>
+                        <p className="text-[13px] font-mono mt-2">{item.description}</p>
+                        <p className="text-bm-red text-xl mt-1 bm-figure">${fmtNum(Number(item.estimated_cost) || 0)}</p>
                       </div>
-                      <span className={`text-[8px] font-black px-2 py-1 rounded-full uppercase ${req.prioridad === 'CRITICA' ? 'bg-red-500/20 text-red-500' : 'bg-blue-500/20 text-blue-400'}`}>{req.prioridad}</span>
+                      <span className={`text-xs font-semibold px-2 py-1 rounded-full uppercase ${req.prioridad === 'CRITICA' ? 'bg-bm-red-tint text-bm-red' : 'bg-[#E8EEF9] text-[#2F5BB7]'}`}>{req.prioridad}</span>
                     </div>
                     {puedeAprobar ? (
-                      <div className="flex gap-2 border-t border-white/5 pt-3">
+                      <div className="flex gap-2 border-t border-bm-line pt-3">
                         <button onClick={() => handleApproveReq(req.id, Number(item.estimated_cost), item.description)} disabled={savingAction === req.id}
-                          className="flex-1 py-2.5 bg-emerald-500 text-black rounded-xl text-[9px] font-black uppercase hover:bg-white transition-all disabled:opacity-40 flex items-center justify-center gap-2">
+                          className="flex-1 py-2.5 bg-bm-ok text-white rounded-xl text-xs font-semibold hover:bg-[#13643F] transition-all disabled:opacity-40 flex items-center justify-center gap-2">
                           {savingAction === req.id ? <Loader2 size={12} className="animate-spin" /> : 'Aprobar'}
                         </button>
                         <button onClick={() => handleRejectReq(req.id)} disabled={savingAction === req.id}
-                          className="flex-1 py-2.5 bg-red-500/10 text-red-400 border border-red-500/20 rounded-xl text-[9px] font-black uppercase hover:bg-red-500/20 transition-all disabled:opacity-40">Rechazar</button>
+                          className="flex-1 py-2.5 bg-bm-red-tint text-bm-red border border-bm-red/25 rounded-xl text-xs font-semibold hover:bg-bm-red-tint transition-all disabled:opacity-40">Rechazar</button>
                       </div>
                     ) : (
-                      <div className="flex items-center gap-2 text-[9px] font-black uppercase text-zinc-600 italic pt-2 border-t border-white/5"><CheckCircle2 className="h-3.5 w-3.5 text-zinc-700" /> {req.estatus}</div>
+                      <div className="flex items-center gap-2 text-xs font-semibold text-bm-steel pt-2 border-t border-bm-line bm-num"><CheckCircle2 className="h-3.5 w-3.5 text-bm-hint" /> {req.estatus}</div>
                     )}
                   </div>
                 );
@@ -5425,18 +5462,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           <div className="space-y-6">
             <div className={`${glass} rounded-2xl p-5 flex items-center justify-between`}>
               <div>
-                <p className="text-[9px] font-black text-zinc-500 uppercase tracking-widest mb-1">Tasa BCV (Bs/USD)</p>
-                <p className="text-[8px] text-zinc-700">Tasa sugerida en FX Desk y cobros en Bs; convierte totales CxC/CxP a USD. BD guarda en moneda nativa.</p>
+                <p className="text-xs font-semibold text-bm-steel mb-1">Tasa BCV (Bs/USD)</p>
+                <p className="text-xs text-bm-hint">Tasa sugerida en FX Desk y cobros en Bs; convierte totales CxC/CxP a USD. BD guarda en moneda nativa.</p>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-[#E1AD01] font-black font-mono">Bs</span>
+                <span className="text-bm-red font-semibold font-mono">Bs</span>
                 <input type="number" step="0.0001" min="1" value={tasaBCV}
                   onChange={e => { const n = parseFloat(e.target.value); if (!isNaN(n) && n > 0) setTasaBCV(n); }}
-                  className="w-28 bg-black/40 border border-[#E1AD01]/30 rounded-xl px-3 py-2 text-[#E1AD01] font-black font-mono text-sm text-center outline-none" />
+                  className="w-28 bg-bm-canvas border border-bm-red/25 rounded-xl px-3 py-2 text-bm-red font-semibold font-mono text-sm text-center outline-none" />
               </div>
             </div>
             <div className={`${glass} rounded-3xl p-7`}>
-              <h3 className="font-black text-[12px] uppercase tracking-widest mb-7 italic flex items-center gap-3"><Lock className="text-[#E1AD01] h-5 w-5" /> Cierre Multi-Moneda</h3>
+              <h3 className="font-semibold text-[12px] mb-7 flex items-center gap-3 bm-num"><Lock className="text-bm-red h-5 w-5" /> Cierre Multi-Moneda</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                 {METODOS.map(({ m, label }) => {
                   const teorico   = getVaultBalance(m);
@@ -5445,32 +5482,32 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                   const descuadra = diff !== null && Math.abs(diff) > 0.01;
                   const conc      = conciliacion.find(x => x.m === m);
                   return (
-                    <div key={m} className={`rounded-2xl border p-5 space-y-4 transition-all ${cuadra ? 'bg-emerald-500/5 border-emerald-500/20' : descuadra ? 'bg-red-500/5 border-red-500/20' : MONEDA_BG[m]}`}>
+                    <div key={m} className={`rounded-2xl border p-5 space-y-4 transition-all ${cuadra ? 'bg-bm-ok-tint/60 border-bm-ok/25' : descuadra ? 'bg-bm-red-tint/60 border-bm-red/25' : MONEDA_BG[m]}`}>
                       <div className="flex items-center justify-between">
-                        <span className={`text-[10px] font-black uppercase tracking-widest ${MONEDA_COLOR[m]}`}>{label}</span>
-                        {cuadra    && <span className="text-[8px] font-black text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded-full uppercase flex items-center gap-1"><CheckCircle2 size={10} /> Cuadrado</span>}
-                        {descuadra && <span className="text-[8px] font-black text-red-400 bg-red-500/10 px-2 py-1 rounded-full uppercase">⚠ Dif. {prefijo(m)} {Math.abs(diff ?? 0).toFixed(2)}</span>}
+                        <span className={`text-[13px] font-semibold ${MONEDA_COLOR[m]}`}>{label}</span>
+                        {cuadra    && <span className="text-xs font-semibold text-bm-ok bg-bm-ok-tint px-2 py-1 rounded-full uppercase flex items-center gap-1"><CheckCircle2 size={10} /> Cuadrado</span>}
+                        {descuadra && <span className="text-xs font-semibold text-bm-red bg-bm-red-tint px-2 py-1 rounded-full uppercase">⚠ Dif. {prefijo(m)} {Math.abs(diff ?? 0).toFixed(2)}</span>}
                       </div>
-                      <div className="bg-black/30 rounded-xl p-4 text-center">
-                        <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Saldo Teórico</p>
-                        <p className={`text-xl font-black italic font-mono ${MONEDA_COLOR[m]}`}>{prefijo(m)} {fmtNum(teorico)}</p>
-                        {m === 'BS' && tasaBCV > 0 && <p className="text-[8px] text-zinc-600 mt-1 font-mono">≈ ${fmtNum(teorico / tasaBCV)} USD @ {tasaBCV}</p>}
-                        {conc && Math.abs(conc.sinAsignar) > 0.01 && <p className="text-[8px] text-zinc-500 mt-1 font-mono">En cajas {fmtMonto(conc.enCajas, m)} · sin ubicar {fmtMonto(conc.sinAsignar, m)}</p>}
+                      <div className="bg-bm-canvas rounded-xl p-4 text-center">
+                        <p className="text-xs text-bm-steel font-semibold mb-1">Saldo Teórico</p>
+                        <p className={`text-xl font-mono bm-figure ${MONEDA_COLOR[m]}`}>{prefijo(m)} {fmtNum(teorico)}</p>
+                        {m === 'BS' && tasaBCV > 0 && <p className="text-xs text-bm-steel mt-1 font-mono">≈ ${fmtNum(teorico / tasaBCV)} USD @ {tasaBCV}</p>}
+                        {conc && Math.abs(conc.sinAsignar) > 0.01 && <p className="text-xs text-bm-steel mt-1 font-mono">En cajas {fmtMonto(conc.enCajas, m)} · sin ubicar {fmtMonto(conc.sinAsignar, m)}</p>}
                       </div>
                       <div>
-                        <label className="text-[8px] text-zinc-600 font-black uppercase tracking-widest block mb-2 text-center">Conteo Físico</label>
+                        <label className="text-xs text-bm-steel font-semibold block mb-2 text-center">Conteo Físico</label>
                         <div className="relative">
-                          <span className={`absolute left-4 top-1/2 -translate-y-1/2 font-black text-lg ${MONEDA_COLOR[m]}`}>{prefijo(m)}</span>
+                          <span className={`absolute left-4 top-1/2 -translate-y-1/2 font-semibold text-lg ${MONEDA_COLOR[m]}`}>{prefijo(m)}</span>
                           <input type="number" step="0.01" value={physBalances[m]} placeholder="0.00"
                             onChange={e => setPhysBalances(p => ({ ...p, [m]: e.target.value }))}
-                            className={`w-full bg-black/50 border py-4 pl-10 pr-4 rounded-xl text-xl font-black italic outline-none text-center text-white transition-all ${cuadra ? 'border-emerald-500/50' : descuadra ? 'border-red-500/50' : 'border-white/10 focus:border-[#E1AD01]'}`} />
+                            className={`w-full bg-white border py-4 pl-10 pr-4 rounded-xl text-xl outline-none text-center text-bm-ink transition-all bm-figure ${cuadra ? 'border-bm-ok/25' : descuadra ? 'border-bm-red/25' : 'border-bm-line focus:border-bm-red'}`} />
                         </div>
                       </div>
                     </div>
                   );
                 })}
               </div>
-              <button onClick={handleCierre} className="w-full py-5 bg-red-600 rounded-2xl font-black uppercase text-[10px] tracking-widest flex items-center justify-center gap-2 hover:bg-red-500 transition-all mt-5">
+              <button onClick={handleCierre} className="w-full py-5 bg-bm-red rounded-2xl font-semibold text-[13px] flex items-center justify-center gap-2 hover:bg-bm-red-deep transition-all mt-5">
                 <Lock className="h-4 w-4" /> Comprobar Cuadre Multi-Moneda
               </button>
             </div>
@@ -5496,21 +5533,21 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           { k: 'ALUMNOS', l: 'Alumnos', icon: Users }, { k: 'VUELOS', l: 'Vuelos por cargar', n: vuelosPorCargar.length, icon: PlaneTakeoff },
           { k: 'TARIFARIO', l: 'Tarifario y ajustes', icon: Settings },
         ];
-        const accion = 'px-4 py-3 rounded-xl text-[9px] font-black uppercase border transition-all flex items-center gap-2 disabled:opacity-30';
+        const accion = 'px-4 py-3 rounded-xl text-xs font-semibold border transition-all flex items-center gap-2 disabled:opacity-30';
         return (
           <div className="space-y-6">
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               {([
-                ['Billeteras · anticipos', usd(totalBilleteras), `${walletCuentas.filter(w => w.saldo_usd > 0).length} alumnos con saldo`, 'text-teal-400', Wallet],
-                ['Deuda por consumos', usd(totalDeudaConsumos), `${conDeuda} alumnos con deuda (todas las CxC)`, 'text-yellow-400', ArrowUpCircle],
-                ['Consumos del mes', usd(consumosMes), 'Ingreso devengado (vuelo, simulador, cursos)', 'text-emerald-400', Receipt],
-                ['Vuelos por cargar', String(vuelosPorCargar.length), `Desde ${fmtDate(walletCorte)} · bitácora MRO`, vuelosPorCargar.length ? 'text-orange-400' : 'text-zinc-500', PlaneTakeoff],
+                ['Billeteras · anticipos', usd(totalBilleteras), `${walletCuentas.filter(w => w.saldo_usd > 0).length} alumnos con saldo`, 'text-[#0F766E]', Wallet],
+                ['Deuda por consumos', usd(totalDeudaConsumos), `${conDeuda} alumnos con deuda (todas las CxC)`, 'text-[#8A6100]', ArrowUpCircle],
+                ['Consumos del mes', usd(consumosMes), 'Ingreso devengado (vuelo, simulador, cursos)', 'text-bm-ok', Receipt],
+                ['Vuelos por cargar', String(vuelosPorCargar.length), `Desde ${fmtDate(walletCorte)} · bitácora MRO`, vuelosPorCargar.length ? 'text-bm-warn' : 'text-bm-steel', PlaneTakeoff],
               ] as [string, string, string, string, LucideIcon][]).map(([l, v, s, c, Icon]) => (
                 <div key={l} className={`${glass} rounded-2xl p-4 flex items-center justify-between`}>
                   <div>
-                    <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">{l}</p>
-                    <p className={`${c} font-black text-lg italic`}>{v}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-0.5">{s}</p>
+                    <p className="text-xs text-bm-steel font-semibold mb-1">{l}</p>
+                    <p className={`${c} text-lg bm-figure`}>{v}</p>
+                    <p className="text-xs text-bm-steel font-mono mt-0.5">{s}</p>
                   </div>
                   <Icon className={`${c} opacity-20 h-9 w-9`} />
                 </div>
@@ -5520,18 +5557,18 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             {!v17Instalado && <EmptyState icon={Wallet} text="Ejecute migracion_finance_v17_billetera_clases.sql para habilitar las billeteras" />}
             <ErrorBanner msg={walletModal ? null : walletError} onClose={() => setWalletError(null)} />
             {walletInfo && (
-              <div className="flex items-start gap-3 p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30">
-                <CheckCircle2 size={14} className="text-emerald-400 shrink-0 mt-0.5" />
-                <p className="text-[10px] text-emerald-300 flex-1 font-mono">{walletInfo}</p>
-                <button type="button" onClick={() => setWalletInfo(null)} className="text-emerald-700 hover:text-emerald-400"><X size={12} /></button>
+              <div className="flex items-start gap-3 p-4 rounded-xl bg-bm-ok-tint border border-bm-ok/25">
+                <CheckCircle2 size={14} className="text-bm-ok shrink-0 mt-0.5" />
+                <p className="text-[13px] text-bm-ok flex-1 font-mono">{walletInfo}</p>
+                <button type="button" onClick={() => setWalletInfo(null)} className="text-bm-ok hover:text-bm-ok"><X size={12} /></button>
               </div>
             )}
 
-            <div className="flex flex-wrap gap-1 p-1.5 bg-black/60 rounded-2xl border border-white/5 w-fit">
+            <div className="flex flex-wrap gap-1 p-1.5 bg-bm-canvas rounded-2xl border border-bm-line w-fit">
               {subTabs.map(({ k, l, n, icon: Icon }) => (
                 <button key={k} type="button" onClick={() => setWalletSubTab(k)}
-                  className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-[9px] font-black uppercase tracking-wider transition-all ${walletSubTab === k ? 'bg-teal-500 text-black' : 'text-zinc-500 hover:text-white hover:bg-white/5'}`}>
-                  <Icon size={12} /> {l}{n ? <span className={`px-1.5 rounded ${walletSubTab === k ? 'bg-black/20' : 'bg-orange-500/20 text-orange-400'}`}>{n}</span> : null}
+                  className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all ${walletSubTab === k ? 'bg-[#0F766E] text-white' : 'text-bm-steel hover:text-bm-ink hover:bg-bm-canvas'}`}>
+                  <Icon size={12} /> {l}{n ? <span className={`px-1.5 rounded ${walletSubTab === k ? 'bg-bm-canvas' : 'bg-bm-warn-tint text-bm-warn'}`}>{n}</span> : null}
                 </button>
               ))}
             </div>
@@ -5539,22 +5576,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             {walletSubTab === 'ALUMNOS' && (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 <div className={`lg:col-span-4 ${glass} rounded-3xl overflow-hidden flex flex-col`}>
-                  <div className="p-4 border-b border-white/5 relative">
-                    <Search size={12} className="absolute left-7 top-1/2 -translate-y-1/2 text-zinc-600" />
+                  <div className="p-4 border-b border-bm-line relative">
+                    <Search size={12} className="absolute left-7 top-1/2 -translate-y-1/2 text-bm-steel" />
                     <input value={walletQuery} onChange={e => setWalletQuery(e.target.value)} placeholder="BUSCAR ALUMNO · SERIAL · SEDE" className={`${inp} pl-9 py-3`} />
                   </div>
                   <div className="flex-1 overflow-y-auto max-h-[680px] p-3 space-y-1.5">
                     {lista.map(({ a, saldo, deuda }) => (
                       <button key={a.student_id} type="button" onClick={() => { setWalletSel(a.student_id); setWalletError(null); }}
-                        className={`w-full text-left p-3 rounded-xl border transition-all ${walletSel === a.student_id ? 'border-teal-500/50 bg-teal-500/10' : 'border-white/[0.05] hover:bg-white/[0.03]'}`}>
+                        className={`w-full text-left p-3 rounded-xl border transition-all ${walletSel === a.student_id ? 'border-[#0F766E]/25 bg-[#E6F4F2]' : 'border-bm-line hover:bg-bm-canvas'}`}>
                         <div className="flex justify-between items-start gap-2">
                           <div className="min-w-0">
-                            <p className="text-[10px] font-black uppercase truncate">{a.nombre}</p>
-                            <p className="text-[8px] text-zinc-600 font-mono">{a.serial} · {a.sede}</p>
+                            <p className="text-[13px] font-semibold truncate">{a.nombre}</p>
+                            <p className="text-xs text-bm-steel font-mono">{a.serial} · {a.sede}</p>
                           </div>
                           <div className="text-right shrink-0">
-                            <p className={`text-[11px] font-black italic ${saldo > 0 ? 'text-teal-400' : 'text-zinc-700'}`}>{usd(saldo)}</p>
-                            {deuda > 0 && <p className="text-[8px] font-black text-yellow-400">debe {usd(deuda)}</p>}
+                            <p className={`text-sm font-semibold bm-num ${saldo > 0 ? 'text-[#0F766E]' : 'text-bm-hint'}`}>{usd(saldo)}</p>
+                            {deuda > 0 && <p className="text-xs font-semibold text-[#8A6100]">debe {usd(deuda)}</p>}
                           </div>
                         </div>
                       </button>
@@ -5567,57 +5604,57 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                   {!sel ? (
                     <div className={`${glass} rounded-3xl`}><EmptyState icon={Wallet} text="Seleccione un alumno para ver su billetera" py="py-24" /></div>
                   ) : (<>
-                    <div className={`${glass} rounded-3xl p-6 border-t-2 border-t-teal-500`}>
+                    <div className={`${glass} rounded-3xl p-6 border-t-2 border-t-[#0F766E]`}>
                       <div className="flex flex-wrap justify-between items-start gap-4 mb-5">
                         <div>
-                          <p className="text-[8px] text-zinc-600 font-black uppercase tracking-[0.3em]">Billetera del alumno · USD</p>
-                          <h3 className="text-xl font-black uppercase italic">{sel.nombre}</h3>
-                          <p className="text-[9px] text-zinc-500 font-mono">{sel.serial} · Sede {sel.sede}</p>
+                          <p className="text-xs text-bm-steel font-semibold">Billetera del alumno · USD</p>
+                          <h3 className="text-xl bm-figure">{sel.nombre}</h3>
+                          <p className="text-xs text-bm-steel font-mono">{sel.serial} · Sede {sel.sede}</p>
                         </div>
                         <div className="grid grid-cols-3 gap-3 text-center">
-                          {([['Saldo', saldoSel, 'text-teal-400'], ['Deuda', deudaSel, deudaSel > 0 ? 'text-yellow-400' : 'text-zinc-600'],
-                             ['Posición', round2(saldoSel - deudaSel), saldoSel - deudaSel >= 0 ? 'text-emerald-400' : 'text-red-400']] as const).map(([l, v, c]) => (
-                            <div key={l} className="bg-black/30 rounded-xl px-4 py-3 border border-white/5">
-                              <p className="text-[7px] text-zinc-600 font-black uppercase">{l}</p>
-                              <p className={`text-base font-black italic ${c}`}>{usd(v)}</p>
+                          {([['Saldo', saldoSel, 'text-[#0F766E]'], ['Deuda', deudaSel, deudaSel > 0 ? 'text-[#8A6100]' : 'text-bm-steel'],
+                             ['Posición', round2(saldoSel - deudaSel), saldoSel - deudaSel >= 0 ? 'text-bm-ok' : 'text-bm-red']] as const).map(([l, v, c]) => (
+                            <div key={l} className="bg-bm-canvas rounded-xl px-4 py-3 border border-bm-line">
+                              <p className="text-[11px] text-bm-steel font-semibold">{l}</p>
+                              <p className={`text-base bm-figure ${c}`}>{usd(v)}</p>
                             </div>
                           ))}
                         </div>
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <button type="button" disabled={!v17Instalado || !canManageFinance} onClick={() => abrirWalletModal('RECARGA', sel.student_id)}
-                          className={`${accion} bg-emerald-500 text-black border-emerald-500 hover:bg-emerald-400`}><Wallet size={12} /> Recargar (pago)</button>
+                          className={`${accion} bg-bm-ok text-white border-bm-ok hover:bg-[#13643F]`}><Wallet size={12} /> Recargar (pago)</button>
                         <button type="button" disabled={!v17Instalado} onClick={() => abrirWalletModal('CONSUMO', sel.student_id)}
-                          className={`${accion} bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/30 hover:bg-[#E1AD01]/20`}><Receipt size={12} /> Registrar consumo</button>
+                          className={`${accion} bg-bm-red-tint text-bm-red border-bm-red/25 hover:bg-bm-red-tint`}><Receipt size={12} /> Registrar consumo</button>
                         <button type="button" disabled={!v17Instalado || saldoSel <= 0 || deudaSel <= 0 || savingAction === sel.student_id} onClick={() => aplicarBilleteraADeuda(sel.student_id)}
-                          className={`${accion} bg-teal-500/10 text-teal-400 border-teal-500/30 hover:bg-teal-500/20`}>{savingAction === sel.student_id ? <Loader2 size={12} className="animate-spin" /> : <Repeat size={12} />} Aplicar saldo a deuda</button>
+                          className={`${accion} bg-[#E6F4F2] text-[#0F766E] border-[#0F766E]/25 hover:bg-[#D5ECE9]`}>{savingAction === sel.student_id ? <Loader2 size={12} className="animate-spin" /> : <Repeat size={12} />} Aplicar saldo a deuda</button>
                         <button type="button" disabled={!v17Instalado || !canManageFinance} onClick={() => abrirWalletModal('AJUSTE', sel.student_id)}
-                          className={`${accion} bg-violet-500/10 text-violet-400 border-violet-500/30 hover:bg-violet-500/20`}><Scale size={12} /> Ajuste</button>
+                          className={`${accion} bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25 hover:bg-[#E7DFF8]`}><Scale size={12} /> Ajuste</button>
                         <button type="button" disabled={!v17Instalado || !canManageFinance || saldoSel <= 0} onClick={() => abrirWalletModal('REEMBOLSO', sel.student_id)}
-                          className={`${accion} bg-red-500/10 text-red-400 border-red-500/30 hover:bg-red-500/20`}><MinusCircle size={12} /> Reembolso</button>
+                          className={`${accion} bg-bm-red-tint text-bm-red border-bm-red/25 hover:bg-bm-red-tint`}><MinusCircle size={12} /> Reembolso</button>
                         <button type="button" onClick={() => imprimirEstadoCuenta(sel.student_id)}
-                          className={`${accion} bg-white/5 text-white border-white/10 hover:bg-white/10 ml-auto`}><Printer size={12} /> Estado de cuenta</button>
+                          className={`${accion} bg-bm-canvas text-bm-ink border-bm-line hover:bg-bm-canvas ml-auto`}><Printer size={12} /> Estado de cuenta</button>
                       </div>
                     </div>
 
                     <div className={`${glass} rounded-3xl overflow-hidden`}>
-                      <p className="p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Receipt size={13} className="text-[#E1AD01]" /> Consumos · {consSel.length}</p>
+                      <p className="p-5 border-b border-bm-line text-[13px] font-semibold flex items-center gap-2"><Receipt size={13} className="text-bm-red" /> Consumos · {consSel.length}</p>
                       <div className="max-h-[320px] overflow-y-auto p-4 space-y-2">
                         {consSel.map(c => (
-                          <div key={c.id} className={`p-4 rounded-2xl border group flex justify-between items-center gap-3 ${c.estado === 'ANULADO' ? 'border-red-500/10 opacity-40' : 'border-white/[0.05] bg-white/[0.02]'}`}>
+                          <div key={c.id} className={`p-4 rounded-2xl border group flex justify-between items-center gap-3 ${c.estado === 'ANULADO' ? 'border-bm-red/25 opacity-40' : 'border-bm-line bg-bm-canvas/60'}`}>
                             <div className="min-w-0 flex-1">
-                              <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
-                                {c.vuelo_id && <PlaneTakeoff size={10} className="text-[#E1AD01] shrink-0" />}{c.descripcion}
+                              <p className="text-[13px] font-semibold truncate flex items-center gap-2">
+                                {c.vuelo_id && <PlaneTakeoff size={10} className="text-bm-red shrink-0" />}{c.descripcion}
                                 {c.modo !== 'BILLETERA' && <Badge tone={TONE.blue}>{MODO_CONSUMO_LABEL[c.modo]}</Badge>}
                                 {c.estado === 'ANULADO' && <Badge tone={TONE.red}>Anulado</Badge>}
                               </p>
-                              <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(c.fecha)} · {c.cantidad} {c.unidad} × {usd(c.precio_unitario_usd)} · {labelServicio(c.clase_servicio)}{c.clase_aeronave ? ` · ${c.clase_aeronave}` : ''}{c.clase_piloto ? ` · ${c.clase_piloto}` : ''}</p>
-                              {c.monto_cxc_usd > 0 && <p className="text-[8px] text-yellow-400 font-mono">Billetera {usd(c.monto_billetera_usd)} · a crédito {usd(c.monto_cxc_usd)}</p>}
-                              {c.motivo_anulacion && <p className="text-[8px] text-red-400/70 font-mono">Motivo: {c.motivo_anulacion}</p>}
+                              <p className="text-xs text-bm-steel font-mono">{fmtDate(c.fecha)} · {c.cantidad} {c.unidad} × {usd(c.precio_unitario_usd)} · {labelServicio(c.clase_servicio)}{c.clase_aeronave ? ` · ${c.clase_aeronave}` : ''}{c.clase_piloto ? ` · ${c.clase_piloto}` : ''}</p>
+                              {c.monto_cxc_usd > 0 && <p className="text-xs text-[#8A6100] font-mono">Billetera {usd(c.monto_billetera_usd)} · a crédito {usd(c.monto_cxc_usd)}</p>}
+                              {c.motivo_anulacion && <p className="text-xs text-bm-red font-mono">Motivo: {c.motivo_anulacion}</p>}
                             </div>
-                            <span className="text-sm font-black italic text-[#E1AD01]">{usd(c.monto_total_usd)}</span>
+                            <span className="text-sm font-semibold text-bm-red bm-num">{usd(c.monto_total_usd)}</span>
                             {c.estado === 'VIGENTE' && canManageFinance && (
-                              <button type="button" onClick={() => pedirAnularConsumo(c)} disabled={savingAction === c.id} title="Anular consumo" className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+                              <button type="button" onClick={() => pedirAnularConsumo(c)} disabled={savingAction === c.id} title="Anular consumo" className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}>
                                 {savingAction === c.id ? <Loader2 size={13} className="animate-spin" /> : <Ban size={13} />}
                               </button>
                             )}
@@ -5628,28 +5665,28 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     </div>
 
                     <div className={`${glass} rounded-3xl overflow-hidden`}>
-                      <p className="p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Layers size={13} className="text-teal-400" /> Movimientos de billetera · {movsSel.length}</p>
+                      <p className="p-5 border-b border-bm-line text-[13px] font-semibold flex items-center gap-2"><Layers size={13} className="text-[#0F766E]" /> Movimientos de billetera · {movsSel.length}</p>
                       <div className="max-h-[360px] overflow-y-auto p-4 space-y-2">
                         {movsSel.map(m => (
-                          <div key={m.id} className={`p-3.5 rounded-2xl border group flex justify-between items-center gap-3 ${m.revertido ? 'border-white/[0.03] opacity-40' : m.tipo === 'REVERSO' ? 'border-red-500/15' : 'border-white/[0.05] bg-white/[0.02]'}`}>
+                          <div key={m.id} className={`p-3.5 rounded-2xl border group flex justify-between items-center gap-3 ${m.revertido ? 'border-bm-line opacity-40' : m.tipo === 'REVERSO' ? 'border-bm-red/25' : 'border-bm-line bg-bm-canvas/60'}`}>
                             <div className="min-w-0 flex-1">
-                              <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
+                              <p className="text-[13px] font-semibold truncate flex items-center gap-2">
                                 <Badge tone={m.signo > 0 ? TONE.emerald : TONE.orange}>{WALLET_MOV_LABEL[m.tipo]}</Badge>
                                 {m.revertido && <Badge tone={TONE.red}>Revertido</Badge>}
                                 <span className="truncate">{m.concepto}</span>
                               </p>
-                              <p className="text-[8px] text-zinc-600 font-mono mt-0.5">
+                              <p className="text-xs text-bm-steel font-mono mt-0.5">
                                 {fmtDate(m.fecha)} · {m.referencia}
                                 {m.moneda_origen && m.monto_origen ? ` · ${fmtMonto(m.monto_origen, normalizePaymentMethod(m.moneda_origen))}${m.tasa ? ` @ ${m.tasa}` : ''}` : ''}
                                 {m.creado_por_email ? ` · ${m.creado_por_email}` : ''}
                               </p>
                             </div>
                             <div className="text-right">
-                              <p className={`text-sm font-black italic ${m.signo > 0 ? 'text-emerald-400' : 'text-red-400'}`}>{m.signo > 0 ? '+' : '−'}{usd(m.monto_usd)}</p>
-                              <p className="text-[8px] text-zinc-600 font-mono">saldo {usd(m.saldo_resultante)}</p>
+                              <p className={`text-sm font-semibold bm-num ${m.signo > 0 ? 'text-bm-ok' : 'text-bm-red'}`}>{m.signo > 0 ? '+' : '−'}{usd(m.monto_usd)}</p>
+                              <p className="text-xs text-bm-steel font-mono">saldo {usd(m.saldo_resultante)}</p>
                             </div>
                             {!m.revertido && m.tipo !== 'REVERSO' && canManageFinance && (
-                              <button type="button" onClick={() => pedirRevertir(m)} disabled={savingAction === m.id} title={m.tipo === 'CONSUMO' ? 'Anular consumo' : 'Revertir (contra-asiento)'} className={`${btnIcon} hover:text-red-500 hover:bg-red-500/10`}>
+                              <button type="button" onClick={() => pedirRevertir(m)} disabled={savingAction === m.id} title={m.tipo === 'CONSUMO' ? 'Anular consumo' : 'Revertir (contra-asiento)'} className={`${btnIcon} hover:text-bm-red hover:bg-bm-red-tint`}>
                                 {savingAction === m.id ? <Loader2 size={13} className="animate-spin" /> : <Undo2 size={13} />}
                               </button>
                             )}
@@ -5661,25 +5698,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
                     {cxcSel.length > 0 && (
                       <div className={`${glass} rounded-3xl overflow-hidden`}>
-                        <p className="p-5 border-b border-white/5 text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><ArrowUpCircle size={13} className="text-yellow-400" /> Cuentas por cobrar pendientes · {usd(deudaSel)}</p>
+                        <p className="p-5 border-b border-bm-line text-[13px] font-semibold flex items-center gap-2"><ArrowUpCircle size={13} className="text-[#8A6100]" /> Cuentas por cobrar pendientes · {usd(deudaSel)}</p>
                         <div className="p-4 space-y-2">
                           {cxcSel.map(c => {
                             const mon = normalizePaymentMethod(c.moneda);
                             const aplicable = c.horas_prometidas === 0 && mon !== 'BS';
                             return (
-                              <div key={c.id} className="p-3.5 rounded-2xl border border-yellow-500/10 flex justify-between items-center gap-3">
+                              <div key={c.id} className="p-3.5 rounded-2xl border border-[#8A6100]/25 flex justify-between items-center gap-3">
                                 <div className="min-w-0 flex-1">
-                                  <p className="text-[10px] font-black uppercase truncate">{c.concepto}</p>
-                                  <p className="text-[8px] text-zinc-600 font-mono">{fmtDate(c.fecha_emision)} · {c.estatus}{consumoPorCxc.has(String(c.id)) ? ' · consumo sin fondos' : c.horas_prometidas > 0 ? ` · paquete ${c.horas_prometidas}h (cobrar en CxC)` : ''}</p>
+                                  <p className="text-[13px] font-semibold truncate">{c.concepto}</p>
+                                  <p className="text-xs text-bm-steel font-mono">{fmtDate(c.fecha_emision)} · {c.estatus}{consumoPorCxc.has(String(c.id)) ? ' · consumo sin fondos' : c.horas_prometidas > 0 ? ` · paquete ${c.horas_prometidas}h (cobrar en CxC)` : ''}</p>
                                 </div>
-                                <span className="text-sm font-black italic text-yellow-400">{fmtMonto(c.monto_pendiente, mon)}</span>
+                                <span className="text-sm font-semibold text-[#8A6100] bm-num">{fmtMonto(c.monto_pendiente, mon)}</span>
                                 {aplicable && saldoSel > 0 && (
                                   <button type="button" onClick={() => aplicarBilleteraADeuda(sel.student_id, String(c.id))} disabled={savingAction === String(c.id)}
-                                    className="px-3 py-2 bg-teal-500/10 text-teal-400 rounded-xl border border-teal-500/20 text-[8px] font-black uppercase flex items-center gap-1 disabled:opacity-30">
+                                    className="px-3 py-2 bg-[#E6F4F2] text-[#0F766E] rounded-xl border border-[#0F766E]/25 text-xs font-semibold flex items-center gap-1 disabled:opacity-30">
                                     <Wallet size={10} /> Aplicar
                                   </button>
                                 )}
-                                <button type="button" onClick={() => { setActiveTab('CUENTAS'); }} className="px-3 py-2 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20 text-[8px] font-black uppercase">Cobrar en CxC</button>
+                                <button type="button" onClick={() => { setActiveTab('CUENTAS'); }} className="px-3 py-2 bg-bm-ok-tint text-bm-ok rounded-xl border border-bm-ok/25 text-xs font-semibold">Cobrar en CxC</button>
                               </div>
                             );
                           })}
@@ -5693,21 +5730,21 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
             {walletSubTab === 'VUELOS' && (
               <div className={`${glass} rounded-3xl overflow-hidden`}>
-                <div className="p-5 border-b border-white/5 flex flex-wrap gap-3 justify-between items-center">
+                <div className="p-5 border-b border-bm-line flex flex-wrap gap-3 justify-between items-center">
                   <div>
-                    <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><PlaneTakeoff size={14} className="text-[#E1AD01]" /> Vuelos por cargar · desde {fmtDate(walletCorte)}</h3>
-                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Fuente: bitácora MRO (horas TAC). Cada vuelo se cobra una sola vez; lo que el saldo no cubra pasa a cuentas por cobrar.</p>
+                    <h3 className="text-[13px] font-semibold flex items-center gap-2"><PlaneTakeoff size={14} className="text-bm-red" /> Vuelos por cargar · desde {fmtDate(walletCorte)}</h3>
+                    <p className="text-xs text-bm-steel font-mono mt-1">Fuente: bitácora MRO (horas TAC). Cada vuelo se cobra una sola vez; lo que el saldo no cubra pasa a cuentas por cobrar.</p>
                   </div>
                   <button type="button" onClick={cargarTodosVuelos} disabled={!vuelosPorCargar.length || vueloCargando !== null}
-                    className="bg-[#E1AD01] text-black px-5 py-3 rounded-xl text-[9px] font-black uppercase flex items-center gap-2 disabled:opacity-30">
+                    className="bg-bm-red text-white px-5 py-3 rounded-xl text-xs font-semibold flex items-center gap-2 disabled:opacity-30">
                     {vueloCargando === 'ALL' ? <Loader2 size={12} className="animate-spin" /> : <PlaneTakeoff size={12} />} Cargar todos con tarifa
                   </button>
                 </div>
                 <div className="overflow-x-auto">
-                  <table className="w-full text-[10px] font-mono">
+                  <table className="w-full text-[13px] font-mono">
                     <thead>
-                      <tr className="text-zinc-600 text-[8px] uppercase tracking-widest">
-                        {['Fecha', 'Alumno', 'Aeronave', 'Misión', 'Horas', 'Tarifa', 'Monto', 'Saldo alumno', ''].map((h, i) => <th key={i} className={`p-3 font-black ${i >= 4 && i <= 7 ? 'text-right' : 'text-left'}`}>{h}</th>)}
+                      <tr className="text-bm-steel text-xs">
+                        {['Fecha', 'Alumno', 'Aeronave', 'Misión', 'Horas', 'Tarifa', 'Monto', 'Saldo alumno', ''].map((h, i) => <th key={i} className={`p-3 font-semibold ${i >= 4 && i <= 7 ? 'text-right' : 'text-left'}`}>{h}</th>)}
                       </tr>
                     </thead>
                     <tbody>
@@ -5717,22 +5754,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                         const saldo = saldoWallet.get(v.student_id ?? '') ?? 0;
                         const busy = vueloCargando === v.id || vueloCargando === 'ALL';
                         return (
-                          <tr key={v.id} className="border-t border-white/[0.04] hover:bg-white/[0.02]">
+                          <tr key={v.id} className="border-t border-bm-line hover:bg-bm-canvas">
                             <td className="p-3">{fmtDate(v.fecha)}</td>
-                            <td className="p-3 uppercase truncate max-w-[180px]">{alumnoPorId(v.student_id)?.nombre ?? '—'}</td>
-                            <td className="p-3 text-[#E1AD01] font-black">{v.matricula ?? '—'}</td>
-                            <td className="p-3 uppercase text-zinc-500">{[v.tipo_mision, v.destino].filter(Boolean).join(' · ') || '—'}</td>
-                            <td className="p-3 text-right font-black">{v.horas.toFixed(1)}</td>
-                            <td className="p-3 text-right">{t ? usd(t.precio_usd) : <span className="text-red-400">SIN TARIFA</span>}</td>
-                            <td className="p-3 text-right font-black text-white">{monto !== null ? usd(monto) : '—'}</td>
-                            <td className={`p-3 text-right ${monto !== null && saldo < monto ? 'text-yellow-400' : 'text-teal-400'}`}>{usd(saldo)}</td>
+                            <td className="p-3 truncate max-w-[180px]">{alumnoPorId(v.student_id)?.nombre ?? '—'}</td>
+                            <td className="p-3 text-bm-red font-semibold">{v.matricula ?? '—'}</td>
+                            <td className="p-3 text-bm-steel">{[v.tipo_mision, v.destino].filter(Boolean).join(' · ') || '—'}</td>
+                            <td className="p-3 text-right font-semibold">{v.horas.toFixed(1)}</td>
+                            <td className="p-3 text-right">{t ? usd(t.precio_usd) : <span className="text-bm-red">SIN TARIFA</span>}</td>
+                            <td className="p-3 text-right font-semibold text-bm-ink">{monto !== null ? usd(monto) : '—'}</td>
+                            <td className={`p-3 text-right ${monto !== null && saldo < monto ? 'text-[#8A6100]' : 'text-[#0F766E]'}`}>{usd(saldo)}</td>
                             <td className="p-3">
                               <div className="flex gap-1 justify-end">
-                                <button type="button" disabled={busy || !t} onClick={() => cargarVuelo(v, 'BILLETERA')} className="px-3 py-1.5 rounded-lg bg-[#E1AD01]/15 text-[#E1AD01] border border-[#E1AD01]/30 text-[8px] font-black uppercase disabled:opacity-30">
+                                <button type="button" disabled={busy || !t} onClick={() => cargarVuelo(v, 'BILLETERA')} className="px-3 py-1.5 rounded-lg bg-bm-red-tint text-bm-red border border-bm-red/25 text-xs font-semibold disabled:opacity-30">
                                   {vueloCargando === v.id ? <Loader2 size={10} className="animate-spin" /> : 'Cargar'}
                                 </button>
-                                <button type="button" disabled={busy} onClick={() => cargarVuelo(v, 'PAQUETE_LEGACY')} title="El alumno ya había pagado estas horas en el régimen anterior" className="px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[8px] font-black uppercase disabled:opacity-30">Paquete</button>
-                                <button type="button" disabled={busy} onClick={() => cargarVuelo(v, 'CORTESIA')} title="Sin cargo (vuelo de cortesía / reposición)" className="px-3 py-1.5 rounded-lg bg-white/5 text-zinc-400 border border-white/10 text-[8px] font-black uppercase disabled:opacity-30">Cortesía</button>
+                                <button type="button" disabled={busy} onClick={() => cargarVuelo(v, 'PAQUETE_LEGACY')} title="El alumno ya había pagado estas horas en el régimen anterior" className="px-3 py-1.5 rounded-lg bg-[#E8EEF9] text-[#2F5BB7] border border-[#2F5BB7]/25 text-xs font-semibold disabled:opacity-30">Paquete</button>
+                                <button type="button" disabled={busy} onClick={() => cargarVuelo(v, 'CORTESIA')} title="Sin cargo (vuelo de cortesía / reposición)" className="px-3 py-1.5 rounded-lg bg-bm-canvas text-bm-steel border border-bm-line text-xs font-semibold disabled:opacity-30">Cortesía</button>
                               </div>
                             </td>
                           </tr>
@@ -5748,37 +5785,37 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             {walletSubTab === 'TARIFARIO' && (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 <div className={`lg:col-span-4 ${glass} rounded-3xl p-6 space-y-4 h-fit`}>
-                  <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Settings size={14} className="text-teal-400" /> Política de billetera</h3>
+                  <h3 className="text-[13px] font-semibold flex items-center gap-2"><Settings size={14} className="text-[#0F766E]" /> Política de billetera</h3>
                   <div>
                     <Lbl>Fecha de inicio del régimen billetera</Lbl>
                     <input type="date" value={configForm.corte} onChange={e => setConfigForm(p => ({ ...p, corte: e.target.value }))} className={inp} style={noUpper} />
-                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Vuelos anteriores no aparecen en "Vuelos por cargar" (se rigen por los paquetes de horas).</p>
+                    <p className="text-xs text-bm-steel font-mono mt-1">Vuelos anteriores no aparecen en "Vuelos por cargar" (se rigen por los paquetes de horas).</p>
                   </div>
                   <div>
                     <Lbl>Límite de crédito por alumno (USD)</Lbl>
                     <input type="number" min="0" step="1" value={configForm.credito} onChange={e => setConfigForm(p => ({ ...p, credito: e.target.value }))} placeholder="VACÍO = SIN LÍMITE" className={inp} />
-                    <p className="text-[8px] text-zinc-600 font-mono mt-1">Si la deuda supera el límite, el consumo exige autorización explícita. Actual: {creditoMax === null ? 'sin límite' : usd(creditoMax)}.</p>
+                    <p className="text-xs text-bm-steel font-mono mt-1">Si la deuda supera el límite, el consumo exige autorización explícita. Actual: {creditoMax === null ? 'sin límite' : usd(creditoMax)}.</p>
                   </div>
-                  <button type="button" onClick={guardarConfig} disabled={savingWallet || !canManageFinance || !v17Instalado} className="w-full py-3.5 bg-teal-500 text-black rounded-xl text-[10px] font-black uppercase disabled:opacity-30 flex items-center justify-center gap-2">
+                  <button type="button" onClick={guardarConfig} disabled={savingWallet || !canManageFinance || !v17Instalado} className="w-full py-3.5 bg-[#0F766E] text-white rounded-xl text-[13px] font-semibold disabled:opacity-30 flex items-center justify-center gap-2">
                     {savingWallet ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />} Guardar política
                   </button>
                 </div>
                 <div className={`lg:col-span-8 ${glass} rounded-3xl overflow-hidden`}>
-                  <div className="p-5 border-b border-white/5 flex justify-between items-center">
-                    <h3 className="text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Receipt size={14} className="text-[#E1AD01]" /> Tarifario · {servicios.length} servicios</h3>
-                    <button type="button" onClick={() => abrirServicio()} disabled={!canManageFinance || !v17Instalado} className="bg-[#E1AD01] text-black px-4 py-2.5 rounded-xl text-[9px] font-black uppercase flex items-center gap-2 disabled:opacity-30"><PlusCircle size={12} /> Nuevo servicio</button>
+                  <div className="p-5 border-b border-bm-line flex justify-between items-center">
+                    <h3 className="text-[13px] font-semibold flex items-center gap-2"><Receipt size={14} className="text-bm-red" /> Tarifario · {servicios.length} servicios</h3>
+                    <button type="button" onClick={() => abrirServicio()} disabled={!canManageFinance || !v17Instalado} className="bg-bm-red text-white px-4 py-2.5 rounded-xl text-xs font-semibold flex items-center gap-2 disabled:opacity-30"><PlusCircle size={12} /> Nuevo servicio</button>
                   </div>
                   <div className="p-4 space-y-2 max-h-[620px] overflow-y-auto">
                     {servicios.map(s => (
-                      <div key={s.id} className={`p-4 rounded-2xl border flex justify-between items-center gap-3 ${s.activo ? 'border-white/[0.06] bg-white/[0.02]' : 'border-white/[0.03] opacity-50'}`}>
+                      <div key={s.id} className={`p-4 rounded-2xl border flex justify-between items-center gap-3 ${s.activo ? 'border-bm-line bg-bm-canvas/60' : 'border-bm-line opacity-50'}`}>
                         <div className="min-w-0 flex-1">
-                          <p className="text-[10px] font-black uppercase truncate flex items-center gap-2">
+                          <p className="text-[13px] font-semibold truncate flex items-center gap-2">
                             {s.nombre}{!s.activo && <Badge tone={TONE.red}>Inactivo</Badge>}{s.precio_usd === 0 && <Badge tone={TONE.orange}>Sin precio</Badge>}
                           </p>
-                          <p className="text-[8px] text-zinc-600 font-mono">{s.codigo} · {s.tipo} · {labelServicio(s.clase_servicio)}{s.aeronave_matricula ? ` · ${s.aeronave_matricula}` : ' · todas las aeronaves'}{s.sede ? ` · ${s.sede}` : ''}</p>
+                          <p className="text-xs text-bm-steel font-mono">{s.codigo} · {s.tipo} · {labelServicio(s.clase_servicio)}{s.aeronave_matricula ? ` · ${s.aeronave_matricula}` : ' · todas las aeronaves'}{s.sede ? ` · ${s.sede}` : ''}</p>
                         </div>
-                        <span className="text-base font-black italic text-[#E1AD01]">{usd(s.precio_usd)}<span className="text-[8px] text-zinc-600 not-italic"> /{s.unidad.toLowerCase()}</span></span>
-                        <button type="button" onClick={() => abrirServicio(s)} disabled={!canManageFinance} className="text-zinc-600 hover:text-[#E1AD01] p-2 disabled:opacity-30"><Pencil size={13} /></button>
+                        <span className="text-base text-bm-red bm-figure">{usd(s.precio_usd)}<span className="text-xs text-bm-steel not-italic"> /{s.unidad.toLowerCase()}</span></span>
+                        <button type="button" onClick={() => abrirServicio(s)} disabled={!canManageFinance} className="text-bm-steel hover:text-bm-red p-2 disabled:opacity-30"><Pencil size={13} /></button>
                       </div>
                     ))}
                     {servicios.length === 0 && <EmptyState icon={Receipt} text="Tarifario vacío" />}
@@ -5814,7 +5851,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const aplicaria = f.aplicar_deudas && Number.isFinite(montoUsd) ? round2(Math.min(saldo + montoUsd, deudaAplicable)) : 0;
         const cajaSel = cajaById(f.caja_id);
         return (
-          <ModalShell accent="border-t-emerald-500" maxW="max-w-2xl">
+          <ModalShell accent="border-t-bm-ok" maxW="max-w-2xl">
             <ModalHeader icon={Wallet} tone={TONE.emerald} title="Recargar billetera"
               subtitle={`${alumnoSel.nombre} · saldo ${usd(saldo)}${deudaAplicable > 0 ? ` · deuda aplicable ${usd(deudaAplicable)}` : ''}`} onClose={cerrarWalletModal} />
             <form onSubmit={handleRecarga} className="space-y-4">
@@ -5825,7 +5862,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 <AmountInput size="lg" value={f.monto} moneda={f.moneda} disabled={savingWallet} onChange={v => setRecargaForm(p => ({ ...p, monto: v }))} />
                 {f.moneda === 'BS' && (
                   <input type="number" step="0.0001" min="0.0001" required value={f.tasa} onChange={e => setRecargaForm(p => ({ ...p, tasa: e.target.value }))}
-                    className="w-full bg-black/50 border border-white/10 py-6 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-[#E1AD01] text-white" placeholder="Tasa Bs/USD" />
+                    className="w-full bg-white border border-bm-line py-6 px-4 rounded-2xl text-xl outline-none focus:border-bm-red text-bm-ink bm-figure" placeholder="Tasa Bs/USD" />
                 )}
               </div>
               <div>
@@ -5842,22 +5879,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               </div>
               <PagadorFields value={recargaPago} onChange={setRecargaPago} moneda={f.moneda} alumnos={alumnos} />
               {deudaAplicable > 0 && (
-                <label className="flex items-center gap-3 p-3 rounded-xl border border-yellow-500/20 bg-yellow-500/5 cursor-pointer">
+                <label className="flex items-center gap-3 p-3 rounded-xl border border-[#8A6100]/25 bg-[#FDF3D8]/60 cursor-pointer">
                   <input type="checkbox" checked={f.aplicar_deudas} onChange={e => setRecargaForm(p => ({ ...p, aplicar_deudas: e.target.checked }))} />
-                  <span className="text-[9px] text-yellow-300 font-black uppercase">Saldar primero sus deudas ({usd(deudaAplicable)} en CxC sin horas, las más antiguas primero)</span>
+                  <span className="text-xs text-[#8A6100] font-semibold">Saldar primero sus deudas ({usd(deudaAplicable)} en CxC sin horas, las más antiguas primero)</span>
                 </label>
               )}
               {Number.isFinite(montoUsd) && (
-                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
-                  <p className="text-emerald-400">+ {fmtMonto(monto, f.moneda)} · Bóveda {f.moneda}</p>
-                  <p className={cajaSel ? 'text-emerald-400' : 'text-red-400'}>{cajaSel ? `+ ${fmtMonto(monto, f.moneda)} · Caja ${cajaSel.nombre}` : 'Falta la caja'}</p>
-                  <p className="text-teal-400">+ {usd(montoUsd)} · Billetera {alumnoSel.nombre}{f.moneda === 'BS' ? ` (@ ${f.tasa})` : ''}</p>
-                  {aplicaria > 0 && <p className="text-yellow-400">− {usd(aplicaria)} · aplicado a deudas</p>}
-                  <p className="text-zinc-500 md:col-span-2">Anticipo (pasivo): se vuelve ingreso cuando el alumno consume vuelo, simulador o cursos.</p>
+                <div className="bg-bm-canvas border border-bm-line rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono">
+                  <p className="text-bm-ok">+ {fmtMonto(monto, f.moneda)} · Bóveda {f.moneda}</p>
+                  <p className={cajaSel ? 'text-bm-ok' : 'text-bm-red'}>{cajaSel ? `+ ${fmtMonto(monto, f.moneda)} · Caja ${cajaSel.nombre}` : 'Falta la caja'}</p>
+                  <p className="text-[#0F766E]">+ {usd(montoUsd)} · Billetera {alumnoSel.nombre}{f.moneda === 'BS' ? ` (@ ${f.tasa})` : ''}</p>
+                  {aplicaria > 0 && <p className="text-[#8A6100]">− {usd(aplicaria)} · aplicado a deudas</p>}
+                  <p className="text-bm-steel md:col-span-2">Anticipo (pasivo): se vuelve ingreso cuando el alumno consume vuelo, simulador o cursos.</p>
                 </div>
               )}
               <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
-              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-emerald-500 text-black hover:bg-emerald-400" label={<><Wallet size={14} /> Registrar recarga</>} />
+              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-bm-ok text-white hover:bg-[#13643F]" label={<><Wallet size={14} /> Registrar recarga</>} />
             </form>
           </ModalShell>
         );
@@ -5876,7 +5913,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const excede = creditoMax !== null && aCxc > 0 && deuda + aCxc > creditoMax;
         const unidad = servicios.find(s => s.id === f.servicio_id)?.unidad ?? TIPOS_CONSUMO.find(t => t.k === f.tipo)?.unidad ?? 'UNIDAD';
         return (
-          <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-2xl">
+          <ModalShell accent="border-t-bm-red" maxW="max-w-2xl">
             <ModalHeader icon={Receipt} tone={TONE.asiento} title="Registrar consumo" subtitle={`${alumnoSel.nombre} · saldo ${usd(saldo)}${deuda > 0 ? ` · deuda ${usd(deuda)}` : ''}`} onClose={cerrarWalletModal} />
             <form onSubmit={handleConsumo} className="space-y-4">
               <div><Lbl>Servicio del tarifario</Lbl>
@@ -5888,7 +5925,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               <div className="grid grid-cols-3 md:grid-cols-6 gap-1.5">
                 {TIPOS_CONSUMO.map(t => (
                   <button key={t.k} type="button" onClick={() => { setConsumoForm(p => ({ ...p, tipo: t.k })); setConsumoClase(c => ({ ...c, servicio: c.servicio || SERVICIO_POR_TIPO[t.k] })); }}
-                    className={`py-2.5 rounded-xl text-[8px] font-black uppercase border transition-all ${f.tipo === t.k ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/30' : optOff}`}>{t.l}</button>
+                    className={`py-2.5 rounded-xl text-xs font-semibold border transition-all ${f.tipo === t.k ? 'bg-bm-red-tint text-bm-red border-bm-red/25' : optOff}`}>{t.l}</button>
                 ))}
               </div>
               <div className="grid grid-cols-3 gap-3">
@@ -5902,28 +5939,28 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 <div className="grid grid-cols-3 gap-1.5">
                   {(['BILLETERA', 'PAQUETE_LEGACY', 'CORTESIA'] as ModoConsumo[]).map(m => (
                     <button key={m} type="button" onClick={() => setConsumoForm(p => ({ ...p, modo: m }))}
-                      className={`py-2.5 rounded-xl text-[8px] font-black uppercase border transition-all ${f.modo === m ? 'bg-teal-500/15 text-teal-400 border-teal-500/30' : optOff}`}>{MODO_CONSUMO_LABEL[m]}</button>
+                      className={`py-2.5 rounded-xl text-xs font-semibold border transition-all ${f.modo === m ? 'bg-[#E6F4F2] text-[#0F766E] border-[#0F766E]/25' : optOff}`}>{MODO_CONSUMO_LABEL[m]}</button>
                   ))}
                 </div>
               </div>
               <ClaseFields value={consumoClase} onChange={setConsumoClase} flota={flota} pilotos={pilotosLista} naturaleza="INGRESO" titulo="Clase del ingreso (aeronave · instructor · sede)" />
               {Number.isFinite(total) && (
-                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-3 gap-2 text-center">
-                  {([['Total', total, 'text-white'], ['De la billetera', desdeW, 'text-teal-400'], ['A cuentas por cobrar', aCxc, aCxc > 0 ? 'text-yellow-400' : 'text-zinc-600']] as const).map(([l, v, c]) => (
-                    <div key={l}><p className="text-[7px] text-zinc-600 font-black uppercase">{l}</p><p className={`text-base font-black italic ${c}`}>{usd(v)}</p></div>
+                <div className="bg-bm-canvas border border-bm-line rounded-2xl p-4 grid grid-cols-3 gap-2 text-center">
+                  {([['Total', total, 'text-bm-ink'], ['De la billetera', desdeW, 'text-[#0F766E]'], ['A cuentas por cobrar', aCxc, aCxc > 0 ? 'text-[#8A6100]' : 'text-bm-steel']] as const).map(([l, v, c]) => (
+                    <div key={l}><p className="text-[11px] text-bm-steel font-semibold">{l}</p><p className={`text-base bm-figure ${c}`}>{usd(v)}</p></div>
                   ))}
                 </div>
               )}
-              {aCxc > 0 && <p className="text-[9px] text-yellow-300 font-mono">El saldo no alcanza: {usd(aCxc)} se registran como deuda del alumno (CxC) y se cobran luego o con su próxima recarga.</p>}
+              {aCxc > 0 && <p className="text-xs text-[#8A6100] font-mono">El saldo no alcanza: {usd(aCxc)} se registran como deuda del alumno (CxC) y se cobran luego o con su próxima recarga.</p>}
               {excede && (
-                <label className="flex items-center gap-3 p-3 rounded-xl border border-red-500/30 bg-red-500/5 cursor-pointer">
+                <label className="flex items-center gap-3 p-3 rounded-xl border border-bm-red/25 bg-bm-red-tint/60 cursor-pointer">
                   <input type="checkbox" checked={f.autorizar} onChange={e => setConsumoForm(p => ({ ...p, autorizar: e.target.checked }))} />
-                  <span className="text-[9px] text-red-300 font-black uppercase">Supera el límite de crédito ({usd(creditoMax ?? 0)}): autorizo el consumo</span>
+                  <span className="text-xs text-bm-red font-semibold">Supera el límite de crédito ({usd(creditoMax ?? 0)}): autorizo el consumo</span>
                 </label>
               )}
               <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
               <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} disabled={excede && !f.autorizar}
-                submitCls="bg-[#E1AD01] text-black hover:bg-white" label={<><Receipt size={14} /> Registrar consumo</>} />
+                submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><Receipt size={14} /> Registrar consumo</>} />
             </form>
           </ModalShell>
         );
@@ -5931,25 +5968,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
       {/* [NEW v17] AJUSTE */}
       {walletModal === 'AJUSTE' && alumnoSel && (
-        <ModalShell accent="border-t-violet-500">
+        <ModalShell accent="border-t-[#6D28D9]">
           <ModalHeader icon={Scale} tone={TONE.fin} title="Ajuste de billetera" subtitle={`${alumnoSel.nombre} · saldo ${usd(saldoWallet.get(alumnoSel.student_id) ?? 0)}`} onClose={cerrarWalletModal} />
           <form onSubmit={handleAjuste} className="space-y-4">
             <div className="grid grid-cols-3 gap-1.5">
               {(['SALDO_INICIAL', 'AJUSTE_CREDITO', 'AJUSTE_DEBITO'] as AjusteTipo[]).map(t => (
                 <button key={t} type="button" onClick={() => setAjusteForm(p => ({ ...p, tipo: t }))}
-                  className={`py-2.5 rounded-xl text-[8px] font-black uppercase border transition-all ${ajusteForm.tipo === t ? 'bg-violet-500/15 text-violet-400 border-violet-500/30' : optOff}`}>{WALLET_MOV_LABEL[t]}</button>
+                  className={`py-2.5 rounded-xl text-xs font-semibold border transition-all ${ajusteForm.tipo === t ? 'bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25' : optOff}`}>{WALLET_MOV_LABEL[t]}</button>
               ))}
             </div>
-            <p className="text-[8px] text-zinc-500 font-mono">
+            <p className="text-xs text-bm-steel font-mono">
               {ajusteForm.tipo === 'SALDO_INICIAL' ? 'Migración de saldos previos (no afecta el P&L).'
                 : ajusteForm.tipo === 'AJUSTE_CREDITO' ? 'Bonificación / descuento: aumenta el saldo y resta ingresos en el P&L.'
                 : 'Cargo adicional sin servicio del tarifario: disminuye el saldo y suma ingresos.'} No mueve caja. Requiere clave de director.
             </p>
-            <AmountInput size="lg" value={ajusteForm.monto} moneda="USDT" prefixCls="text-violet-400" onChange={v => setAjusteForm(p => ({ ...p, monto: v }))} />
+            <AmountInput size="lg" value={ajusteForm.monto} moneda="USDT" prefixCls="text-[#6D28D9]" onChange={v => setAjusteForm(p => ({ ...p, monto: v }))} />
             <textarea value={ajusteForm.motivo} onChange={e => setAjusteForm(p => ({ ...p, motivo: e.target.value }))} rows={2} placeholder="MOTIVO (obligatorio, queda en auditoría)"
-              className="w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-violet-500/60 resize-none uppercase" />
+              className="w-full bg-white border border-bm-line p-4 rounded-2xl text-bm-ink text-xs font-mono outline-none focus:border-[#6D28D9] resize-none uppercase" />
             <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
-            <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-violet-500 text-white hover:bg-violet-400" label={<><KeyRound size={13} /> Registrar ajuste</>} />
+            <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-[#6D28D9] text-bm-ink hover:bg-[#5B21B6]" label={<><KeyRound size={13} /> Registrar ajuste</>} />
           </form>
         </ModalShell>
       )}
@@ -5962,10 +5999,10 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const origen = Number.isFinite(montoUsd) && montoUsd > 0 ? (f.moneda === 'BS' ? round2(montoUsd * tasa) : round2(montoUsd)) : NaN;
         const cajaSel = cajaById(f.caja_id);
         return (
-          <ModalShell accent="border-t-red-500" maxW="max-w-xl">
+          <ModalShell accent="border-t-bm-red" maxW="max-w-xl">
             <ModalHeader icon={MinusCircle} tone={TONE.red} title="Reembolso al alumno" subtitle={`${alumnoSel.nombre} · saldo ${usd(saldoWallet.get(alumnoSel.student_id) ?? 0)}`} onClose={cerrarWalletModal} />
             <form onSubmit={handleReembolso} className="space-y-4">
-              <div><Lbl>Monto a devolver (USD de billetera)</Lbl><AmountInput size="lg" value={f.monto_usd} moneda="USDT" prefixCls="text-red-400" onChange={v => setReembolsoForm(p => ({ ...p, monto_usd: v }))} /></div>
+              <div><Lbl>Monto a devolver (USD de billetera)</Lbl><AmountInput size="lg" value={f.monto_usd} moneda="USDT" prefixCls="text-bm-red" onChange={v => setReembolsoForm(p => ({ ...p, monto_usd: v }))} /></div>
               <div><Lbl>Se paga en</Lbl><MonedaPicker value={f.moneda} onChange={m => setReembolsoForm(p => ({ ...p, moneda: m, caja_id: ajustarCaja(p.caja_id, m) }))} /></div>
               {f.moneda === 'BS' && <div><Lbl>Tasa Bs/USD</Lbl><input type="number" step="0.0001" min="0.0001" value={f.tasa} onChange={e => setReembolsoForm(p => ({ ...p, tasa: e.target.value }))} className={inp} /></div>}
               <select value={f.caja_id} onChange={e => setReembolsoForm(p => ({ ...p, caja_id: e.target.value }))} className={inp}>
@@ -5979,14 +6016,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               </div>
               <input value={f.concepto} onChange={e => setReembolsoForm(p => ({ ...p, concepto: e.target.value }))} placeholder="MOTIVO DEL REEMBOLSO" className={inp} />
               {Number.isFinite(origen) && (
-                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
-                  <p className="text-red-400">− {fmtMonto(origen, f.moneda)} · Bóveda {f.moneda}</p>
-                  <p className={cajaSel ? 'text-red-400' : 'text-zinc-600'}>{cajaSel ? `− ${fmtMonto(origen, f.moneda)} · Caja ${cajaSel.nombre}` : 'Falta la caja'}</p>
-                  <p className="text-teal-400">− {usd(montoUsd)} · Billetera (cancela anticipo, no es gasto)</p>
+                <div className="bg-bm-canvas border border-bm-line rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono">
+                  <p className="text-bm-red">− {fmtMonto(origen, f.moneda)} · Bóveda {f.moneda}</p>
+                  <p className={cajaSel ? 'text-bm-red' : 'text-bm-steel'}>{cajaSel ? `− ${fmtMonto(origen, f.moneda)} · Caja ${cajaSel.nombre}` : 'Falta la caja'}</p>
+                  <p className="text-[#0F766E]">− {usd(montoUsd)} · Billetera (cancela anticipo, no es gasto)</p>
                 </div>
               )}
               <ErrorBanner msg={walletError} onClose={() => setWalletError(null)} />
-              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-red-500 text-white hover:bg-red-400" label={<><KeyRound size={13} /> Registrar reembolso</>} />
+              <ModalActions onCancel={cerrarWalletModal} busy={savingWallet} submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><KeyRound size={13} /> Registrar reembolso</>} />
             </form>
           </ModalShell>
         );
@@ -5994,19 +6031,19 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
       {/* [NEW v17] MOTIVO: revertir movimiento / anular consumo */}
       {motivoAccion && (
-        <ModalShell accent="border-t-red-500" z="z-[96]">
+        <ModalShell accent="border-t-bm-red" z="z-[96]">
           <ModalHeader icon={Undo2} tone={TONE.red} title={motivoAccion.titulo} subtitle="Contra-asiento auditado · requiere clave de director" onClose={() => setMotivoAccion(null)} />
-          <p className="text-[10px] text-zinc-300 font-mono mb-4">{motivoAccion.detalle}</p>
+          <p className="text-[13px] text-bm-ink font-mono mb-4">{motivoAccion.detalle}</p>
           <textarea value={motivoTexto} onChange={e => setMotivoTexto(e.target.value)} rows={3} placeholder="MOTIVO (obligatorio, mínimo 5 caracteres)"
-            className="w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-red-500/60 resize-none uppercase mb-4" />
+            className="w-full bg-white border border-bm-line p-4 rounded-2xl text-bm-ink text-xs font-mono outline-none focus:border-bm-red resize-none uppercase mb-4" />
           <ModalActions onCancel={() => setMotivoAccion(null)} onSubmit={confirmarMotivo} busy={false} disabled={motivoTexto.trim().length < 5}
-            submitCls="bg-red-500 text-white hover:bg-red-400" label={<><Undo2 size={13} /> Continuar</>} />
+            submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><Undo2 size={13} /> Continuar</>} />
         </ModalShell>
       )}
 
       {/* [NEW v17] SERVICIO DEL TARIFARIO */}
       {servicioEdit && (
-        <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-xl">
+        <ModalShell accent="border-t-bm-red" maxW="max-w-xl">
           <ModalHeader icon={Receipt} tone={TONE.asiento} title={servicioEdit.id ? 'Editar servicio' : 'Nuevo servicio'} subtitle="Tarifa en USD por unidad" onClose={() => setServicioEdit(null)} />
           <div className="grid grid-cols-2 gap-3">
             <input value={servicioEdit.codigo} onChange={e => setServicioEdit(p => p && ({ ...p, codigo: e.target.value }))} placeholder="CÓDIGO (ej. VUELO-YV1234)" className={inp} />
@@ -6031,22 +6068,22 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               {SERVICIOS_PL.filter(s => s.n === 'INGRESO').map(s => <option key={s.k} value={s.k}>{s.cod} · {s.l}</option>)}
             </select>
             <input value={servicioEdit.notas} onChange={e => setServicioEdit(p => p && ({ ...p, notas: e.target.value }))} placeholder="NOTAS" className={`${inp} col-span-2`} style={noUpper} />
-            <label className="col-span-2 flex items-center gap-3 text-[9px] font-black uppercase text-zinc-400">
+            <label className="col-span-2 flex items-center gap-3 text-xs font-semibold text-bm-steel">
               <input type="checkbox" checked={servicioEdit.activo} onChange={e => setServicioEdit(p => p && ({ ...p, activo: e.target.checked }))} /> Activo (disponible para cobrar)
             </label>
           </div>
           <div className="my-4"><ErrorBanner msg={walletError} onClose={() => setWalletError(null)} /></div>
-          <ModalActions onCancel={() => setServicioEdit(null)} onSubmit={guardarServicio} busy={savingWallet} submitCls="bg-[#E1AD01] text-black hover:bg-white" label={<><ShieldCheck size={13} /> Guardar</>} />
+          <ModalActions onCancel={() => setServicioEdit(null)} onSubmit={guardarServicio} busy={savingWallet} submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><ShieldCheck size={13} /> Guardar</>} />
         </ModalShell>
       )}
 
       {/* [NEW v17] CLASE CONTABLE (reclasificación) */}
       {reclasAccion && (
-        <ModalShell accent="border-t-teal-500" maxW="max-w-lg">
+        <ModalShell accent="border-t-[#0F766E]" maxW="max-w-lg">
           <ModalHeader icon={Tag} tone={TONE.fx} title="Clase contable" subtitle={reclasAccion.titulo} onClose={() => setReclasAccion(null)} />
           <ClaseFields value={reclasForm} onChange={setReclasForm} flota={flota} pilotos={pilotosLista} />
-          <p className="text-[8px] text-zinc-600 font-mono my-3">Solo cambia la clasificación para el P&amp;L por clase. No modifica montos, cajas ni asientos.</p>
-          <ModalActions onCancel={() => setReclasAccion(null)} onSubmit={handleReclasificar} busy={savingWallet} submitCls="bg-teal-500 text-black hover:bg-teal-400" label={<><Tag size={13} /> Guardar clase</>} />
+          <p className="text-xs text-bm-steel font-mono my-3">Solo cambia la clasificación para el P&amp;L por clase. No modifica montos, cajas ni asientos.</p>
+          <ModalActions onCancel={() => setReclasAccion(null)} onSubmit={handleReclasificar} busy={savingWallet} submitCls="bg-[#0F766E] text-white hover:bg-[#0B5E58]" label={<><Tag size={13} /> Guardar clase</>} />
         </ModalShell>
       )}
 
@@ -6070,15 +6107,15 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
           ? round2(cxc.horas_prometidas * Math.min(1, (cxc.monto_pagado + aplicado) / cxc.monto_total) - cxc.horas_compradas) : 0;
         const conTasa = requiereTasa(cobroForm.moneda, monedaCuenta);
         const signo   = esCxC ? '+' : '−';
-        const tonoMov = esCxC ? 'text-emerald-400' : 'text-red-400';
+        const tonoMov = esCxC ? 'text-bm-ok' : 'text-bm-red';
         const cerrar  = () => { setCobroModal(null); setCobroError(null); };
         return (
-          <ModalShell accent={esCxC ? 'border-t-emerald-500' : esPrest ? 'border-t-violet-500' : 'border-t-orange-500'} maxW="max-w-xl">
+          <ModalShell accent={esCxC ? 'border-t-bm-ok' : esPrest ? 'border-t-[#6D28D9]' : 'border-t-bm-warn'} maxW="max-w-xl">
             <ModalHeader icon={esCxC ? ArrowUpCircle : ArrowDownCircle} tone={esCxC ? TONE.emerald : TONE.orange}
               title={esCxC ? 'Registrar cobro' : esPrest ? 'Devolver préstamo' : 'Registrar pago'} subtitle={`${nombre} · ${cuenta.concepto}`} onClose={cerrar} />
-            <div className="bg-black/30 rounded-xl p-4 mb-4 grid grid-cols-2 gap-3 text-center">
-              <div><p className="text-[8px] text-zinc-600 font-black uppercase">Pendiente</p><p className="text-lg font-black italic text-white">{fmtMonto(pendiente, monedaCuenta)}</p></div>
-              <div><p className="text-[8px] text-zinc-600 font-black uppercase">Queda después</p><p className={`text-lg font-black italic ${exceso ? 'text-red-400' : 'text-[#E1AD01]'}`}>{fmtMonto(nuevoPend, monedaCuenta)}</p></div>
+            <div className="bg-bm-canvas rounded-xl p-4 mb-4 grid grid-cols-2 gap-3 text-center">
+              <div><p className="text-xs text-bm-steel font-semibold">Pendiente</p><p className="text-lg text-bm-ink bm-figure">{fmtMonto(pendiente, monedaCuenta)}</p></div>
+              <div><p className="text-xs text-bm-steel font-semibold">Queda después</p><p className={`text-lg bm-figure ${exceso ? 'text-bm-red' : 'text-bm-red'}`}>{fmtMonto(nuevoPend, monedaCuenta)}</p></div>
             </div>
             <form onSubmit={handleCobroPago} className="space-y-4">
               <div><Lbl>{esCxC ? 'Moneda recibida' : 'Moneda con que se paga'}</Lbl><MonedaPicker value={cobroForm.moneda} onChange={setCobroMoneda} /></div>
@@ -6103,7 +6140,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 <AmountInput value={cobroForm.monto} moneda={cobroForm.moneda} onChange={v => setCobroForm(p => ({ ...p, monto: v }))} />
                 {conTasa && (
                   <input type="number" step="0.0001" min="0.0001" required value={cobroForm.tasa} onChange={e => setCobroForm(p => ({ ...p, tasa: e.target.value }))}
-                    className="w-full bg-black/50 border border-white/10 py-4 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-[#E1AD01] text-white" placeholder="Tasa Bs/USD" />
+                    className="w-full bg-white border border-bm-line py-4 px-4 rounded-2xl text-xl outline-none focus:border-bm-red text-bm-ink bm-figure" placeholder="Tasa Bs/USD" />
                 )}
               </div>
               {esCxC && <PagadorFields value={cobroPago} onChange={setCobroPago} moneda={cobroForm.moneda} alumnos={alumnos} />}
@@ -6112,16 +6149,16 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 <input type="date" required value={cobroForm.fecha} onChange={e => setCobroForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
               </div>
               {aplicado !== null && Number.isFinite(recibido) && (
-                <div className="bg-black/30 border border-white/10 rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
+                <div className="bg-bm-canvas border border-bm-line rounded-2xl p-4 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono">
                   <p className={tonoMov}>{signo} {fmtMonto(recibido, cobroForm.moneda)} · Bóveda {cobroForm.moneda}{esPrest ? ' (financiamiento)' : ''}</p>
-                  <p className={cajaSel ? tonoMov : 'text-zinc-600'}>{cajaSel ? `${signo} ${fmtMonto(recibido, cobroForm.moneda)} · Caja ${cajaSel.nombre}${esEfe ? ` (${cobroForm.subcaja})` : ''}` : 'Sin caja: quedará sin ubicar'}</p>
-                  <p className="text-[#E1AD01]">− {fmtMonto(aplicado, monedaCuenta)} · {esCxC ? 'CxC' : 'CxP'} {nombre}</p>
-                  {esCxC && <p className="text-[#E1AD01]">+ {horasDelta}h acreditadas al alumno</p>}
+                  <p className={cajaSel ? tonoMov : 'text-bm-steel'}>{cajaSel ? `${signo} ${fmtMonto(recibido, cobroForm.moneda)} · Caja ${cajaSel.nombre}${esEfe ? ` (${cobroForm.subcaja})` : ''}` : 'Sin caja: quedará sin ubicar'}</p>
+                  <p className="text-bm-red">− {fmtMonto(aplicado, monedaCuenta)} · {esCxC ? 'CxC' : 'CxP'} {nombre}</p>
+                  {esCxC && <p className="text-bm-red">+ {horasDelta}h acreditadas al alumno</p>}
                 </div>
               )}
               <ErrorBanner msg={cobroError} onClose={() => setCobroError(null)} />
               <ModalActions onCancel={cerrar} busy={savingCobro} disabled={aplicado === null || exceso}
-                submitCls={esCxC ? 'bg-emerald-500 text-black hover:bg-emerald-400' : 'bg-orange-500 text-black hover:bg-orange-400'}
+                submitCls={esCxC ? 'bg-bm-ok text-white hover:bg-[#13643F]' : 'bg-bm-warn text-white hover:bg-[#9A4708]'}
                 label={<><CheckCircle2 size={14} /> {esCxC ? 'Registrar cobro' : esPrest ? 'Registrar devolución' : 'Registrar pago'}</>} />
             </form>
           </ModalShell>
@@ -6130,25 +6167,25 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
 
       {/* ENTREGA ADM → CEO */}
       {entregaCEOModal && (
-        <ModalShell accent="border-t-yellow-500">
+        <ModalShell accent="border-t-[#8A6100]">
           <ModalHeader icon={ArrowLeftRight} tone={TONE.yellow} title="Entrega Efectivo a CEO" subtitle="Sale de ADM → Entra a CEO" onClose={() => setEntregaCEOModal(false)} />
-          <div className="grid grid-cols-2 gap-4 bg-black/30 rounded-xl p-4 mb-4">
+          <div className="grid grid-cols-2 gap-4 bg-bm-canvas rounded-xl p-4 mb-4">
             <div className="text-center">
-              <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Stand-By ADM</p>
-              <p className={`font-black italic ${saldoEfectivoADM >= 0 ? 'text-yellow-400' : 'text-red-400'}`}>{fmtMonto(saldoEfectivoADM, 'CASH')}</p>
+              <p className="text-xs text-bm-steel font-semibold mb-1">Stand-By ADM</p>
+              <p className={`font-semibold bm-num ${saldoEfectivoADM >= 0 ? 'text-[#8A6100]' : 'text-bm-red'}`}>{fmtMonto(saldoEfectivoADM, 'CASH')}</p>
             </div>
             <div className="text-center">
-              <p className="text-[8px] text-zinc-600 font-black uppercase tracking-widest mb-1">Custodia CEO</p>
-              <p className="text-yellow-400 font-black italic">{fmtMonto(saldoEfectivoCEO, 'CASH')}</p>
+              <p className="text-xs text-bm-steel font-semibold mb-1">Custodia CEO</p>
+              <p className="text-[#8A6100] font-semibold bm-num">{fmtMonto(saldoEfectivoCEO, 'CASH')}</p>
             </div>
           </div>
           <form onSubmit={handleEntregaCEO} className="space-y-4">
             <input type="date" required value={entregaCEOForm.fecha} onChange={e => setEntregaCEOForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
-            <AmountInput size="lg" value={entregaCEOForm.monto} moneda="CASH" prefixCls="text-yellow-400" focusCls="focus:border-yellow-500" disabled={savingCaja}
+            <AmountInput size="lg" value={entregaCEOForm.monto} moneda="CASH" prefixCls="text-[#8A6100]" focusCls="focus:border-[#8A6100]" disabled={savingCaja}
               onChange={v => setEntregaCEOForm(p => ({ ...p, monto: v }))} />
             <input required value={entregaCEOForm.concepto} onChange={e => setEntregaCEOForm(p => ({ ...p, concepto: e.target.value }))} placeholder="CONCEPTO (ej: COBRO PAQUETE 10H - CARLOS PÉREZ)" className={inp} disabled={savingCaja} />
             <ErrorBanner msg={cajaError} onClose={() => setCajaError(null)} />
-            <ModalActions onCancel={() => setEntregaCEOModal(false)} busy={savingCaja} submitCls="bg-yellow-500 text-black hover:bg-yellow-400" label={<><ArrowLeftRight size={14} /> Confirmar Entrega</>} />
+            <ModalActions onCancel={() => setEntregaCEOModal(false)} busy={savingCaja} submitCls="bg-[#C99700] text-white hover:bg-[#A87E00]" label={<><ArrowLeftRight size={14} /> Confirmar Entrega</>} />
           </form>
         </ModalShell>
       )}
@@ -6166,23 +6203,23 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const involvesBS   = fxForm.moneda_origen === 'BS' || fxForm.moneda_destino === 'BS';
         const cerrar = () => { setFxModalOpen(false); setFxError(null); };
         const lados = [
-          { lado: 'ORIGEN' as const, titulo: 'Sale · moneda que vendes', box: 'border-red-500/15 bg-red-500/[0.03]', tt: 'text-red-400',
+          { lado: 'ORIGEN' as const, titulo: 'Sale · moneda que vendes', box: 'border-bm-red/25 bg-bm-red-tint/60', tt: 'text-bm-red',
             moneda: fxForm.moneda_origen, otra: fxForm.moneda_destino, cajaId: fxForm.caja_origen_id, esEfe: esEfeO, subcaja: fxForm.subcaja_origen,
             labelCaja: 'Caja de donde sale', vacia: 'SOLO BÓVEDA · no estaba en una caja',
             setCaja: (v: string) => setFxForm(p => ({ ...p, caja_origen_id: v })), setSub: (s: SubcajaEfectivo) => setFxForm(p => ({ ...p, subcaja_origen: s })) },
-          { lado: 'DESTINO' as const, titulo: 'Entra · moneda que recibes', box: 'border-emerald-500/15 bg-emerald-500/[0.03]', tt: 'text-emerald-400',
+          { lado: 'DESTINO' as const, titulo: 'Entra · moneda que recibes', box: 'border-bm-ok/25 bg-bm-ok-tint/60', tt: 'text-bm-ok',
             moneda: fxForm.moneda_destino, otra: fxForm.moneda_origen, cajaId: fxForm.caja_destino_id, esEfe: esEfeD, subcaja: fxForm.subcaja_destino,
             labelCaja: 'Caja donde entra', vacia: 'SOLO BÓVEDA · sin caja física',
             setCaja: (v: string) => setFxForm(p => ({ ...p, caja_destino_id: v })), setSub: (s: SubcajaEfectivo) => setFxForm(p => ({ ...p, subcaja_destino: s })) },
         ];
         return (
-          <ModalShell accent="border-t-teal-500" maxW="max-w-3xl">
+          <ModalShell accent="border-t-[#0F766E]" maxW="max-w-3xl">
             <ModalHeader icon={TrendingUp} tone={TONE.fx} title="FX Desk — Cambio de moneda" subtitle="Sale de la bóveda/caja origen y entra a la bóveda/caja destino en una sola operación" onClose={cerrar} />
             <form onSubmit={handleFX} className="space-y-5">
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {lados.map(L => (
                   <div key={L.lado} className={`rounded-2xl border p-4 space-y-3 ${L.box}`}>
-                    <p className={`text-[9px] font-black uppercase tracking-widest ${L.tt}`}>{L.titulo}</p>
+                    <p className={`text-xs font-semibold ${L.tt}`}>{L.titulo}</p>
                     <MonedaPicker value={L.moneda} onChange={m => setFxMoneda(L.lado, m)} isDisabled={m => m === L.otra} />
                     <div>
                       <Lbl>{L.labelCaja}</Lbl>
@@ -6193,45 +6230,45 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                     </div>
                     {L.esEfe && <SubcajaToggle value={L.subcaja} onChange={L.setSub} />}
                     {L.lado === 'ORIGEN' ? (
-                      <div className="text-[8px] font-mono space-y-0.5">
-                        <p className={moSafe > saldoBovedaO ? 'text-red-400' : 'text-zinc-500'}>Bóveda {fxForm.moneda_origen}: {fmtMonto(saldoBovedaO, fxForm.moneda_origen)}</p>
+                      <div className="text-xs font-mono space-y-0.5">
+                        <p className={moSafe > saldoBovedaO ? 'text-bm-red' : 'text-bm-steel'}>Bóveda {fxForm.moneda_origen}: {fmtMonto(saldoBovedaO, fxForm.moneda_origen)}</p>
                         {saldoCajaO !== null && cajaO && (
-                          <p className={moSafe > saldoCajaO ? 'text-red-400' : 'text-zinc-500'}>{cajaO.nombre}{esEfeO ? ` (${fxForm.subcaja_origen})` : ''}: {fmtMonto(saldoCajaO, fxForm.moneda_origen)}</p>
+                          <p className={moSafe > saldoCajaO ? 'text-bm-red' : 'text-bm-steel'}>{cajaO.nombre}{esEfeO ? ` (${fxForm.subcaja_origen})` : ''}: {fmtMonto(saldoCajaO, fxForm.moneda_origen)}</p>
                         )}
                       </div>
-                    ) : <p className="text-[8px] font-mono text-zinc-500">Bóveda {fxForm.moneda_destino}: {fmtMonto(getVaultBalance(fxForm.moneda_destino), fxForm.moneda_destino)}</p>}
+                    ) : <p className="text-xs font-mono text-bm-steel">Bóveda {fxForm.moneda_destino}: {fmtMonto(getVaultBalance(fxForm.moneda_destino), fxForm.moneda_destino)}</p>}
                   </div>
                 ))}
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Lbl cls="text-teal-400">Monto {fxForm.moneda_origen} que sale</Lbl>
-                  <AmountInput value={fxForm.monto_origen} moneda={fxForm.moneda_origen} focusCls="focus:border-teal-500" onChange={v => setFxForm(p => ({ ...p, monto_origen: v }))} />
+                  <Lbl cls="text-[#0F766E]">Monto {fxForm.moneda_origen} que sale</Lbl>
+                  <AmountInput value={fxForm.monto_origen} moneda={fxForm.moneda_origen} focusCls="focus:border-[#0F766E]" onChange={v => setFxForm(p => ({ ...p, monto_origen: v }))} />
                 </div>
                 <div>
-                  <Lbl cls="text-teal-400">{involvesBS ? 'Tasa (Bs por 1 USD)' : 'Factor neto (1 = sin comisión)'}</Lbl>
+                  <Lbl cls="text-[#0F766E]">{involvesBS ? 'Tasa (Bs por 1 USD)' : 'Factor neto (1 = sin comisión)'}</Lbl>
                   <input type="number" step="0.0001" min="0.0001" required value={fxForm.tasa} onChange={e => setFxForm(p => ({ ...p, tasa: e.target.value }))}
-                    className="w-full bg-black/50 border border-white/10 py-4 px-4 rounded-2xl text-xl font-black italic outline-none focus:border-teal-500 text-white" placeholder={involvesBS ? String(tasaBCV) : '1'} />
+                    className="w-full bg-white border border-bm-line py-4 px-4 rounded-2xl text-xl outline-none focus:border-[#0F766E] text-bm-ink bm-figure" placeholder={involvesBS ? String(tasaBCV) : '1'} />
                   {involvesBS && (
-                    <button type="button" onClick={() => setFxForm(p => ({ ...p, tasa: String(tasaBCV) }))} className="text-[8px] text-zinc-500 hover:text-teal-400 font-mono mt-1">Usar tasa BCV del sistema ({tasaBCV})</button>
+                    <button type="button" onClick={() => setFxForm(p => ({ ...p, tasa: String(tasaBCV) }))} className="text-xs text-bm-steel hover:text-[#0F766E] font-mono mt-1">Usar tasa BCV del sistema ({tasaBCV})</button>
                   )}
                 </div>
               </div>
 
               {fxMontoDestino !== null && (
-                <div className="bg-teal-500/5 border border-teal-500/20 rounded-2xl p-4 space-y-3">
+                <div className="bg-[#E6F4F2]/60 border border-[#0F766E]/25 rounded-2xl p-4 space-y-3">
                   <div className="flex items-center justify-between">
-                    <p className="text-[9px] text-teal-400 font-black uppercase tracking-widest">Recibes</p>
-                    <p className={`text-xl font-black italic ${MONEDA_COLOR[fxForm.moneda_destino]}`}>{fmtMonto(fxMontoDestino, fxForm.moneda_destino)}</p>
+                    <p className="text-xs text-[#0F766E] font-semibold">Recibes</p>
+                    <p className={`text-xl bm-figure ${MONEDA_COLOR[fxForm.moneda_destino]}`}>{fmtMonto(fxMontoDestino, fxForm.moneda_destino)}</p>
                   </div>
-                  <div className="border-t border-teal-500/10 pt-3 grid grid-cols-1 md:grid-cols-2 gap-2 text-[9px] font-mono">
-                    <p className="text-red-400">− {fmtMonto(moSafe, fxForm.moneda_origen)} · Bóveda {fxForm.moneda_origen}</p>
-                    <p className="text-emerald-400">+ {fmtMonto(fxMontoDestino, fxForm.moneda_destino)} · Bóveda {fxForm.moneda_destino}</p>
-                    <p className={cajaO ? 'text-red-400' : 'text-zinc-600'}>{cajaO ? `− ${fmtMonto(moSafe, fxForm.moneda_origen)} · Caja ${cajaO.nombre}${esEfeO ? ` (${fxForm.subcaja_origen})` : ''}` : 'Sin movimiento de caja origen'}</p>
-                    <p className={cajaD ? 'text-emerald-400' : 'text-zinc-600'}>{cajaD ? `+ ${fmtMonto(fxMontoDestino, fxForm.moneda_destino)} · Caja ${cajaD.nombre}${esEfeD ? ` (${fxForm.subcaja_destino})` : ''}` : 'Sin movimiento de caja destino'}</p>
+                  <div className="border-t border-[#0F766E]/25 pt-3 grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-mono">
+                    <p className="text-bm-red">− {fmtMonto(moSafe, fxForm.moneda_origen)} · Bóveda {fxForm.moneda_origen}</p>
+                    <p className="text-bm-ok">+ {fmtMonto(fxMontoDestino, fxForm.moneda_destino)} · Bóveda {fxForm.moneda_destino}</p>
+                    <p className={cajaO ? 'text-bm-red' : 'text-bm-steel'}>{cajaO ? `− ${fmtMonto(moSafe, fxForm.moneda_origen)} · Caja ${cajaO.nombre}${esEfeO ? ` (${fxForm.subcaja_origen})` : ''}` : 'Sin movimiento de caja origen'}</p>
+                    <p className={cajaD ? 'text-bm-ok' : 'text-bm-steel'}>{cajaD ? `+ ${fmtMonto(fxMontoDestino, fxForm.moneda_destino)} · Caja ${cajaD.nombre}${esEfeD ? ` (${fxForm.subcaja_destino})` : ''}` : 'Sin movimiento de caja destino'}</p>
                   </div>
-                  <p className="text-[8px] text-zinc-600 font-mono">No cuenta como ingreso ni egreso: solo cambia el valor de moneda.</p>
+                  <p className="text-xs text-bm-steel font-mono">No cuenta como ingreso ni egreso: solo cambia el valor de moneda.</p>
                 </div>
               )}
 
@@ -6240,7 +6277,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 <input type="date" required value={fxForm.fecha} onChange={e => setFxForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
               </div>
               <ErrorBanner msg={fxError} onClose={() => setFxError(null)} />
-              <ModalActions onCancel={cerrar} busy={savingFX} disabled={fxMontoDestino === null} submitCls="bg-teal-500 text-black hover:bg-teal-400" label={<><TrendingUp size={14} /> Registrar cambio</>} />
+              <ModalActions onCancel={cerrar} busy={savingFX} disabled={fxMontoDestino === null} submitCls="bg-[#0F766E] text-white hover:bg-[#0B5E58]" label={<><TrendingUp size={14} /> Registrar cambio</>} />
             </form>
           </ModalShell>
         );
@@ -6253,21 +6290,21 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const deuda  = round2(pend.reduce((a, c) => a + c.monto_pendiente, 0));
         const dev    = prestamoForm.es_devolucion;
         return (
-          <ModalShell accent="border-t-violet-500">
-            <ModalHeader icon={HandCoins} tone={TONE.fin} title="Préstamo Externo" subtitle="Barquisimeto / Roberto ↔ Águilas · financiamiento, no ingreso" onClose={() => setPrestamoModal(false)} />
+          <ModalShell accent="border-t-[#6D28D9]">
+            <ModalHeader icon={HandCoins} tone={TONE.fin} title="Préstamo Externo" subtitle={`Barquisimeto / Roberto ↔ ${EMPRESA_CORTA} · financiamiento, no ingreso`} onClose={() => setPrestamoModal(false)} />
             <form onSubmit={handlePrestamo} className="space-y-4">
-              <div className="flex bg-black/50 rounded-2xl p-1 border border-white/10">
-                {([[false, '+ Préstamo a Águilas', 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'], [true, '- Devolución', 'bg-red-500/20 text-red-400 border border-red-500/30']] as const).map(([v, l, on]) => (
+              <div className="flex bg-white rounded-2xl p-1 border border-bm-line">
+                {([[false, `+ Préstamo a ${EMPRESA_CORTA}`, 'bg-bm-ok-tint text-bm-ok border border-bm-ok/25'], [true, '- Devolución', 'bg-bm-red-tint text-bm-red border border-bm-red/25']] as const).map(([v, l, on]) => (
                   <button key={l} type="button" onClick={() => setPrestamoForm(p => ({ ...p, es_devolucion: v, cuenta_id: v ? p.cuenta_id : '' }))}
-                    className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${dev === v ? on : 'text-zinc-600 hover:text-zinc-400'}`}>{l}</button>
+                    className={`flex-1 py-3 rounded-xl text-[13px] font-semibold transition-all ${dev === v ? on : 'text-bm-steel hover:text-bm-ink'}`}>{l}</button>
                 ))}
               </div>
               <div>
-                <Lbl cls="text-violet-400">Prestamista</Lbl>
+                <Lbl cls="text-[#6D28D9]">Prestamista</Lbl>
                 <div className="grid grid-cols-2 gap-2">
                   {PRESTAMISTAS.map(p => (
                     <button key={p} type="button" onClick={() => setPrestamoForm(prev => ({ ...prev, prestamista: p, cuenta_id: '' }))}
-                      className={`py-3 rounded-xl text-[10px] font-black uppercase border transition-all ${prestamoForm.prestamista === p ? 'bg-violet-500/20 text-violet-400 border-violet-500/30' : optOff}`}>{p}</button>
+                      className={`py-3 rounded-xl text-[13px] font-semibold border transition-all ${prestamoForm.prestamista === p ? 'bg-[#F1ECFB] text-[#6D28D9] border-[#6D28D9]/25' : optOff}`}>{p}</button>
                   ))}
                 </div>
               </div>
@@ -6279,7 +6316,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
               {esEfeP && <SubcajaToggle value={prestamoForm.subcaja} onChange={sc => setPrestamoForm(p => ({ ...p, subcaja: sc }))} />}
               {dev && (
                 <div>
-                  <Lbl cls="text-violet-400">Aplicar a · deuda {prestamoForm.moneda}: {fmtMonto(deuda, prestamoForm.moneda)}</Lbl>
+                  <Lbl cls="text-[#6D28D9]">Aplicar a · deuda {prestamoForm.moneda}: {fmtMonto(deuda, prestamoForm.moneda)}</Lbl>
                   <select value={prestamoForm.cuenta_id} onChange={e => setPrestamoForm(p => ({ ...p, cuenta_id: e.target.value }))} className={inp}>
                     <option value="">AUTOMÁTICO · préstamo más antiguo primero</option>
                     {pend.map(c => <option key={c.id} value={c.id}>{fmtDate(c.fecha_emision)} · {fmtMonto(c.monto_pendiente, c.moneda)} · {c.concepto}</option>)}
@@ -6287,7 +6324,7 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 </div>
               )}
               <div className="grid grid-cols-2 gap-4">
-                <AmountInput value={prestamoForm.monto} moneda={prestamoForm.moneda} prefixCls="text-violet-400" focusCls="focus:border-violet-500" onChange={v => setPrestamoForm(p => ({ ...p, monto: v }))} />
+                <AmountInput value={prestamoForm.monto} moneda={prestamoForm.moneda} prefixCls="text-[#6D28D9]" focusCls="focus:border-[#6D28D9]" onChange={v => setPrestamoForm(p => ({ ...p, monto: v }))} />
                 <input type="date" required value={prestamoForm.fecha} onChange={e => setPrestamoForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
               </div>
               <input required value={prestamoForm.concepto} onChange={e => setPrestamoForm(p => ({ ...p, concepto: e.target.value }))} placeholder="CONCEPTO DEL PRÉSTAMO" className={inp} />
@@ -6296,14 +6333,14 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                   value={{ ...prestamoPago, pagador_tipo: 'PRESTAMISTA', pagador_nombre: prestamoForm.prestamista }}
                   onChange={v => setPrestamoPago({ ...v, pagador_tipo: 'PRESTAMISTA' })} />
               )}
-              <div className="bg-violet-500/5 border border-violet-500/20 rounded-xl p-3">
-                <p className="text-[9px] text-violet-400 font-mono">
+              <div className="bg-[#F1ECFB]/60 border border-[#6D28D9]/25 rounded-xl p-3">
+                <p className="text-xs text-[#6D28D9] font-mono">
                   {dev ? `ℹ Sale de bóveda y caja, y rebaja la deuda con ${prestamoForm.prestamista}. No cuenta como gasto.`
                        : `ℹ Entra a bóveda y caja y crea la CxP de devolución a ${prestamoForm.prestamista}. No cuenta como ingreso.`}
                 </p>
               </div>
               <ErrorBanner msg={cajaError} onClose={() => setCajaError(null)} />
-              <ModalActions onCancel={() => setPrestamoModal(false)} busy={savingCaja} submitCls="bg-violet-500 text-white hover:bg-violet-400"
+              <ModalActions onCancel={() => setPrestamoModal(false)} busy={savingCaja} submitCls="bg-[#6D28D9] text-bm-ink hover:bg-[#5B21B6]"
                 label={<><HandCoins size={14} /> {dev ? 'Registrar Devolución' : 'Registrar Préstamo'}</>} />
             </form>
           </ModalShell>
@@ -6315,21 +6352,21 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const cerrar = () => { setTransferModalOpen(false); setTransferError(null); };
         const opciones = cajasQueAceptan(transferForm.moneda);
         return (
-          <ModalShell accent="border-t-purple-500" maxW="max-w-2xl">
+          <ModalShell accent="border-t-[#6D28D9]" maxW="max-w-2xl">
             <ModalHeader icon={ArrowLeftRight} tone={TONE.purple} title="Transferir entre Cajas" subtitle="Mueve custodia, la bóveda no cambia · misma moneda (para cambiar moneda use FX Desk)" onClose={cerrar} />
             <form onSubmit={handleTransferencia} className="space-y-4">
-              <div><Lbl cls="text-purple-400">Moneda</Lbl><MonedaPicker value={transferForm.moneda} onChange={m => setTransferForm(p => ({ ...p, moneda: m, caja_origen_id: '', caja_destino_id: '' }))} /></div>
+              <div><Lbl cls="text-[#6D28D9]">Moneda</Lbl><MonedaPicker value={transferForm.moneda} onChange={m => setTransferForm(p => ({ ...p, moneda: m, caja_origen_id: '', caja_destino_id: '' }))} /></div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Lbl cls="text-purple-400">Caja Origen</Lbl>
+                  <Lbl cls="text-[#6D28D9]">Caja Origen</Lbl>
                   <select required value={transferForm.caja_origen_id} onChange={e => setTransferForm(p => ({ ...p, caja_origen_id: e.target.value }))} className={inp} disabled={savingTransfer}>
                     <option value="">— DE —</option>
                     {opciones.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
                   </select>
-                  {transferForm.caja_origen_id && <p className="text-[8px] text-zinc-600 font-mono mt-1">Saldo {transferForm.moneda}: {fmtMonto(getCajaBalance(transferForm.caja_origen_id, transferForm.moneda), transferForm.moneda)}</p>}
+                  {transferForm.caja_origen_id && <p className="text-xs text-bm-steel font-mono mt-1">Saldo {transferForm.moneda}: {fmtMonto(getCajaBalance(transferForm.caja_origen_id, transferForm.moneda), transferForm.moneda)}</p>}
                 </div>
                 <div>
-                  <Lbl cls="text-purple-400">Caja Destino</Lbl>
+                  <Lbl cls="text-[#6D28D9]">Caja Destino</Lbl>
                   <select required value={transferForm.caja_destino_id} onChange={e => setTransferForm(p => ({ ...p, caja_destino_id: e.target.value }))} className={inp} disabled={savingTransfer}>
                     <option value="">— A —</option>
                     {opciones.filter(c => c.id !== transferForm.caja_origen_id).map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
@@ -6337,17 +6374,17 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
                 </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <AmountInput size="lg" value={transferForm.monto} moneda={transferForm.moneda} prefixCls="text-purple-400" focusCls="focus:border-purple-500" disabled={savingTransfer}
+                <AmountInput size="lg" value={transferForm.monto} moneda={transferForm.moneda} prefixCls="text-[#6D28D9]" focusCls="focus:border-[#6D28D9]" disabled={savingTransfer}
                   onChange={v => setTransferForm(p => ({ ...p, monto: v }))} />
                 <input type="date" required value={transferForm.fecha} onChange={e => setTransferForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} disabled={savingTransfer} />
               </div>
               <input required value={transferForm.concepto} onChange={e => setTransferForm(p => ({ ...p, concepto: e.target.value }))} placeholder="CONCEPTO" className={inp} disabled={savingTransfer} />
-              <label className="flex items-center gap-3 p-3 rounded-xl border border-white/10 bg-white/[0.02] cursor-pointer">
-                <input type="checkbox" checked={transferForm.generar_reposicion} onChange={e => setTransferForm(p => ({ ...p, generar_reposicion: e.target.checked }))} className="w-4 h-4 accent-purple-500" />
-                <span className="text-[9px] text-zinc-400 font-mono">La caja origen es fondo fijo: crear reposición pendiente para devolverle este monto</span>
+              <label className="flex items-center gap-3 p-3 rounded-xl border border-bm-line bg-bm-canvas/60 cursor-pointer">
+                <input type="checkbox" checked={transferForm.generar_reposicion} onChange={e => setTransferForm(p => ({ ...p, generar_reposicion: e.target.checked }))} className="w-4 h-4 accent-[#6D28D9]" />
+                <span className="text-xs text-bm-steel font-mono">La caja origen es fondo fijo: crear reposición pendiente para devolverle este monto</span>
               </label>
               <ErrorBanner msg={transferError} onClose={() => setTransferError(null)} />
-              <ModalActions onCancel={cerrar} busy={savingTransfer} submitCls="bg-purple-500 text-white hover:bg-purple-400" label={<><ArrowLeftRight size={14} /> Ejecutar</>} />
+              <ModalActions onCancel={cerrar} busy={savingTransfer} submitCls="bg-[#6D28D9] text-bm-ink hover:bg-[#5B21B6]" label={<><ArrowLeftRight size={14} /> Ejecutar</>} />
             </form>
           </ModalShell>
         );
@@ -6359,27 +6396,27 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
         const cajaRep    = cajaById(salidaRep?.caja_id);
         const monedasRep = cajaRep ? getCajaConfig(cajaRep).monedasPermitidas : ALL_METHODS;
         return (
-          <ModalShell accent="border-t-purple-500">
+          <ModalShell accent="border-t-[#6D28D9]">
             <ModalHeader icon={Repeat} tone={TONE.purple} title="Reponer a Caja" subtitle={`Movimiento interno: entra a ${cajaRep?.nombre ?? 'la caja original'}, la bóveda no cambia`} />
-            <div className="bg-purple-500/5 border border-purple-500/20 rounded-2xl p-4 mb-4">
-              <p className="text-[9px] text-purple-400/80 font-mono">{pagarReposicionModal.entidad_nombre}</p>
-              <p className="text-2xl font-black italic text-purple-400 mt-1">{fmtMonto(pagarReposicionModal.monto_total, pagarReposicionModal.moneda)}</p>
-              <p className="text-[8px] text-zinc-600 font-mono mt-1">{pagarReposicionModal.concepto}</p>
+            <div className="bg-[#F1ECFB]/60 border border-[#6D28D9]/25 rounded-2xl p-4 mb-4">
+              <p className="text-xs text-[#6D28D9] font-mono">{pagarReposicionModal.entidad_nombre}</p>
+              <p className="text-2xl text-[#6D28D9] mt-1 bm-figure">{fmtMonto(pagarReposicionModal.monto_total, pagarReposicionModal.moneda)}</p>
+              <p className="text-xs text-bm-steel font-mono mt-1">{pagarReposicionModal.concepto}</p>
             </div>
-            <Lbl cls="text-purple-400">Moneda</Lbl>
+            <Lbl cls="text-[#6D28D9]">Moneda</Lbl>
             <div className="mb-4">
               <MonedaPicker value={pagarReposicionMoneda} isDisabled={m => !monedasRep.includes(m)} onChange={m => { setPagarReposicionMoneda(m); setPagarReposicionFuente(''); }} />
             </div>
-            <Lbl cls="text-purple-400">¿De dónde sale?</Lbl>
+            <Lbl cls="text-[#6D28D9]">¿De dónde sale?</Lbl>
             <select value={pagarReposicionFuente} onChange={e => setPagarReposicionFuente(e.target.value)} className={`${inp} mb-2`}>
               <option value="">SALDO SIN UBICAR DE BÓVEDA · {fmtMonto(sinUbicar(pagarReposicionMoneda), pagarReposicionMoneda)}</option>
               {cajasQueAceptan(pagarReposicionMoneda).filter(c => c.id !== cajaRep?.id).map(c => (
                 <option key={c.id} value={c.id}>{c.nombre} · {fmtMonto(getCajaBalance(c.id, pagarReposicionMoneda), pagarReposicionMoneda)}</option>
               ))}
             </select>
-            <p className="text-[8px] text-zinc-600 font-mono mb-6">No genera egreso: el dinero ya estaba en la bóveda, solo cambia quién lo custodia.</p>
+            <p className="text-xs text-bm-steel font-mono mb-6">No genera egreso: el dinero ya estaba en la bóveda, solo cambia quién lo custodia.</p>
             <ModalActions onCancel={() => setPagarReposicionModal(null)} onSubmit={confirmarPagoReposicion} busy={savingAction === pagarReposicionModal.id}
-              submitCls="bg-purple-500 text-white hover:bg-purple-400" label={<><CheckCircle2 size={14} /> Confirmar</>} />
+              submitCls="bg-[#6D28D9] text-bm-ink hover:bg-[#5B21B6]" label={<><CheckCircle2 size={14} /> Confirmar</>} />
           </ModalShell>
         );
       })()}
@@ -6388,52 +6425,52 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
       {deleteTransferModal && (() => {
         const { salida, entrada, reposicion, cajaOrigenNombre, cajaDestinoNombre } = deleteTransferModal;
         const items = ([
-          salida     && { k: 'salida' as const,     titulo: `Salida de ${cajaOrigenNombre}`,         tc: 'text-red-400',     det: `-${fmtMonto(salida.monto, salida.moneda)}` },
-          entrada    && { k: 'entrada' as const,    titulo: `Entrada a ${cajaDestinoNombre}`,        tc: 'text-emerald-400', det: `+${fmtMonto(entrada.monto, entrada.moneda)}` },
-          reposicion && { k: 'reposicion' as const, titulo: `CxP Reposición (${reposicion.estatus})`, tc: 'text-purple-400',  det: fmtMonto(reposicion.monto_total, reposicion.moneda) },
+          salida     && { k: 'salida' as const,     titulo: `Salida de ${cajaOrigenNombre}`,         tc: 'text-bm-red',     det: `-${fmtMonto(salida.monto, salida.moneda)}` },
+          entrada    && { k: 'entrada' as const,    titulo: `Entrada a ${cajaDestinoNombre}`,        tc: 'text-bm-ok', det: `+${fmtMonto(entrada.monto, entrada.moneda)}` },
+          reposicion && { k: 'reposicion' as const, titulo: `CxP Reposición (${reposicion.estatus})`, tc: 'text-[#6D28D9]',  det: fmtMonto(reposicion.monto_total, reposicion.moneda) },
         ]).filter((x): x is { k: 'salida' | 'entrada' | 'reposicion'; titulo: string; tc: string; det: string } => !!x);
         const sel = deleteTransferSelection;
         return (
-          <ModalShell accent="border-t-red-500" maxW="max-w-lg">
+          <ModalShell accent="border-t-bm-red" maxW="max-w-lg">
             <ModalHeader icon={Trash2} tone={TONE.red} title="Eliminar Transferencia" subtitle="Selecciona qué registros eliminar" />
             <div className="space-y-2 mb-6">
               {items.map(it => (
-                <label key={it.k} className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${sel[it.k] ? 'bg-red-500/10 border-red-500/30' : 'bg-white/[0.02] border-white/[0.05]'}`}>
-                  <input type="checkbox" checked={sel[it.k]} onChange={e => setDeleteTransferSelection(p => ({ ...p, [it.k]: e.target.checked }))} className="w-4 h-4 accent-red-500" />
+                <label key={it.k} className={`flex items-center gap-3 p-4 rounded-2xl border cursor-pointer transition-all ${sel[it.k] ? 'bg-bm-red-tint border-bm-red/25' : 'bg-bm-canvas/60 border-bm-line'}`}>
+                  <input type="checkbox" checked={sel[it.k]} onChange={e => setDeleteTransferSelection(p => ({ ...p, [it.k]: e.target.checked }))} className="w-4 h-4 accent-[#D42125]" />
                   <div>
-                    <p className={`text-[10px] font-black uppercase ${it.tc}`}>{it.titulo}</p>
-                    <p className="text-[8px] text-zinc-600 font-mono">{it.det}</p>
+                    <p className={`text-[13px] font-semibold ${it.tc}`}>{it.titulo}</p>
+                    <p className="text-xs text-bm-steel font-mono">{it.det}</p>
                   </div>
                 </label>
               ))}
             </div>
-            <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 mb-4">
-              <p className="text-[9px] text-yellow-400 font-mono">⚠ Marcar todos los elementos mantiene integridad contable.</p>
+            <div className="bg-[#FDF3D8]/60 border border-[#8A6100]/25 rounded-xl p-3 mb-4">
+              <p className="text-xs text-[#8A6100] font-mono">⚠ Marcar todos los elementos mantiene integridad contable.</p>
             </div>
             <ModalActions onCancel={() => setDeleteTransferModal(null)} onSubmit={confirmDeleteTransferSelection} busy={false}
-              disabled={!sel.salida && !sel.entrada && !sel.reposicion} submitCls="bg-red-500 text-white hover:bg-red-400" label={<><Trash2 size={14} /> Eliminar Seleccionados</>} />
+              disabled={!sel.salida && !sel.entrada && !sel.reposicion} submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><Trash2 size={14} /> Eliminar Seleccionados</>} />
           </ModalShell>
         );
       })()}
 
       {/* CLAVE DEL DIRECTOR */}
       {directorAuthOpen && (
-        <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-sm" z="z-[100]">
+        <ModalShell accent="border-t-bm-red" maxW="max-w-sm" z="z-[100]">
           <ModalHeader icon={KeyRound} tone={TONE.asiento} title="Autorización Director" subtitle="Clave de 4 dígitos requerida." />
           <input autoFocus type="password" inputMode="numeric" maxLength={4} value={directorCode} placeholder="••••"
             onChange={e => setDirectorCode(e.target.value.replace(/\D/g, '').slice(0, 4))}
             onKeyDown={e => { if (e.key === 'Enter') confirmDirectorCode(); }}
-            className="w-full bg-black/50 border border-white/10 p-5 rounded-2xl text-white text-2xl text-center font-black tracking-[0.6em] outline-none focus:border-[#E1AD01]" />
-          {directorAuthError && <p className="text-[9px] text-red-400 mt-3 text-center font-mono">{directorAuthError}</p>}
+            className="w-full bg-white border border-bm-line p-5 rounded-2xl text-bm-ink text-2xl text-center font-semibold outline-none focus:border-bm-red" />
+          {directorAuthError && <p className="text-xs text-bm-red mt-3 text-center font-mono">{directorAuthError}</p>}
           <div className="mt-5">
-            <ModalActions onCancel={cancelDirectorAuth} onSubmit={confirmDirectorCode} busy={false} submitCls="bg-[#E1AD01] text-black hover:bg-white" label="Autorizar" />
+            <ModalActions onCancel={cancelDirectorAuth} onSubmit={confirmDirectorCode} busy={false} submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label="Autorizar" />
           </div>
         </ModalShell>
       )}
 
       {/* EDITAR LEDGER (legacy) */}
       {editingTx && (
-        <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-2xl" z="z-[90]">
+        <ModalShell accent="border-t-bm-red" maxW="max-w-2xl" z="z-[90]">
           <ModalHeader icon={Pencil} tone={TONE.asiento} title="Editar Movimiento (legacy)" onClose={() => setEditingTx(null)} />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <select value={editTxForm.type} onChange={e => setEditTxForm(p => ({ ...p, type: e.target.value as TransactionType }))} className={inp}>
@@ -6449,16 +6486,16 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             <input type="number" min="0.01" step="0.01" value={editTxForm.amount} onChange={e => setEditTxForm(p => ({ ...p, amount: e.target.value }))} className={inp} placeholder="MONTO" />
             <input type="date" value={editTxForm.fecha} onChange={e => setEditTxForm(p => ({ ...p, fecha: e.target.value }))} className={inp} style={noUpper} />
             <textarea value={editTxForm.description} onChange={e => setEditTxForm(p => ({ ...p, description: e.target.value }))} rows={3} placeholder="DESCRIPCIÓN"
-              className="md:col-span-2 w-full bg-black/50 border border-white/10 p-4 rounded-2xl text-white text-xs font-mono outline-none focus:border-[#E1AD01] resize-none" />
+              className="md:col-span-2 w-full bg-white border border-bm-line p-4 rounded-2xl text-bm-ink text-xs font-mono outline-none focus:border-bm-red resize-none" />
           </div>
           <div className="my-4"><ErrorBanner msg={ledgerError} onClose={() => setLedgerError(null)} /></div>
-          <ModalActions onCancel={() => setEditingTx(null)} onSubmit={saveEditedTx} busy={savingAction === editingTx.id} submitCls="bg-[#E1AD01] text-black hover:bg-white" label={<><ShieldCheck size={13} /> Guardar</>} />
+          <ModalActions onCancel={() => setEditingTx(null)} onSubmit={saveEditedTx} busy={savingAction === editingTx.id} submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><ShieldCheck size={13} /> Guardar</>} />
         </ModalShell>
       )}
 
       {/* EDITAR CAJA (legacy / ubicación) */}
       {editingMov && (
-        <ModalShell accent="border-t-[#E1AD01]" maxW="max-w-2xl" z="z-[90]">
+        <ModalShell accent="border-t-bm-red" maxW="max-w-2xl" z="z-[90]">
           <ModalHeader icon={Pencil} tone={TONE.asiento} title="Editar Movimiento Caja (legacy / ubicación)" onClose={() => setEditingMov(null)} />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <select value={editMovForm.tipo} onChange={e => setEditMovForm(p => ({ ...p, tipo: e.target.value as 'ENTRADA' | 'SALIDA' }))} className={inp}>
@@ -6473,10 +6510,12 @@ export const FinancePanel: React.FC<FinancePanelProps> = ({ vendors, inventory =
             <input value={editMovForm.referencia} onChange={e => setEditMovForm(p => ({ ...p, referencia: e.target.value }))} className={inp} placeholder="REFERENCIA" />
           </div>
           <div className="my-4"><ErrorBanner msg={cajaError} onClose={() => setCajaError(null)} /></div>
-          <ModalActions onCancel={() => setEditingMov(null)} onSubmit={saveEditedMov} busy={savingAction === editingMov.id} submitCls="bg-[#E1AD01] text-black hover:bg-white" label={<><ShieldCheck size={13} /> Guardar</>} />
+          <ModalActions onCancel={() => setEditingMov(null)} onSubmit={saveEditedMov} busy={savingAction === editingMov.id} submitCls="bg-bm-red text-white hover:bg-bm-red-deep" label={<><ShieldCheck size={13} /> Guardar</>} />
         </ModalShell>
       )}
 
+      {/* [v17.1] Confirmaciones B&M */}
+      {confirmDialogBm}
     </div>
   );
 };

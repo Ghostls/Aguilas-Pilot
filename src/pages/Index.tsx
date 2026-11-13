@@ -1,7 +1,10 @@
 // src/pages/Index.tsx
-// VALKYRON OS v7.3.3 — Archivo OMA + Stock completo + Impresión · B&M MANTENIMIENTO AERONÁUTICO
+// VALKYRON OS v7.3.4 — Archivo OMA + Stock completo + Impresión · B&M MANTENIMIENTO AERONÁUTICO
 // FUSIÓN v6.1 + v7.0 + v7.1 + rebrand B&M
 // ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v7.3.4:
+//   [UI]  Finanzas (FinancePanel v17.1) ya es B&M: se retira LegacyModuleFrame.
+//
 // CHANGELOG v7.3.3:
 //   [UI]  Registro de vuelo (FlightRegister v7.1) y Alta de personal
 //         (Register v3.2) ya son B&M: se retiran LegacyModuleFrame y el
@@ -873,14 +876,12 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
             )}
 
             {safeTab === 'finance' && isVisible('finance') && (
-              <LegacyModuleFrame>
-                <FinancePanel
-                  vendors={vendorsData}
-                  inventory={partsData}
-                  userRole={userProfile?.rol as any}
-                  setGlobalFinance={setAguilasFinance}
-                />
-              </LegacyModuleFrame>
+              <FinancePanel
+                vendors={vendorsData}
+                inventory={partsData}
+                userRole={userProfile?.rol as any}
+                setGlobalFinance={setAguilasFinance}
+              />
             )}
 
             {safeTab === 'vendors' && isVisible('vendors') && guard(
@@ -921,7 +922,7 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
 
         <footer className="mt-auto flex flex-col gap-1 border-t border-bm-line px-4 py-5 text-xs text-bm-steel sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
           <span>B&amp;M Mantenimiento Aeronáutico</span>
-          <span>Valkyron OS v7.3.3</span>
+          <span>Valkyron OS v7.3.4</span>
         </footer>
       </div>
 

@@ -1,5 +1,14 @@
 // src/components/FleetDashboard.tsx
-// VALKYRON OS v5.7 — Flota · B&M MANTENIMIENTO AERONÁUTICO
+// VALKYRON OS v5.8.1 — Flota · B&M MANTENIMIENTO AERONÁUTICO
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v5.8.1:
+//   [FIX] Al abrir una aeronave desde abajo de la lista (móvil) el detalle
+//         quedaba a media altura: ahora sube al inicio y, al volver, restaura
+//         la posición de la lista (abrirAeronave + listScrollRef).
+// CHANGELOG v5.8:
+//   [UI]  AircraftCard v1.3 y AircraftDetail v3.5 ya son B&M: se retiran las
+//         islas oscuras. Historial y Editar orden pasan al pie de la propia
+//         tarjeta (prop `actions`), fuera de su área clicable.
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v5.7 — REBRAND B&M + CONEXIONES:
 //   [FIX] Horas precargadas en componentes e inspecciones: Index entrega
@@ -722,19 +731,44 @@ const FleetDashboard = ({
     setTimeout(() => abrirHistorial(ac), 120);
   }, [abrirHistorial]);
 
+  // ── [v5.8.1] SCROLL ENTRE LISTA Y DETALLE ────────────────────────────────
+  // El contenedor de scroll es window. Sin esto, al abrir una aeronave que
+  // está abajo en la lista (móvil), el detalle se pintaba a media altura y se
+  // perdían el encabezado y "Volver a Flota". Guarda la posición de la lista,
+  // sube al abrir el detalle y la restaura al volver.
+  const listScrollRef = React.useRef(0);
+
+  const abrirAeronave = useCallback((ac: Aircraft) => {
+    listScrollRef.current = typeof window !== 'undefined' ? window.scrollY : 0;
+    setSelectedAircraft(ac);
+  }, []);
+
+  const selectedId = selectedAircraft?.id ?? null;
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (selectedId !== null) {
+      window.scrollTo({ top: 0, left: 0 });
+      return;
+    }
+    if (listScrollRef.current > 0) {
+      const y = listScrollRef.current;
+      listScrollRef.current = 0;
+      // un frame para que la grilla de tarjetas ya esté montada
+      requestAnimationFrame(() => window.scrollTo({ top: y, left: 0 }));
+    }
+  }, [selectedId]);
+
   // ── RENDER ────────────────────────────────────────────────────────────────
 
   if (selectedAircraft) {
     return (
-      // [v5.7] AircraftDetail aún con estética Águilas: isla oscura hasta migrarlo
-      <div className="dark rounded-[24px] bg-[#050505] p-3 text-white sm:p-5">
-        <AircraftDetail
-          aircraft={selectedAircraft}
-          onBack={() => { setSelectedAircraft(null); void onFleetChange?.(); }}
-          onOpenHistorial={handleOpenHistorialFromDetail}
-          onFleetChange={onFleetChange}
-        />
-      </div>
+      // [v5.8] AircraftDetail v3.5 es B&M: sin isla oscura
+      <AircraftDetail
+        aircraft={selectedAircraft}
+        onBack={() => { setSelectedAircraft(null); void onFleetChange?.(); }}
+        onOpenHistorial={handleOpenHistorialFromDetail}
+        onFleetChange={onFleetChange}
+      />
     );
   }
 
@@ -789,14 +823,12 @@ const FleetDashboard = ({
       {/* Grid de tarjetas */}
       <div className="grid grid-cols-1 gap-3 sm:gap-4 md:grid-cols-2 xl:grid-cols-3">
         {normalizedFleet.map(ac => (
-          <div key={ac.id} className="flex flex-col overflow-hidden rounded-[20px] border border-bm-line bg-white">
-            {/* [v5.7] AircraftCard aún con estética Águilas: isla oscura hasta migrarlo */}
-            <div className="dark flex-1 bg-[#050505] text-white">
-              <AircraftCard aircraft={ac} onSelect={setSelectedAircraft} />
-            </div>
-
-            {/* Acciones siempre visibles (antes solo con hover) */}
-            <div className="flex gap-2 border-t border-bm-line p-3">
+          // [v5.8] Tarjeta B&M con las acciones en su pie (siempre visibles)
+          <AircraftCard
+            key={ac.id}
+            aircraft={ac}
+            onSelect={abrirAeronave}
+            actions={<>
               <button
                 type="button"
                 onClick={e => { e.stopPropagation(); abrirHistorial(ac); }}
@@ -817,8 +849,8 @@ const FleetDashboard = ({
                   Editar orden
                 </button>
               )}
-            </div>
-          </div>
+            </>}
+          />
         ))}
 
         {normalizedFleet.length === 0 && (

@@ -1,20 +1,21 @@
 // src/components/AircraftCard.tsx
-// VALKYRON OS v1.2 — FUSIÓN COMPLETA
+// VALKYRON OS v1.3 — B&M MANTENIMIENTO AERONÁUTICO
 //
-// PRESERVADO:
-//   - Diseño original de las tarjetas
-//   - Identidad visual Valkyron (#E1AD01)
-//   - Monitoreo de fatiga
-//   - Visualización de sede y modelo
-//   - Selección de aeronave
-//   - Cuatro estados visuales
-//
-// MEJORAS:
-//   - Tipado estricto de los estados
-//   - Compatibilidad con valores nulos
-//   - Normalización de estados con y sin tildes
-//   - Estado desconocido -> AOG / Tierra
-//   - Etiqueta "Operativa en sistema"
+// CHANGELOG v1.3 — REBRAND B&M:
+//   [UI]  Tarjeta blanca B&M: matrícula en tipografía de datos, estado como
+//         insignia semántica (verde operativa, ámbar hangar, rojo AOG, azul en
+//         vuelo), sede y monitoreo de fatiga legibles en móvil.
+//   [NEW] Prop opcional `actions`: botones del contenedor (Historial, Editar
+//         orden) en el pie de la tarjeta, FUERA del área clicable. Antes Flota
+//         los pintaba aparte y solo con hover (inaccesibles en táctil).
+//   [A11Y] El área clicable ya no contiene otros botones (botón dentro de
+//         botón); foco visible.
+//   [CHG] statusConfig: `className` (paleta oscura) → `tone` (BmTone).
+// PRESERVADO ÍNTEGRO (v1.2): normalización de estados con y sin tildes,
+//   estado vacío o desconocido → AOG / Tierra (conservador), etiqueta
+//   "Operativa en sistema", monitoreo de fatiga con FatigueBar (máx. 2
+//   componentes, límite 100), selección por clic / Enter / Espacio,
+//   onOpenHistorial opcional, props existentes.
 //
 // IMPORTANTE:
 //   Este componente es visual. El estado real debe
@@ -36,6 +37,7 @@ import {
 import type { Aircraft } from '@/Types/Maintenance';
 
 import FatigueBar from './FatigueBar';
+import { BmBadge, bmBtn, type BmTone } from './brand/bm-ui';
 
 // ─────────────────────────────────────────────────────────────
 // PROPIEDADES
@@ -45,6 +47,8 @@ interface AircraftCardProps {
   aircraft: Aircraft;
   onSelect: (aircraft: Aircraft) => void;
   onOpenHistorial?: (aircraft: Aircraft) => void;
+  /** [v1.3] Acciones del contenedor, en el pie y fuera del área clicable. */
+  actions?: React.ReactNode;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -55,29 +59,25 @@ const statusConfig = {
   operational: {
     label: 'Operativa en sistema',
     icon: CheckCircle,
-    className:
-      'bg-green-500/10 text-green-500 border-green-500/20',
+    tone: 'ok' as BmTone,
   },
 
   maintenance: {
-    label: 'Hangar / Mantenimiento',
+    label: 'Hangar / mantenimiento',
     icon: Wrench,
-    className:
-      'bg-[#E1AD01]/10 text-[#E1AD01] border-[#E1AD01]/20',
+    tone: 'warn' as BmTone,
   },
 
   grounded: {
-    label: 'AOG / Tierra',
+    label: 'AOG / en tierra',
     icon: AlertTriangle,
-    className:
-      'bg-red-500/10 text-red-500 border-red-500/20',
+    tone: 'danger' as BmTone,
   },
 
   flight: {
-    label: 'En Vuelo',
+    label: 'En vuelo',
     icon: Plane,
-    className:
-      'bg-blue-500/10 text-blue-500 border-blue-500/20',
+    tone: 'info' as BmTone,
   },
 };
 
@@ -151,6 +151,7 @@ const AircraftCard: React.FC<AircraftCardProps> = ({
   aircraft,
   onSelect,
   onOpenHistorial,
+  actions,
 }) => {
   // Estado normalizado de la aeronave.
   const statusKey = mapStatusToKey(
@@ -167,226 +168,71 @@ const AircraftCard: React.FC<AircraftCardProps> = ({
   const components = aircraft.components ?? [];
 
   return (
-    <div
-      className="
-        bg-[#0f0f0f]
-        border
-        border-white/10
-        rounded-2xl
-        overflow-hidden
-        cursor-pointer
-        hover:border-[#E1AD01]/50
-        hover:shadow-[0_0_30px_rgba(225,173,1,0.1)]
-        transition-all
-        duration-300
-        group
-        text-left
-      "
-      onClick={() => onSelect(aircraft)}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(aircraft); } }}
-      role="button" tabIndex={0} aria-label={`Ver aeronave ${aircraft.tailNumber}`}
-    >
+    <article className="flex h-full flex-col overflow-hidden rounded-[20px] border border-bm-line bg-white text-left text-bm-ink transition-colors hover:border-bm-field">
       {/* ─────────────────────────────────────────────── */}
-      {/* ENCABEZADO Y ESTADO                         */}
+      {/* ÁREA CLICABLE: ENCABEZADO, SEDE Y FATIGA        */}
       {/* ─────────────────────────────────────────────── */}
 
       <div
-        className="
-          relative
-          h-24
-          bg-gradient-to-br
-          from-slate-900
-          to-black
-          overflow-hidden
-          flex
-          items-center
-          justify-center
-        "
+        className="flex-1 cursor-pointer space-y-4 p-4 outline-none transition-colors hover:bg-bm-canvas/40 focus-visible:bg-bm-canvas/60 focus-visible:ring-4 focus-visible:ring-inset focus-visible:ring-bm-red/15 sm:p-5"
+        onClick={() => onSelect(aircraft)}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(aircraft); } }}
+        role="button" tabIndex={0} aria-label={`Ver aeronave ${aircraft.tailNumber}`}
       >
-        {/* Marca de agua */}
+        {/* Matrícula, modelo y estado */}
 
-        <Plane
-          className="
-            h-12
-            w-12
-            text-white/5
-            absolute
-            -right-2
-            -bottom-2
-            rotate-12
-          "
-        />
+        {/* flex-wrap: con estados largos la insignia baja de línea en vez de cortar la matrícula */}
+        <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
 
-        {/* Gradiente inferior */}
+          <div className="flex min-w-0 items-center gap-3">
 
-        <div
-          className="
-            absolute
-            inset-0
-            bg-gradient-to-t
-            from-[#0f0f0f]
-            to-transparent
-          "
-        />
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-bm-red-tint text-bm-red">
+              <Plane className="h-5 w-5" />
+            </span>
 
-        {/* Indicador del estado */}
+            <div className="min-w-0">
 
-        <div
-          className={`
-            absolute
-            top-3
-            right-3
-            flex
-            items-center
-            gap-1.5
-            rounded-lg
-            px-3
-            py-1
-            text-[10px]
-            font-black
-            uppercase
-            tracking-widest
-            border
-            backdrop-blur-md
-            ${status.className}
-          `}
-        >
-          <StatusIcon className="h-3 w-3" />
-
-          <span>{status.label}</span>
-        </div>
-      </div>
-
-      {/* ─────────────────────────────────────────────── */}
-      {/* INFORMACIÓN DE AERONAVE                    */}
-      {/* ─────────────────────────────────────────────── */}
-
-      <div className="p-5 space-y-4">
-
-        {/* Matrícula y modelo */}
-
-        <div className="flex items-start justify-between">
-
-          <div className="flex items-center gap-3 text-left">
-
-            <div
-              className="
-                p-2
-                bg-[#E1AD01]/10
-                rounded-lg
-              "
-            >
-              <Plane
-                className="
-                  h-5
-                  w-5
-                  text-[#E1AD01]
-                "
-              />
-            </div>
-
-            <div className="text-left">
-
-              <h3
-                className="
-                  font-mono
-                  font-black
-                  text-xl
-                  text-white
-                  tracking-tighter
-                  uppercase
-                  leading-none
-                "
-              >
+              <h3 className="truncate font-data text-xl font-semibold uppercase leading-none">
                 {aircraft.tailNumber}
               </h3>
 
-              <p
-                className="
-                  text-[10px]
-                  text-slate-500
-                  font-bold
-                  uppercase
-                  tracking-widest
-                  mt-1
-                  text-left
-                "
-              >
+              <p className="mt-1.5 truncate text-[13px] uppercase text-bm-steel">
                 {aircraft.model}
               </p>
 
             </div>
           </div>
+
+          {/* Indicador del estado */}
+
+          <BmBadge tone={status.tone} icon={<StatusIcon className="h-3 w-3" />} className="shrink-0">
+            {status.label}
+          </BmBadge>
         </div>
 
         {/* ─────────────────────────────────────────── */}
         {/* SEDE                                      */}
         {/* ─────────────────────────────────────────── */}
 
-        <div
-          className="
-            flex
-            items-center
-            gap-2
-            text-[10px]
-            text-slate-400
-            font-mono
-            bg-white/5
-            w-fit
-            px-2
-            py-1
-            rounded
-            border
-            border-white/5
-          "
-        >
-          <MapPin
-            className="
-              h-3
-              w-3
-              text-[#E1AD01]
-            "
-          />
-
-          <span
-            className="
-              uppercase
-              tracking-tighter
-              text-slate-300
-            "
-          >
-            Base {aircraft.location || 'Sin asignar'}
-          </span>
-        </div>
+        <span className="inline-flex items-center gap-1.5 rounded-lg bg-bm-canvas px-2.5 py-1.5 text-xs font-medium text-bm-ink">
+          <MapPin className="h-3.5 w-3.5 text-bm-red" />
+          Base {aircraft.location || 'sin asignar'}
+        </span>
 
         {/* ─────────────────────────────────────────── */}
         {/* MONITOREO DE FATIGA                       */}
         {/* ─────────────────────────────────────────── */}
 
-        <div className="space-y-3 pt-2 text-left">
+        <div className="space-y-3 border-t border-bm-line pt-3.5">
 
           {/* Título */}
 
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex items-center gap-2">
 
-            <Shield
-              className="
-                h-3
-                w-3
-                text-[#E1AD01]/50
-              "
-            />
+            <Shield className="h-3.5 w-3.5 text-bm-steel" />
 
-            <span
-              className="
-                text-[9px]
-                font-black
-                text-slate-500
-                uppercase
-                tracking-[0.2em]
-              "
-            >
-              Monitoreo de Fatiga
+            <span className="text-xs font-medium text-bm-steel">
+              Monitoreo de fatiga
             </span>
           </div>
 
@@ -410,27 +256,33 @@ const AircraftCard: React.FC<AircraftCardProps> = ({
           {/* Sin telemetría */}
 
           {components.length === 0 && (
-            <p
-              className="
-                text-[8px]
-                text-slate-600
-                font-mono
-                uppercase
-              "
-            >
+            <p className="text-xs text-bm-hint">
               Datos de telemetría no disponibles
             </p>
           )}
 
         </div>
-        {onOpenHistorial && (
-          <button type="button" onClick={event => { event.stopPropagation(); onOpenHistorial(aircraft); }}
-            className="w-full flex items-center justify-center gap-2 rounded-xl border border-[#E1AD01]/30 bg-[#E1AD01]/10 px-4 py-3 text-[10px] uppercase font-black tracking-widest text-[#E1AD01] hover:bg-[#E1AD01] hover:text-black transition-colors">
-            <History size={14}/> Expediente histórico OMA
-          </button>
-        )}
       </div>
-    </div>
+
+      {/* Expediente OMA (opcional) — fuera del área clicable [v1.3] */}
+
+      {onOpenHistorial && (
+        <div className="px-4 pb-4 sm:px-5">
+          <button type="button" onClick={event => { event.stopPropagation(); onOpenHistorial(aircraft); }}
+            className={`${bmBtn.secondary} ${bmBtn.sm} w-full`}>
+            <History className="h-4 w-4" /> Expediente histórico OMA
+          </button>
+        </div>
+      )}
+
+      {/* Acciones del contenedor [v1.3] */}
+
+      {actions && (
+        <div className="flex gap-2 border-t border-bm-line p-3">
+          {actions}
+        </div>
+      )}
+    </article>
   );
 };
 

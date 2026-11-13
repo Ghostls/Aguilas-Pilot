@@ -1,4 +1,29 @@
 // src/components/AircraftDetail.tsx
+// VALKYRON OS v3.5 — B&M MANTENIMIENTO AERONÁUTICO
+// CHANGELOG v3.5 — REBRAND B&M + CONEXIONES:
+//   [UI]  Interfaz B&M mobile-first: cabecera oscura de diagnóstico, métricas
+//         blancas, OT activa y checklist legibles; cierre y liberación en
+//         BmModal (hoja inferior en móvil, Escape, foco, bloqueo durante el
+//         guardado). El expediente OMA se abre sobre el lienzo claro.
+//   [FIX] "Orden actualizada correctamente" no desaparecía nunca: se retira
+//         a los 4 s o con su botón de cierre.
+//   [FIX] Etiqueta de estado: .toUpperCase() sobre un estado nulo rompía la
+//         pantalla; ahora se muestra "Estado no verificado".
+//   [FIX] Un error de validación del cierre aparecía a la vez en el modal y,
+//         tapado, en la página; ahora solo se muestra donde se está operando.
+//   [UI]  "Completar orden" explica por qué está deshabilitado (repuestos
+//         pendientes o checklist sin verificar).
+//   [UI]  Botón de historial: "Historial técnico" cuando Flota lo gestiona;
+//         "Expediente histórico OMA" cuando abre el archivo.
+//   [UI]  Las observaciones se muestran tal como se guardan (antes se forzaban
+//         a mayúsculas en pantalla aunque se guardaban como se escribían).
+//   [UI]  Impresión con identidad B&M.
+//   [FIX] Checklist: orderRecord.id.slice() rompía el módulo si el id de la OT llega numérico
+//         (bigint); ahora String(id).slice(0, 8).
+// PRESERVADO ÍNTEGRO: lectura en vivo de flota + OT, checklist por OT con
+//   control de concurrencia, cierre por fn_mro_cerrar_orden, liberación por
+//   fn_mro_liberar_aeronave, historial técnico imprimible completo (campos
+//   dinámicos, etiquetas humanas, escapado), props y flujo onBack/onFleetChange.
 // VALKYRON OS v3.4.1 — FUSIÓN v3.2 + v3.3; FIX TS2322 LucideIcon
 // v3.2: Historial técnico completo imprimible A4 con todas las órdenes,
 // campos adicionales dinámicos y etiquetas humanas; UI histórico preservado.
@@ -9,6 +34,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabaseClient';
 import type { Aircraft } from '../Types/Maintenance';
 import AircraftArchive from './AircraftArchive';
+import { BmModal, BmField, BmSelect, BmNotice, bmInput, bmTextarea, bmBtn } from './brand/bm-ui'; // [v3.5]
 import {
   ArrowLeft, Plane, Wrench, Loader2, AlertTriangle, Clock, Cpu, HardDrive, Signal,
   Save, AlertCircle, CheckCircle2, History, X, Printer, ShieldCheck, RefreshCw, PackagePlus, PackageCheck, Square, type LucideIcon,
@@ -116,6 +142,13 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
   }, [aircraft.id, matricula]);
 
   useEffect(() => { void fetchLatestOrder(); }, [fetchLatestOrder]);
+
+  // [v3.5] El aviso de guardado se retira solo
+  useEffect(() => {
+    if (!successMsg) return;
+    const t = setTimeout(() => setSuccessMsg(false), 4000);
+    return () => clearTimeout(t);
+  }, [successMsg]);
 
   // El checklist pertenece a la orden de trabajo, NO a la matrícula.
   // Recibido no equivale a instalado, inspeccionado ni liberado al servicio.
@@ -351,16 +384,17 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
             align-items: flex-start;
             gap: 30px;
 
-            border-bottom: 3px solid #111827;
+            border-bottom: 3px solid #D42125;
 
             padding-bottom: 18px;
             margin-bottom: 25px;
           }
 
           .brand {
-            font-size: 27px;
+            font-size: 24px;
             font-weight: 900;
-            letter-spacing: 3px;
+            letter-spacing: 1px;
+            color: #D42125;
           }
 
           .subtitle {
@@ -1026,11 +1060,11 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
           <div>
 
             <div class="brand">
-              VALKYRON OS
+              B&amp;M MANTENIMIENTO AERONÁUTICO
             </div>
 
             <div class="subtitle">
-              SISTEMA DE GESTIÓN Y MANTENIMIENTO
+              VALKYRON OS · SISTEMA DE GESTIÓN Y MANTENIMIENTO
               DE AERONAVES
             </div>
 
@@ -1153,7 +1187,7 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
         <div class="footer">
 
           <span>
-            VALKYRON OS — Registro técnico de aeronave.
+            B&amp;M Mantenimiento Aeronáutico · Valkyron OS — Registro técnico de aeronave.
             Este documento no constituye certificación de aeronavegabilidad.
           </span>
 
@@ -1235,272 +1269,312 @@ const AircraftDetail: React.FC<AircraftDetailProps> = ({ aircraft, onBack, onOpe
     }
   };
 
-
-  const inputCls = `w-full bg-black border border-white/10 rounded-xl p-4 text-white text-xs uppercase
-    outline-none focus:border-[#E1AD01] transition-all placeholder:text-white/20 font-mono`;
-  const btnCls = 'flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all disabled:opacity-40';
-  const statusLabel = isFetching ? 'Sincronizando MRO' : isMaintenance ? 'EN HANGAR / MANTENIMIENTO'
-    : isGrounded ? 'AOG / TIERRA' : flotaActual?.estado === 'operational' ? 'OPERATIVA EN SISTEMA'
-    : (flotaActual?.estado ?? aircraft.status).toUpperCase();
+  // [v3.5] Controles B&M (antes: negro con borde dorado, texto de 12 px)
+  const inputCls = bmInput;
+  const statusLabel = isFetching ? 'Sincronizando MRO' : isMaintenance ? 'En hangar / mantenimiento'
+    : isGrounded ? 'AOG / en tierra' : flotaActual?.estado === 'operational' ? 'Operativa en sistema'
+    : String(flotaActual?.estado ?? aircraft.status ?? 'Estado no verificado'); // [FIX v3.5] sin .toUpperCase() sobre nulo
+  const statusPill = isFetching ? 'bg-white/10 text-white'
+    : isMaintenance ? 'bg-bm-warn text-white'
+    : isGrounded ? 'bg-bm-red text-white'
+    : 'bg-bm-ok text-white';
+  const partesRecibidas = requiredParts.length - pendingParts.length;
+  const cierreBloqueado = partsLoading || !!partsError || pendingParts.length > 0;
 
   return (
-    <div className="p-6 min-h-screen text-white animate-in fade-in duration-500 space-y-8">
+    <div className="bm-app space-y-4 text-left text-bm-ink sm:space-y-5">
       {/* Barra de navegación y accesos al historial completo */}
-      <header className="flex justify-between items-center gap-4 flex-wrap">
-        <button type="button" onClick={onBack} className="text-gray-400 flex gap-2 items-center hover:text-[#E1AD01] text-[10px] font-black uppercase tracking-widest">
-          <ArrowLeft size={16}/> Volver al Dashboard
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <button type="button" onClick={onBack} className={`${bmBtn.ghost} ${bmBtn.sm} -ml-2`}>
+          <ArrowLeft className="h-4 w-4" /> Volver a Flota
         </button>
-        <div className="flex flex-wrap gap-2 items-center">
+        <div className="flex flex-wrap items-center gap-2">
           <button type="button" onClick={() => void fetchLatestOrder()} disabled={isFetching || isSaving}
-            className={`${btnCls} border border-white/15 hover:bg-white/10`}><RefreshCw size={14}/> Actualizar</button>
+            className={`${bmBtn.secondary} ${bmBtn.sm}`} aria-label="Actualizar estado">
+            <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+            <span className="hidden sm:inline">Actualizar</span>
+          </button>
           <button type="button" onClick={() => onOpenHistorial ? onOpenHistorial(aircraft) : setIsArchiveOpen(true)}
-            className={`${btnCls} bg-[#E1AD01]/10 border border-[#E1AD01]/30 text-[#E1AD01] hover:bg-[#E1AD01] hover:text-black`}>
-            <History size={14}/> Expediente histórico OMA</button>
+            className={`${bmBtn.secondary} ${bmBtn.sm}`}>
+            <History className="h-4 w-4" /> {onOpenHistorial ? 'Historial técnico' : 'Expediente histórico OMA'}
+          </button>
           <button type="button" onClick={() => void handlePrintHistory()}
-            className={`${btnCls} bg-white/[0.04] border border-white/15 hover:bg-white hover:text-black`}>
-            <Printer size={14}/> Imprimir Historial</button>
-          <span className="text-[9px] font-mono text-slate-500 bg-black/30 p-2 rounded">ID: {matricula}</span>
+            className={`${bmBtn.dark} ${bmBtn.sm}`}>
+            <Printer className="h-4 w-4" /> Imprimir historial
+          </button>
         </div>
       </header>
 
       {/* Estado de aeronave consultado directamente de PostgreSQL */}
-      <section className="p-8 bg-black/30 border border-white/10 rounded-3xl relative overflow-hidden shadow-2xl">
-        <Plane size={160} className="absolute -right-5 -bottom-5 text-white/[0.025]"/>
-        <div className="relative flex justify-between items-end flex-wrap gap-6">
-          <div>
-            <p className="text-[10px] text-[#E1AD01] font-black uppercase tracking-[0.3em] mb-2">Diagnóstico de Aeronave</p>
-            <h2 className="text-5xl font-black italic">{aircraft.model}</h2>
-            <p className="text-[10px] text-slate-500 font-black mt-3 uppercase tracking-widest">{matricula} · Base {aircraft.location}</p>
+      <section className="relative overflow-hidden rounded-[24px] bg-bm-ink p-5 text-white sm:p-7">
+        <Plane className="pointer-events-none absolute -bottom-6 -right-4 h-40 w-40 rotate-12 text-white/[0.05]" aria-hidden="true" />
+        <div className="relative flex flex-wrap items-end justify-between gap-5">
+          <div className="min-w-0">
+            <p className="text-sm text-white/60">Diagnóstico de aeronave</p>
+            <h2 className="bm-figure mt-1 break-words text-[40px] leading-none sm:text-[56px]">{aircraft.model}</h2>
+            <p className="mt-3 text-sm text-white/70">
+              <span className="font-data font-semibold text-white">{matricula}</span> · Base {aircraft.location || 'sin asignar'}
+            </p>
           </div>
-          <div className={`p-4 rounded-2xl border-2 font-black text-xs flex gap-3 items-center ${isMaintenance ?
-            'bg-amber-500/10 border-amber-500 text-amber-400' : isGrounded ?
-            'bg-red-500/10 border-red-500 text-red-400' : 'bg-emerald-500/10 border-emerald-500 text-emerald-400'}`}>
-            {isFetching ? <Loader2 className="animate-spin" size={20}/> : isMaintenance ? <Wrench size={20}/> : <Plane size={20}/>}
+          <div className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold ${statusPill}`} role="status">
+            {isFetching ? <Loader2 className="h-4 w-4 animate-spin" /> : isMaintenance ? <Wrench className="h-4 w-4" /> : <Plane className="h-4 w-4" />}
             {statusLabel}
           </div>
         </div>
       </section>
 
       {/* Métricas: solo las respaldadas por la base de datos */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <MetricCard label="Time Since New (TSN)" value={`${flotaActual?.horas_vuelo_totales ?? aircraft.hours_vuelo_totales ?? 0} h`} icon={Clock}/>
-        <MetricCard label="Órdenes activas" value={isFetching ? 'Consultando' : orderRecord ? 'Hay OT activa' : 'Ninguna detectada'} icon={Wrench}/>
-        <MetricCard label="Estado en BD" value={flotaActual?.estado ?? 'Consultando'} icon={HardDrive}/>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 sm:gap-4">
+        <MetricCard label="Time Since New (TSN)" value={`${flotaActual?.horas_vuelo_totales ?? aircraft.hours_vuelo_totales ?? 0} h`} icon={Clock} numeric />
+        <MetricCard label="Órdenes activas" value={isFetching ? 'Consultando…' : orderRecord ? 'Hay OT activa' : 'Ninguna detectada'} icon={Wrench} />
+        <MetricCard label="Estado en BD" value={flotaActual?.estado ?? 'Consultando…'} icon={HardDrive} mono />
       </div>
 
       {/* Conserva el panel visual sin inventar telemetría del motor */}
-      <section className="bg-white/[0.03] p-6 rounded-3xl border border-white/10 shadow-xl">
-        <h3 className="text-[10px] text-[#E1AD01] font-black mb-6 uppercase tracking-[0.3em] flex gap-2 items-center">
-          <Cpu size={14}/> Módulo de Análisis Predictivo Motor
+      <section className="rounded-[24px] border border-bm-line bg-white p-4 sm:p-6">
+        <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold">
+          <Cpu className="h-4 w-4 text-bm-red" /> Módulo de análisis predictivo del motor
         </h3>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
-          <TelemetryDot label="Estado Motor" value="SIN TELEMETRÍA"/>
-          <TelemetryDot label="Vibración" value="NO DISPONIBLE"/>
-          <TelemetryDot label="Temperatura de aceite" value="NO DISPONIBLE"/>
-          <TelemetryDot label="Alerta predictiva" value="SIN DATOS"/>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <TelemetryDot label="Estado motor" value="Sin telemetría"/>
+          <TelemetryDot label="Vibración" value="No disponible"/>
+          <TelemetryDot label="Temperatura de aceite" value="No disponible"/>
+          <TelemetryDot label="Alerta predictiva" value="Sin datos"/>
         </div>
-        <p className="text-[9px] text-slate-600 mt-5 font-mono">Estos campos requieren sensores o una fuente verificada; no representan diagnóstico técnico.</p>
+        <p className="mt-4 text-xs text-bm-hint">Estos campos requieren sensores o una fuente verificada; no representan diagnóstico técnico.</p>
       </section>
 
-      {errorMsg && <FeedbackBanner tone="error" text={errorMsg} onClose={() => setErrorMsg(null)}/>}
-      {successMsg && <FeedbackBanner tone="success" text="Orden actualizada correctamente."/>}
+      {errorMsg && !isCompleteOpen && !isReleaseOpen && <FeedbackBanner tone="error" text={errorMsg} onClose={() => setErrorMsg(null)}/>}
+      {successMsg && <FeedbackBanner tone="success" text="Orden actualizada correctamente." onClose={() => setSuccessMsg(false)}/>}
 
       {/* Panel de la última OT activa: busca aunque el dashboard tenga un estado obsoleto */}
-      {isMaintenance && <section className="p-8 bg-amber-950/10 border-2 border-amber-500/30 rounded-3xl space-y-5 shadow-2xl">
-        <h3 className="text-[11px] text-amber-400 font-black uppercase tracking-widest flex items-center gap-3">
-          <AlertTriangle size={18}/> Panel de Orden de Trabajo Activa
+      {isMaintenance && <section className="space-y-5 rounded-[24px] border border-bm-warn/30 bg-white p-4 sm:p-6">
+        <h3 className="flex items-center gap-2.5 text-base font-semibold">
+          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-bm-warn-tint text-bm-warn"><AlertTriangle className="h-4 w-4"/></span>
+          Orden de trabajo activa
         </h3>
-        {isFetching ? <div className="flex items-center gap-3 py-8 text-slate-500"><Loader2 className="animate-spin"/> Sincronizando con MRO...</div>
+        {isFetching ? <div className="flex items-center gap-3 py-8 text-sm text-bm-steel" role="status"><Loader2 className="h-5 w-5 animate-spin text-bm-red"/> Sincronizando con MRO…</div>
           : orderRecord ? <>
-            <div className="grid md:grid-cols-2 gap-5 p-5 bg-black/40 border border-white/5 rounded-2xl">
-              <div><p className="text-[9px] text-slate-500 uppercase font-black">Tarea</p>
-                <p className="text-xs text-white font-bold mt-2 whitespace-pre-line">{orderRecord.descripcion_tarea}</p></div>
-              <div><p className="text-[9px] text-slate-500 uppercase font-black">Técnico asignado</p>
-                <p className="text-xs text-white font-bold mt-2">{orderRecord.nombre_mecanico}</p></div>
+            <div className="grid gap-4 rounded-2xl bg-bm-canvas p-4 md:grid-cols-2">
+              <div><p className="text-xs text-bm-steel">Tarea</p>
+                <p className="mt-1 whitespace-pre-line text-sm font-semibold uppercase leading-snug">{orderRecord.descripcion_tarea}</p></div>
+              <div><p className="text-xs text-bm-steel">Técnico asignado</p>
+                <p className="mt-1 text-sm font-semibold uppercase">{orderRecord.nombre_mecanico}</p></div>
             </div>
-            <form onSubmit={handleUpdate} className="space-y-5">
-              <div><label className="block mb-2 text-[10px] text-[#E1AD01] font-black uppercase">Estado de la orden</label>
-                <select value={status} onChange={e => setStatus(e.target.value)} className={inputCls}>
-                  <option value="In Progress">EN PROGRESO</option>
-                  <option value="Pending Parts">ESPERANDO REPUESTOS</option>
-                  <option value="On Hold">EN ESPERA</option>
-                </select>
-                <p className="text-[9px] text-slate-500 mt-2">Completar la orden requiere registrar el cierre técnico.</p>
-              </div>
-              <div><label className="block mb-2 text-[10px] text-[#E1AD01] font-black uppercase">Observaciones / progreso</label>
-                <textarea rows={5} value={notes} onChange={e => setNotes(e.target.value)}
-                  placeholder="AVANCES, DIAGNÓSTICO, REPUESTOS PEDIDOS..." className={`${inputCls} resize-none`}/></div>
-              <div className="flex gap-3 flex-wrap">
-                <button type="submit" disabled={isSaving} className={`${btnCls} flex-1 bg-[#E1AD01] text-black hover:bg-white`}>
-                  {isSaving ? <Loader2 className="animate-spin" size={14}/> : <Save size={14}/>} Guardar progreso
+            <form onSubmit={handleUpdate} className="space-y-4">
+              <BmField label="Estado de la orden" htmlFor="ad-estado" hint="Completar la orden requiere registrar el cierre técnico.">
+                <BmSelect id="ad-estado" value={status} onChange={e => setStatus(e.target.value)}>
+                  <option value="In Progress">En progreso</option>
+                  <option value="Pending Parts">Esperando repuestos</option>
+                  <option value="On Hold">En espera</option>
+                </BmSelect>
+              </BmField>
+              <BmField label="Observaciones y progreso" htmlFor="ad-notas">
+                <textarea id="ad-notas" rows={5} value={notes} onChange={e => setNotes(e.target.value)}
+                  placeholder="Avances, diagnóstico, repuestos pedidos" className={bmTextarea}/>
+              </BmField>
+              <div className="flex flex-col gap-3 sm:flex-row">
+                <button type="submit" disabled={isSaving} className={`${bmBtn.primary} sm:flex-1`}>
+                  {isSaving ? <Loader2 className="h-4 w-4 animate-spin"/> : <Save className="h-4 w-4"/>} Guardar progreso
                 </button>
-                <button type="button" onClick={() => setIsCompleteOpen(true)} disabled={isSaving || partsLoading || !!partsError || pendingParts.length > 0}
-                  className={`${btnCls} flex-1 bg-emerald-500 text-black hover:bg-emerald-400`}>
-                  <CheckCircle2 size={14}/> Completar Orden
+                <button type="button" onClick={() => setIsCompleteOpen(true)} disabled={isSaving || cierreBloqueado}
+                  className={`${bmBtn.success} sm:flex-1`}>
+                  <CheckCircle2 className="h-4 w-4"/> Completar orden
                 </button>
               </div>
+              {/* [v3.5] Motivo visible cuando el cierre está bloqueado */}
+              {!partsLoading && cierreBloqueado && (
+                <p className="text-[13px] text-bm-steel">
+                  {partsError
+                    ? 'No se pudo verificar el checklist de repuestos: actualícelo antes de cerrar.'
+                    : `Para cerrar, marque como recibidos los ${pendingParts.length} repuesto(s) pendiente(s) del checklist.`}
+                </p>
+              )}
             </form>
-          </> : <div className="bg-black/40 border border-white/10 rounded-2xl p-5 space-y-4">
-            <p className="text-xs text-amber-400">La aeronave permanece en mantenimiento sin órdenes abiertas. No está liberada para vuelo.</p>
-            <p className="text-xs text-slate-500">Si existe documentación de retorno al servicio, una persona expresamente autorizada puede registrar su liberación.</p>
+          </> : <div className="space-y-4 rounded-2xl bg-bm-canvas p-4">
+            <BmNotice tone="warn" icon={<AlertTriangle className="h-4 w-4"/>}>
+              La aeronave permanece en mantenimiento sin órdenes abiertas. <strong>No está liberada para vuelo.</strong>
+            </BmNotice>
+            <p className="text-sm text-bm-steel">Si existe documentación de retorno al servicio, una persona expresamente autorizada puede registrar su liberación.</p>
             <button type="button" onClick={() => setIsReleaseOpen(true)} disabled={isSaving}
-              className={`${btnCls} bg-emerald-500 text-black hover:bg-emerald-400`}><ShieldCheck size={14}/> Registrar liberación autorizada</button>
+              className={bmBtn.success}><ShieldCheck className="h-4 w-4"/> Registrar liberación autorizada</button>
           </div>}
       </section>}
 
-      {isArchiveOpen && <div className="fixed inset-0 z-[80] bg-black/95 overflow-y-auto" role="dialog" aria-modal="true" aria-label="Expediente histórico OMA">
-        <div className="mx-auto max-w-6xl py-8 px-4">
-          <div className="flex justify-end"><button type="button" className={`${btnCls} border border-white/20`} onClick={() => setIsArchiveOpen(false)}><X size={16}/> Cerrar expediente</button></div>
-          <AircraftArchive initialMatricula={matricula} onBack={() => setIsArchiveOpen(false)}/>
-        </div>
+      {isArchiveOpen && <div className="fixed inset-0 z-[80] overflow-y-auto bg-bm-canvas" role="dialog" aria-modal="true" aria-label="Expediente histórico OMA">
+        <AircraftArchive initialMatricula={matricula} onBack={() => setIsArchiveOpen(false)}/>
+        <button type="button" onClick={() => setIsArchiveOpen(false)}
+          className={`${bmBtn.dark} fixed bottom-4 right-4 z-[81] shadow-bm-pop`}>
+          <X className="h-4 w-4"/> Cerrar expediente
+        </button>
       </div>}
 
       {/* Checklist persistente de materiales requeridos en la OT activa */}
       {orderRecord && (
-        <section className="rounded-3xl border border-[#E1AD01]/25 bg-[#0a0a0a] p-6 md:p-8 space-y-5 shadow-xl">
+        <section className="space-y-5 rounded-[24px] border border-bm-line bg-white p-4 sm:p-6">
           <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h3 className="flex items-center gap-2 text-[11px] font-black uppercase tracking-widest text-[#E1AD01]">
-                <PackageCheck size={17} /> Checklist de repuestos requeridos
+            <div className="min-w-0">
+              <h3 className="flex items-center gap-2 text-base font-semibold">
+                <PackageCheck className="h-5 w-5 text-bm-red" /> Checklist de repuestos requeridos
               </h3>
-              <p className="mt-2 text-xs text-slate-400">Orden {orderRecord.id.slice(0, 8)} · {matricula}</p>
-              <p className="mt-1 text-[10px] text-slate-500">
+              <p className="mt-1 text-[13px] text-bm-steel">Orden <span className="font-data">{String(orderRecord.id).slice(0, 8)}</span> · {matricula}</p>
+              <p className="mt-1 text-xs text-bm-hint">
                 Marcar recibido confirma disponibilidad documental; no registra instalación ni descuenta stock.
               </p>
             </div>
-            <div className="rounded-xl border border-white/10 bg-black px-4 py-3 text-right text-xs">
-              <strong className={pendingParts.length ? 'text-amber-400' : 'text-emerald-400'}>
-                {requiredParts.length - pendingParts.length}/{requiredParts.length}
-              </strong>
-              <span className="ml-2 text-slate-500">recibidos</span>
-            </div>
+            <span className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-semibold ${pendingParts.length ? 'bg-bm-warn-tint text-bm-warn' : 'bg-bm-ok-tint text-bm-ok'}`}>
+              <span className="bm-num">{partesRecibidas}/{requiredParts.length}</span> recibidos
+            </span>
           </div>
-          {partsError && <div role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">{partsError}</div>}
+          {partsError && <BmNotice tone="danger" role="alert" icon={<AlertCircle className="h-4 w-4"/>}>{partsError}</BmNotice>}
           {partsLoading ? (
-            <p className="flex items-center gap-2 text-xs text-slate-400"><Loader2 size={15} className="animate-spin" /> Cargando materiales...</p>
+            <p className="flex items-center gap-2 text-sm text-bm-steel" role="status"><Loader2 className="h-4 w-4 animate-spin text-bm-red" /> Cargando materiales…</p>
           ) : requiredParts.length === 0 ? (
-            <p className="rounded-xl border border-dashed border-white/10 p-4 text-xs text-slate-500">Sin repuestos requeridos registrados para esta orden.</p>
+            <p className="rounded-2xl border border-dashed border-bm-line p-4 text-sm text-bm-steel">Sin repuestos requeridos registrados para esta orden.</p>
           ) : (
             <div className="space-y-2">
               {requiredParts.map(part => (
-                <label key={part.id} className="flex items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4 cursor-pointer">
+                <label key={part.id} className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition-colors ${
+                  part.recibido ? 'border-bm-ok/25 bg-bm-ok-tint/50' : 'border-bm-line bg-white hover:bg-bm-canvas/60'}`}>
                   <input type="checkbox" checked={part.recibido} disabled={partsSaving || partsLoading}
                     onChange={() => void togglePartReceived(part)}
-                    className="mt-1 h-4 w-4 accent-[#E1AD01]" />
+                    className="mt-0.5 h-5 w-5 shrink-0 accent-[#D42125]" />
                   <div className="min-w-0 flex-1">
-                    <p className={part.recibido ? 'text-xs font-bold text-emerald-400' : 'text-xs font-bold text-white'}>
-                      {part.numero_parte} · {part.descripcion}
+                    <p className={`text-sm font-semibold ${part.recibido ? 'text-bm-ok' : ''}`}>
+                      <span className="font-data">{part.numero_parte}</span> · {part.descripcion}
                     </p>
-                    <p className="mt-1 text-[10px] text-slate-500">Cantidad requerida: {part.cantidad} · {part.recibido ? 'RECIBIDO' : 'PENDIENTE'}</p>
-                    {part.recibido_at && <p className="mt-1 text-[9px] text-slate-600">Actualizado: {formatDate(part.recibido_at)}</p>}
+                    <p className="mt-1 text-xs text-bm-steel">Cantidad requerida: <span className="bm-num">{part.cantidad}</span> · {part.recibido ? 'Recibido' : 'Pendiente'}</p>
+                    {part.recibido_at && <p className="mt-1 text-xs text-bm-hint">Actualizado: {formatDate(part.recibido_at)}</p>}
                   </div>
-                  {part.recibido ? <CheckCircle2 size={17} className="text-emerald-400" /> : <Square size={17} className="text-amber-400" />}
+                  {part.recibido ? <CheckCircle2 className="h-5 w-5 shrink-0 text-bm-ok" /> : <Square className="h-5 w-5 shrink-0 text-bm-warn" />}
                 </label>
               ))}
             </div>
           )}
-          <form onSubmit={addRequiredPart} className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_2fr_100px_auto] md:items-end">
-            <div>
-              <label className="mb-2 block text-[9px] font-black uppercase text-slate-500">Número de parte</label>
-              <input required maxLength={100} className={inputCls} placeholder="P/N" value={partDraft.numero_parte}
+          <form onSubmit={addRequiredPart} className="grid grid-cols-1 gap-3 border-t border-bm-line pt-4 md:grid-cols-[1fr_2fr_110px_auto] md:items-end">
+            <BmField label="Número de parte" htmlFor="ad-pn" required>
+              <input id="ad-pn" required maxLength={100} className={`${inputCls} font-data uppercase`} placeholder="P/N" value={partDraft.numero_parte}
                 onChange={event => setPartDraft(prev => ({ ...prev, numero_parte: event.target.value }))} />
-            </div>
-            <div>
-              <label className="mb-2 block text-[9px] font-black uppercase text-slate-500">Descripción</label>
-              <input required maxLength={300} className={inputCls} placeholder="Repuesto requerido" value={partDraft.descripcion}
+            </BmField>
+            <BmField label="Descripción" htmlFor="ad-desc" required>
+              <input id="ad-desc" required maxLength={300} className={inputCls} placeholder="Repuesto requerido" value={partDraft.descripcion}
                 onChange={event => setPartDraft(prev => ({ ...prev, descripcion: event.target.value }))} />
-            </div>
-            <div>
-              <label className="mb-2 block text-[9px] font-black uppercase text-slate-500">Cantidad</label>
-              <input required min="1" step="1" type="number" className={inputCls} value={partDraft.cantidad}
+            </BmField>
+            <BmField label="Cantidad" htmlFor="ad-cant" required>
+              <input id="ad-cant" required min="1" step="1" type="number" inputMode="numeric" className={`${inputCls} bm-num`} value={partDraft.cantidad}
                 onChange={event => setPartDraft(prev => ({ ...prev, cantidad: event.target.value }))} />
-            </div>
-            <button type="submit" disabled={partsSaving || partsLoading}
-              className={`${btnCls} bg-[#E1AD01] text-black hover:bg-white`}>
-              {partsSaving ? <Loader2 size={14} className="animate-spin"/> : <PackagePlus size={14}/>} Agregar
+            </BmField>
+            <button type="submit" disabled={partsSaving || partsLoading} className={bmBtn.primary}>
+              {partsSaving ? <Loader2 className="h-4 w-4 animate-spin"/> : <PackagePlus className="h-4 w-4"/>} Agregar
             </button>
           </form>
           <button type="button" onClick={() => void loadRequiredParts(orderRecord.id)} disabled={partsSaving || partsLoading}
-            className="text-[10px] uppercase text-slate-500 hover:text-[#E1AD01] flex gap-2 items-center">
-            <RefreshCw size={13}/> Actualizar checklist
+            className={`${bmBtn.ghost} ${bmBtn.sm} -ml-2`}>
+            <RefreshCw className="h-4 w-4"/> Actualizar checklist
           </button>
         </section>
       )}
 
       {/* Modal de cierre: no libera automáticamente la aeronave */}
-      {isCompleteOpen && orderRecord && <div className="fixed inset-0 z-[90] bg-black/95 flex items-center justify-center p-4 overflow-y-auto">
-        <div className="w-full max-w-lg bg-[#0a0a0a] border border-emerald-500/40 rounded-3xl shadow-2xl overflow-hidden">
-          <div className="bg-emerald-500/10 border-b border-emerald-500/20 p-6 flex justify-between items-center">
-            <div><h3 className="text-sm font-black uppercase">Cerrar orden de trabajo</h3><p className="text-[10px] text-emerald-400 mt-2">{matricula} · {aircraft.model}</p></div>
-            <button type="button" onClick={() => setIsCompleteOpen(false)}><X size={20}/></button>
-          </div>
-          <form onSubmit={handleCompleteOrder} className="p-7 space-y-5">
-            <p className="bg-amber-500/10 border border-amber-500/20 p-3 rounded-xl text-xs text-amber-400">
-              El cierre de esta orden NO autoriza el regreso al servicio de la aeronave.
-            </p>
-            <div className="bg-white/[0.03] border border-white/10 p-4 rounded-xl"><p className="text-[9px] text-slate-500 uppercase">Tarea</p>
-              <p className="text-xs font-bold whitespace-pre-line mt-2">{orderRecord.descripcion_tarea}</p></div>
-            <div><label className="block mb-2 text-[10px] text-emerald-400 font-black uppercase">Mecánico / inspector *</label>
-              <input required className={inputCls} value={completeForm.mecanicoCierre}
-                onChange={e => setCompleteForm(p => ({...p, mecanicoCierre:e.target.value}))}/></div>
-            <div><label className="block mb-2 text-[10px] text-[#E1AD01] font-black uppercase">Horas totales al cierre (TSN) *</label>
-              <input required type="number" min="0" step="0.1" className={`${inputCls} text-2xl text-center font-black`}
-                value={completeForm.horasActuales} onChange={e => setCompleteForm(p => ({...p, horasActuales:e.target.value}))}/></div>
-            <div><label className="block mb-2 text-[10px] text-emerald-400 font-black uppercase">Observaciones finales *</label>
-              <textarea required rows={5} className={inputCls} value={completeForm.observacionesFinales}
-                onChange={e => setCompleteForm(p => ({...p, observacionesFinales:e.target.value}))}/></div>
-            {errorMsg && <p className="text-xs text-red-400">{errorMsg}</p>}
-            <div className="flex gap-3"><button type="button" onClick={() => setIsCompleteOpen(false)} className={`${btnCls} flex-1 border border-white/10`}>Cancelar</button>
-              <button type="submit" disabled={isSaving} className={`${btnCls} flex-1 bg-emerald-500 text-black`}>
-                {isSaving ? <Loader2 size={14} className="animate-spin"/> : <CheckCircle2 size={14}/>} Confirmar cierre</button></div>
+      <BmModal
+        open={isCompleteOpen && !!orderRecord}
+        onClose={() => setIsCompleteOpen(false)}
+        busy={isSaving}
+        title="Cerrar orden de trabajo"
+        subtitle={`${matricula} · ${aircraft.model}`}
+        icon={<CheckCircle2 className="h-5 w-5"/>}
+        tone="ok"
+        z={90}
+      >
+        {orderRecord && (
+          <form onSubmit={handleCompleteOrder} className="space-y-4">
+            <BmNotice tone="warn" icon={<AlertTriangle className="h-4 w-4"/>}>
+              El cierre de esta orden <strong>no autoriza</strong> el regreso al servicio de la aeronave.
+            </BmNotice>
+            <div className="rounded-2xl bg-bm-canvas p-4"><p className="text-xs text-bm-steel">Tarea</p>
+              <p className="mt-1 whitespace-pre-line text-sm font-semibold uppercase">{orderRecord.descripcion_tarea}</p></div>
+            <BmField label="Mecánico / inspector" htmlFor="ad-mec" required>
+              <input id="ad-mec" required className={`${inputCls} uppercase`} value={completeForm.mecanicoCierre}
+                onChange={e => setCompleteForm(p => ({...p, mecanicoCierre:e.target.value}))}/>
+            </BmField>
+            <BmField label="Horas totales al cierre (TSN)" htmlFor="ad-horas" required>
+              <input id="ad-horas" required type="number" min="0" step="0.1" inputMode="decimal"
+                className={`${inputCls} bm-num h-14 text-center text-2xl font-semibold`}
+                value={completeForm.horasActuales} onChange={e => setCompleteForm(p => ({...p, horasActuales:e.target.value}))}/>
+            </BmField>
+            <BmField label="Observaciones finales" htmlFor="ad-obs" required>
+              <textarea id="ad-obs" required rows={5} className={bmTextarea} value={completeForm.observacionesFinales}
+                onChange={e => setCompleteForm(p => ({...p, observacionesFinales:e.target.value}))}/>
+            </BmField>
+            {errorMsg && <BmNotice tone="danger" role="alert" icon={<AlertCircle className="h-4 w-4"/>}>{errorMsg}</BmNotice>}
+            <div className="flex flex-col-reverse gap-3 sm:flex-row">
+              <button type="button" onClick={() => setIsCompleteOpen(false)} disabled={isSaving} className={`${bmBtn.secondary} sm:flex-1`}>Cancelar</button>
+              <button type="submit" disabled={isSaving} className={`${bmBtn.success} sm:flex-1`}>
+                {isSaving ? <Loader2 className="h-4 w-4 animate-spin"/> : <CheckCircle2 className="h-4 w-4"/>} Confirmar cierre
+              </button>
+            </div>
           </form>
-        </div>
-      </div>}
+        )}
+      </BmModal>
 
       {/* Modal de autorización: validación completa dentro del RPC */}
-      {isReleaseOpen && !orderRecord && <div className="fixed inset-0 z-[95] bg-black/95 flex justify-center items-center p-4 overflow-y-auto">
-        <div className="bg-[#0a0a0a] border border-emerald-500/40 rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl">
-          <div className="bg-emerald-500/10 p-6 flex justify-between items-center border-b border-emerald-500/20">
-            <div><h3 className="uppercase font-black">Retorno al servicio · {matricula}</h3><p className="text-[10px] text-slate-400 mt-2">Solo personal previamente habilitado en Supabase</p></div>
-            <button type="button" onClick={() => setIsReleaseOpen(false)}><X size={20}/></button>
+      <BmModal
+        open={isReleaseOpen && !orderRecord}
+        onClose={() => setIsReleaseOpen(false)}
+        busy={isSaving}
+        title={`Retorno al servicio · ${matricula}`}
+        subtitle="Solo personal previamente habilitado en Supabase"
+        icon={<ShieldCheck className="h-5 w-5"/>}
+        tone="ok"
+        z={95}
+      >
+        <form onSubmit={handleRelease} className="space-y-4">
+          <BmNotice tone="warn" icon={<AlertTriangle className="h-4 w-4"/>}>
+            Confirme que dispone de autorización real de mantenimiento, documentación de liberación firmada y verificación de todas las restricciones. Este formulario <strong>no emite</strong> una certificación técnica.
+          </BmNotice>
+          <BmField label="Referencia de liberación firmada" htmlFor="ad-ref" required>
+            <input id="ad-ref" required className={`${inputCls} font-data uppercase`} value={releaseForm.referencia} placeholder="Número de registro o referencia"
+              onChange={e => setReleaseForm(p=>({...p,referencia:e.target.value}))}/>
+          </BmField>
+          <BmField label="Observaciones y revisión de restricciones" htmlFor="ad-rev" required>
+            <textarea id="ad-rev" required rows={5} className={bmTextarea} value={releaseForm.observaciones}
+              onChange={e => setReleaseForm(p=>({...p,observaciones:e.target.value}))}/>
+          </BmField>
+          {errorMsg && <BmNotice tone="danger" role="alert" icon={<AlertCircle className="h-4 w-4"/>}>{errorMsg}</BmNotice>}
+          <div className="flex flex-col-reverse gap-3 sm:flex-row">
+            <button type="button" className={`${bmBtn.secondary} sm:flex-1`} disabled={isSaving} onClick={() => setIsReleaseOpen(false)}>Cancelar</button>
+            <button disabled={isSaving} type="submit" className={`${bmBtn.success} sm:flex-1`}>
+              {isSaving ? <Loader2 className="h-4 w-4 animate-spin"/> : <ShieldCheck className="h-4 w-4"/>} Registrar
+            </button>
           </div>
-          <form onSubmit={handleRelease} className="p-7 space-y-5">
-            <p className="text-xs bg-amber-500/10 border border-amber-500/20 p-4 rounded-lg text-amber-300">
-              Confirma que dispones de autorización real de mantenimiento, documentación de liberación firmada y verificación de todas las restricciones. Este formulario NO emite una certificación técnica.
-            </p>
-            <div><label className="block mb-2 text-[10px] font-black uppercase">Referencia de liberación firmada *</label>
-              <input required className={inputCls} value={releaseForm.referencia} placeholder="NÚMERO DE REGISTRO / REFERENCIA"
-                onChange={e => setReleaseForm(p=>({...p,referencia:e.target.value}))}/></div>
-            <div><label className="block mb-2 text-[10px] font-black uppercase">Observaciones y revisión de restricciones *</label>
-              <textarea required rows={5} className={inputCls} value={releaseForm.observaciones}
-                onChange={e => setReleaseForm(p=>({...p,observaciones:e.target.value}))}/></div>
-            {errorMsg && <p className="text-red-400 text-xs">{errorMsg}</p>}
-            <div className="flex gap-3"><button type="button" className={`${btnCls} flex-1 border border-white/20`} onClick={() => setIsReleaseOpen(false)}>Cancelar</button>
-              <button disabled={isSaving} type="submit" className={`${btnCls} flex-1 bg-emerald-500 text-black`}>
-                {isSaving ? <Loader2 size={14} className="animate-spin"/> : <ShieldCheck size={14}/>} Registrar</button></div>
-          </form>
-        </div>
-      </div>}
+        </form>
+      </BmModal>
     </div>
   );
 };
 
 // Componentes visuales auxiliares; no sustituyen fuentes de datos técnicas.
-const MetricCard = ({ label, value, icon: Icon }: { label: string; value: string; icon: LucideIcon }) => (
-  <div className="bg-white/[0.03] border border-white/10 rounded-3xl p-6 flex gap-4 items-center shadow-xl">
-    <Icon size={26} className="text-[#E1AD01]"/>
-    <div><p className="text-[9px] text-slate-500 uppercase font-black tracking-widest mb-2">{label}</p><p className="text-xl font-black break-words">{value}</p></div>
+const MetricCard = ({ label, value, icon: Icon, numeric = false, mono = false }: { label: string; value: string; icon: LucideIcon; numeric?: boolean; mono?: boolean }) => (
+  <div className="flex items-center gap-4 rounded-[20px] border border-bm-line bg-white p-4 sm:p-5">
+    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-bm-red-tint text-bm-red"><Icon className="h-5 w-5"/></span>
+    <div className="min-w-0">
+      <p className="text-[13px] text-bm-steel">{label}</p>
+      <p className={`mt-0.5 break-words font-semibold ${numeric ? 'bm-num text-2xl' : mono ? 'font-data text-base' : 'text-lg'}`}>{value}</p>
+    </div>
   </div>
 );
 const TelemetryDot = ({ label, value }: { label: string; value: string }) => (
-  <div><p className="text-[9px] text-slate-500 font-black uppercase tracking-widest">{label}</p>
-    <p className="text-sm text-zinc-500 font-mono mt-2 flex gap-2 items-center"><Signal size={13}/>{value}</p>
+  <div className="rounded-2xl bg-bm-canvas p-3.5">
+    <p className="text-xs text-bm-steel">{label}</p>
+    <p className="mt-1.5 flex items-center gap-2 text-sm font-medium text-bm-hint"><Signal className="h-3.5 w-3.5"/>{value}</p>
   </div>
 );
 const FeedbackBanner = ({ tone, text, onClose }: { tone: 'error' | 'success'; text: string; onClose?: () => void }) => (
-  <div className={`p-4 border rounded-xl flex gap-3 items-center ${tone === 'error' ? 'bg-red-500/10 border-red-500/30 text-red-300' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'}`}>
-    <AlertCircle size={16}/><p className="text-xs flex-1">{text}</p>
-    {onClose && <button type="button" onClick={onClose}><X size={14}/></button>}
+  <div role={tone === 'error' ? 'alert' : 'status'} className={`flex items-center gap-3 rounded-2xl border p-4 text-sm ${
+    tone === 'error' ? 'border-bm-red/25 bg-bm-red-tint text-bm-red-deep' : 'border-bm-ok/25 bg-bm-ok-tint text-bm-ok'}`}>
+    {tone === 'error' ? <AlertCircle className="h-4 w-4 shrink-0"/> : <CheckCircle2 className="h-4 w-4 shrink-0"/>}
+    <p className="flex-1">{text}</p>
+    {onClose && <button type="button" onClick={onClose} aria-label="Cerrar aviso" className="flex h-8 w-8 items-center justify-center rounded-lg hover:bg-white/60"><X className="h-4 w-4"/></button>}
   </div>
 );
 export default AircraftDetail;
