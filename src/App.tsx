@@ -1,7 +1,13 @@
-// NÚCLEO DE INTELIGENCIA OPERATIVA - VALKYRON OS v7.3.1
+// NÚCLEO DE INTELIGENCIA OPERATIVA - VALKYRON OS v7.3.2
 // B&M MANTENIMIENTO AERONÁUTICO (ex Águilas Pilot) — Inventario & MRO
 // ─────────────────────────────────────────────────────────────────────────────
 // FUSIÓN v5.0 + v7.0 + v7.1 + rebrand B&M
+//
+// CHANGELOG v7.3.2:
+//   [UI]  /inventory-archive sin marco: InventoryArchive v2.0 es una página B&M
+//         completa con cabecera propia y "Volver a Stock" (igual que
+//         /aircraft-archive). Ninguna ruta usa ya frame="legacy"; la variante se
+//         conserva en RouteFrame por compatibilidad.
 //
 // CHANGELOG v7.3.1:
 //   [UI]  /planificacion pasa a frame="bm": FlightPlanningboard v1.2 ya es B&M
@@ -543,7 +549,7 @@ const AppRoutes = () => {
         <Route
           path="/inventory-archive"
           element={
-            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryArchive} modulo="Archivo de Inventario" frame="legacy">
+            <ProtectedRoute globalFleet={globalFleet} allowedRoles={ROUTE_ROLES.inventoryArchive} modulo="Archivo de Inventario">
               <InventoryArchive />
             </ProtectedRoute>
           }

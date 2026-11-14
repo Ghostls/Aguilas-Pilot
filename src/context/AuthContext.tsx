@@ -1,6 +1,17 @@
 // src/context/AuthContext.tsx
-// VALKYRON OS v7.1 — AUTENTICACIÓN RESILIENTE Y ROLES OPERATIVOS
+// VALKYRON OS v7.2 — AUTENTICACIÓN RESILIENTE Y ROLES OPERATIVOS · B&M
 // FUSIÓN v6.1 + v7.0
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v7.2 (sobre v7.1) — REBRAND B&M:
+//   [UI]  ISSUE_MESSAGES: INIT_TIMEOUT ya no menciona "Águilas OS" (lo muestra
+//         AuthRecoveryPanel en la pantalla de recuperación).
+//   [FIX] Diagnóstico de filas duplicadas: si roles_operativos tiene más de una
+//         fila para el usuario, maybeSingle() devuelve PGRST116 y lastError solo
+//         traía el mensaje técnico de PostgREST ("JSON object requested,
+//         multiple rows returned"). Ahora explica la causa y qué hacer. La
+//         política no cambia (fail-closed: sin acceso).
+//   SIN CAMBIOS: política de roles, tiempos, eventos, re-verificación,
+//         exportaciones públicas y firma de AuthProvider.
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v7.1 (sobre v7.0):
 //   [NEW] Re-verificación de permisos al volver a la pestaña (visibilitychange):
@@ -170,7 +181,7 @@ export const PLANNER_ROLES: UserRole[] = [
 export const ISSUE_MESSAGES: Record<AuthIssue, { title: string; detail: string }> = {
   INIT_TIMEOUT: {
     title: 'No se pudo recuperar la sesión guardada',
-    detail: 'El navegador no respondió a tiempo al leer la sesión de este equipo. Suele ocurrir si otra pestaña de Águilas OS quedó bloqueada o la conexión es inestable. Reintente; si persiste, repare la sesión del dispositivo.',
+    detail: 'El navegador no respondió a tiempo al leer la sesión de este equipo. Suele ocurrir si otra pestaña del sistema B&M quedó bloqueada o la conexión es inestable. Reintente; si persiste, repare la sesión del dispositivo.',
   },
   OFFLINE: {
     title: 'Sin conexión a internet',
@@ -453,7 +464,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children, onSignedOu
         if (error) {
           lastError = controller.signal.aborted
             ? 'Tiempo de espera agotado al verificar permisos.'
-            : error.message;
+            : error.code === 'PGRST116'
+              // [v7.2] maybeSingle() con varias filas: dato duplicado, no caída del servidor
+              ? 'Hay más de una fila en roles_operativos para este usuario. Administración debe dejar una sola.'
+              : error.message;
           authLog('permisos:roles_operativos', { clase: cls, codigo: error.code ?? '', http: status }, 'warn');
         }
       }
