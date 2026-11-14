@@ -1,7 +1,11 @@
-// NÚCLEO DE INTELIGENCIA OPERATIVA - VALKYRON OS v7.3
+// NÚCLEO DE INTELIGENCIA OPERATIVA - VALKYRON OS v7.3.1
 // B&M MANTENIMIENTO AERONÁUTICO (ex Águilas Pilot) — Inventario & MRO
 // ─────────────────────────────────────────────────────────────────────────────
 // FUSIÓN v5.0 + v7.0 + v7.1 + rebrand B&M
+//
+// CHANGELOG v7.3.1:
+//   [UI]  /planificacion pasa a frame="bm": FlightPlanningboard v1.2 ya es B&M
+//         (antes frame="legacy", fondo oscuro).
 //
 // CHANGELOG v7.3 — RUTAS DIRECTAS CON MARCO:
 //   [FIX] Las rutas directas (/control-hub, /inventory-checkout,
@@ -561,7 +565,7 @@ const AppRoutes = () => {
               allowedRoles={PLANNER_ROLES}
               requirePlanner
               modulo="Planificación de Vuelo"
-              frame="legacy"
+              frame="bm"
             >
               <FlightPlanningBoard />
             </ProtectedRoute>

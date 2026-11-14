@@ -1,4 +1,38 @@
-// src/components/FlightPlanningBoard.tsx
+// src/components/FlightPlanningboard.tsx
+// VALKYRON OS v1.2 — PLANIFICACIÓN DE VUELO · B&M MANTENIMIENTO AERONÁUTICO
+// (nombre de archivo con "b" minúscula: así lo importan App.tsx e Index.tsx; en
+//  Linux/Vercel el import distingue mayúsculas)
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v1.2 — REBRAND B&M + CONEXIONES:
+//   [FIX] Aeronaves en MRO invisibles: el tablero descartaba al leer las que
+//         tienen disponible_mro = false, así que el KPI "· N MRO" nunca aparecía
+//         y el selector no podía mostrarlas como "En MRO". Ahora se conservan:
+//         cuentan aparte, se listan bloqueadas y nunca son asignables.
+//   [FIX] Tablero fuera de orden: al cambiar rápido de semana o sede, una
+//         respuesta vieja de fn_plan_tablero podía pintarse sobre la nueva. Solo
+//         pinta la última lectura (contador de secuencia).
+//   [FIX] Trazabilidad cruzada: al abrir otra reserva antes de que llegaran los
+//         eventos de la anterior, se mostraban los eventos equivocados.
+//   [FIX] Reserva modificada por otro usuario con el modal abierto: se guardaba
+//         sobre datos viejos (p. ej. "Confirmar" sobre una ya confirmada). El
+//         modal se actualiza con la fila nueva y avisa antes de guardar.
+//   [FIX] Una excepción de red en fn_plan_asignar / fn_plan_rechazar dejaba el
+//         botón en "guardando" para siempre (try/finally).
+//   [FIX] Canal realtime con sufijo único (remontajes reutilizaban un canal ya
+//         suscrito) y escucha de ordenes_trabajo (la disponibilidad MRO cambia
+//         al abrir o cerrar órdenes).
+//   [NEW] Aviso al reprogramar a una fecha posterior a la ventana cargada
+//         (21 días): la ocupación local puede estar incompleta.
+//   [UI]  B&M: cabecera blanca con selector de sede, KPI con cifras
+//         protagonistas, bandeja en tarjetas, tablero con columna de horas fija
+//         al desplazar, modal en BmModal (hoja inferior en móvil, Esc, bloqueo
+//         mientras guarda) y opciones con role="radio".
+// PRESERVADO: flujo SOLICITADA → CONFIRMAR / REPROGRAMAR / RECHAZAR, toda
+//   escritura por fn_plan_asignar / fn_plan_rechazar, lectura fn_plan_tablero
+//   con p_sede null, capacidad min(aeronaves, capitanes) por sede, sugerencias
+//   de reprogramación, motivos predefinidos, auditoría reservas_slot_eventos,
+//   fechas locales, export nombrado y por defecto.
+// ─────────────────────────────────────────────────────────────────────────────
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║            OPERACIÓN ÁGUILAS — PLANIFICACIÓN DE VUELO v1.1                  ║
 // ║            VALKYRON OS — FLIGHT OPERATIONS / DISPATCH                       ║
@@ -26,6 +60,7 @@ import {
   Gauge, History, Inbox, Loader2, Lock, MapPin, Plane, RefreshCw, Repeat,
   ShieldCheck, User, Users, Wrench, X, XCircle,
 } from 'lucide-react';
+import { BmBadge, BmModal, BmNotice, bmBtn, bmInput, bmTextarea } from './brand/bm-ui';   // [v1.2]
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TIPOS
@@ -223,13 +258,36 @@ const nombreCorto = (n: string | null | undefined) => {
   return partes.length > 1 ? `${partes[0]} ${partes[1].charAt(0)}.` : partes[0];
 };
 
+// [v1.2] Paleta B&M
 const ESTADO_STYLE: Record<EstadoReserva, string> = {
-  SOLICITADA: 'text-sky-400 bg-sky-500/10 border-sky-500/25',
-  CONFIRMADA: 'text-[#E1AD01] bg-[#E1AD01]/10 border-[#E1AD01]/25',
-  COMPLETADA: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/25',
-  CANCELADA:  'text-red-400 bg-red-500/10 border-red-500/25',
-  POSTERGADA: 'text-amber-400 bg-amber-500/10 border-amber-500/25',
-  RECHAZADA:  'text-red-400 bg-red-500/10 border-red-500/25',
+  SOLICITADA: 'text-[#2F5BB7] bg-[#E8EEF9]',
+  CONFIRMADA: 'text-bm-red-deep bg-bm-red-tint',
+  COMPLETADA: 'text-bm-ok bg-bm-ok-tint',
+  CANCELADA:  'text-bm-steel bg-bm-canvas',
+  POSTERGADA: 'text-bm-warn bg-bm-warn-tint',
+  RECHAZADA:  'text-bm-red-deep bg-bm-canvas',
+};
+
+// [NEW v1.2] Etiquetas en tipo oración
+const ESTADO_LABEL: Record<EstadoReserva, string> = {
+  SOLICITADA: 'Solicitada',
+  CONFIRMADA: 'Confirmada',
+  COMPLETADA: 'Completada',
+  CANCELADA:  'Cancelada',
+  POSTERGADA: 'Postergada',
+  RECHAZADA:  'Rechazada',
+};
+
+const SEDE_LABEL: Record<SedeFiltro, string> = {
+  TODAS:        'Todas',
+  BARQUISIMETO: 'BQTO',
+  MATURIN:      'Maturín',
+};
+
+const rolLegible = (rol: string | null | undefined) => {
+  const t = String(rol ?? '').replace(/_/g, ' ').trim().toLowerCase();
+  if (t === 'ceo') return 'CEO';
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : 'Planificador';
 };
 
 const ACCION_LABEL: Record<string, string> = {
@@ -278,6 +336,8 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
   const [loadingEventos, setLoadingEventos] = useState(false);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const boardSeq    = useRef(0);   // [v1.2] solo pinta la última lectura del tablero
+  const eventosSeq  = useRef(0);   // [v1.2] trazabilidad de la reserva abierta
   const hoyYMD = data.hoy ?? toYMD(new Date());
 
   // ════════════════════════════════════════════════════════════════════════
@@ -285,6 +345,7 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
   // ════════════════════════════════════════════════════════════════════════
 
   const fetchBoard = useCallback(async (silent = false) => {
+    const seq = ++boardSeq.current;   // [v1.2]
     if (silent) setSyncing(true); else setLoading(true);
     setError(null);
     try {
@@ -295,6 +356,7 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
         // La RPC limita instructores por p_sede: evita ocultar capitanes de otras sedes.
         p_sede: null,
       });
+      if (seq !== boardSeq.current) return;   // [v1.2] llegó otra lectura más nueva
       if (rpcError) throw new Error(rpcError.message);
 
       const raw = (res ?? {}) as any;
@@ -334,8 +396,10 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
           modelo:         a.modelo ?? null,
           sede:           normSede(a.sede),
           disponible_mro: a.disponible_mro === true,
+        // [FIX v1.2] se conservan las aeronaves en MRO (bloqueadas, nunca asignables):
+        // la capacidad y la asignación ya filtran por disponible_mro.
         })).filter((a: PlanAeronave) =>
-          a.disponible_mro && (sede === 'TODAS' || a.sede === sede)
+          sede === 'TODAS' || a.sede === sede
         ),
         instructores: (raw.instructores ?? []).map((i: any): PlanInstructor => ({
           id:              String(i.id),
@@ -344,12 +408,15 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
         })),
       });
     } catch (err) {
+      if (seq !== boardSeq.current) return;   // [v1.2]
       const msg = err instanceof Error ? err.message : 'Error cargando el tablero.';
       console.error('[PLANIFICACION]', msg);
       setError(msg);
     } finally {
-      setLoading(false);
-      setSyncing(false);
+      if (seq === boardSeq.current) {   // [v1.2]
+        setLoading(false);
+        setSyncing(false);
+      }
     }
   }, [rango.desde, rango.hasta, sede]);
 
@@ -358,12 +425,17 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
   // Realtime: cualquier cambio de reservas (alumno solicita/cancela, capitán cierra, otro planificador)
   useEffect(() => {
     const ch = supabase
-      .channel('planificacion-vuelo-board')
+      .channel(`planificacion-vuelo-board-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`)   // [v1.2] nombre único
       .on('postgres_changes', { event: '*', schema: 'public', table: 'reservas_slot_vuelo' }, () => {
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => fetchBoard(true), 600);
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'flota_aviones' }, () => {
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => fetchBoard(true), 600);
+      })
+      // [NEW v1.2] abrir o cerrar una orden de trabajo cambia disponible_mro
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'ordenes_trabajo' }, () => {
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => fetchBoard(true), 600);
       })
@@ -434,9 +506,12 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
       if (r.aeronave_id)   busyAv.set(r.aeronave_id, r);
       if (r.instructor_id) busyIns.set(r.instructor_id, r);
     });
+    // [FIX v1.2] las aeronaves en MRO se listan bloqueadas (antes desaparecían)
     const aeronaves = data.aeronaves
-      .filter(a => a.disponible_mro && (!sedeAlumno || a.sede === sedeAlumno))
-      .map(a => ({ ...a, ocupadaPor: busyAv.get(a.id) ?? null, libre: !busyAv.has(a.id) }));
+      .filter(a => !sedeAlumno || a.sede === sedeAlumno)
+      .map(a => ({ ...a, ocupadaPor: busyAv.get(a.id) ?? null, libre: a.disponible_mro && !busyAv.has(a.id) }))
+      .sort((a, b) => Number(b.disponible_mro) - Number(a.disponible_mro) ||
+        a.matricula.localeCompare(b.matricula, 'es'));
     // Listar todos los capitanes activos devueltos por la RPC; los de otra sede
     // se ven, pero no son asignables (la BD valida la sede finalmente).
     const instructores = data.instructores
@@ -527,6 +602,7 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
   // ════════════════════════════════════════════════════════════════════════
 
   const fetchEventos = useCallback(async (reservaId: string) => {
+    const seq = ++eventosSeq.current;   // [v1.2]
     setLoadingEventos(true);
     const { data: ev, error: evError } = await supabase
       .from('reservas_slot_eventos')
@@ -534,6 +610,7 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
       .eq('reserva_id', reservaId)
       .order('created_at', { ascending: false })
       .limit(12);
+    if (seq !== eventosSeq.current) return;   // [v1.2] ya se abrió otra reserva
     if (!evError) setEventos((ev ?? []) as EventoReserva[]);
     else setEventos([]);
     setLoadingEventos(false);
@@ -579,10 +656,31 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
 
   const closeModal = () => {
     if (saving) return;
+    eventosSeq.current++;   // [v1.2] descarta eventos en vuelo
     setSelected(null);
     setEventos([]);
     setFormError(null);
   };
+
+  // [NEW v1.2] La reserva abierta cambió en el servidor (otro planificador, el
+  // alumno o el capitán): se refresca el modal y se avisa antes de guardar.
+  useEffect(() => {
+    if (!selected || saving) return;
+    const fresh = data.reservas.find(r => r.id === selected.id);
+    if (!fresh) {
+      setFormError('Esta reserva ya no figura en el tablero (cancelada o fuera del filtro). Cierre y verifique.');
+      return;
+    }
+    const cambio = fresh.status !== selected.status
+      || fresh.fecha !== selected.fecha
+      || fresh.slot_hora !== selected.slot_hora
+      || fresh.aeronave_id !== selected.aeronave_id
+      || fresh.instructor_id !== selected.instructor_id;
+    if (cambio) {
+      setSelected(fresh);
+      setFormError('Otro usuario modificó esta reserva mientras la editaba. Revise los datos antes de guardar.');
+    }
+  }, [data.reservas]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const submit = async () => {
     if (!selected) return;
@@ -591,11 +689,17 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
     if (mode === 'RECHAZAR') {
       if (!form.motivo.trim()) { setFormError('Indique el motivo.'); return; }
       setSaving(true);
-      const { error: rpcError } = await supabase.rpc('fn_plan_rechazar', {
-        p_reserva_id: selected.id,
-        p_motivo:     form.motivo.trim().toUpperCase(),
-      });
-      setSaving(false);
+      let rpcError: { message: string } | null = null;
+      try {
+        ({ error: rpcError } = await supabase.rpc('fn_plan_rechazar', {
+          p_reserva_id: selected.id,
+          p_motivo:     form.motivo.trim().toUpperCase(),
+        }));
+      } catch (e) {
+        rpcError = { message: e instanceof Error ? e.message : 'Error de red al rechazar.' };   // [v1.2]
+      } finally {
+        setSaving(false);
+      }
       if (rpcError) { setFormError(rpcError.message); return; }
       setAviso(`${selected.status === 'SOLICITADA' ? 'Solicitud rechazada' : 'Vuelo cancelado'} · ${selected.alumno_nombre}`);
       setSelected(null);
@@ -615,16 +719,22 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
     if (accion === 'REPROGRAMAR' && !form.motivo.trim()) { setFormError('El motivo de reprogramación es obligatorio.'); return; }
 
     setSaving(true);
-    const { error: rpcError } = await supabase.rpc('fn_plan_asignar', {
-      p_reserva_id:    selected.id,
-      p_fecha:         form.fecha,
-      p_slot:          form.slot,
-      p_aeronave_id:   form.aeronave_id,
-      p_instructor_id: form.instructor_id,
-      p_motivo:        form.motivo.trim() ? form.motivo.trim().toUpperCase() : null,
-      p_accion:        accion,
-    });
-    setSaving(false);
+    let rpcError: { message: string } | null = null;
+    try {
+      ({ error: rpcError } = await supabase.rpc('fn_plan_asignar', {
+        p_reserva_id:    selected.id,
+        p_fecha:         form.fecha,
+        p_slot:          form.slot,
+        p_aeronave_id:   form.aeronave_id,
+        p_instructor_id: form.instructor_id,
+        p_motivo:        form.motivo.trim() ? form.motivo.trim().toUpperCase() : null,
+        p_accion:        accion,
+      }));
+    } catch (e) {
+      rpcError = { message: e instanceof Error ? e.message : 'Error de red al guardar.' };   // [v1.2]
+    } finally {
+      setSaving(false);
+    }
     if (rpcError) { setFormError(rpcError.message); return; }
 
     const av  = data.aeronaves.find(a => a.id === form.aeronave_id)?.matricula ?? '';
@@ -642,11 +752,11 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
     const lleno = cap === 0 || usados >= cap;
     const alto  = !lleno && cap > 0 && usados / cap >= 0.75;
     return (
-      <span className={`px-2 py-0.5 rounded-md border text-[8px] font-black font-mono ${
-        lleno ? 'text-red-400 bg-red-500/10 border-red-500/25'
-        : alto ? 'text-amber-400 bg-amber-500/10 border-amber-500/25'
-        : 'text-emerald-400 bg-emerald-500/10 border-emerald-500/25'}`}>
-        {cap === 0 ? 'SIN CAPACIDAD' : `${usados}/${cap}${lleno ? ' LLENO' : ''}`}
+      <span className={`bm-num inline-flex shrink-0 items-center rounded-md px-2 py-0.5 text-xs font-semibold ${
+        lleno ? 'bg-bm-red-tint text-bm-red-deep'
+        : alto ? 'bg-bm-warn-tint text-bm-warn'
+        : 'bg-bm-ok-tint text-bm-ok'}`}>
+        {cap === 0 ? 'Sin capacidad' : `${usados}/${cap}${lleno ? ' lleno' : ''}`}
       </span>
     );
   };
@@ -654,63 +764,62 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
   const renderRecursos = () => {
     if (!selected) return null;
     const est = recursosEstado(form.fecha, form.slot, selected.id, selected.alumno_sede);
+    const opcion = (activo: boolean, sel: boolean) =>
+      `flex w-full items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors ${
+        !activo ? 'cursor-not-allowed border-bm-line bg-bm-canvas opacity-60'
+        : sel ? 'border-bm-red bg-bm-red-tint'
+        : 'border-bm-line bg-white hover:border-bm-steel/40'}`;
     return (
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div>
-          <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2 flex items-center gap-1.5">
-            <Plane size={10} /> Aeronave
+          <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-bm-steel">
+            <Plane className="h-3.5 w-3.5" /> Aeronave
           </p>
-          <div className="space-y-1.5">
-            {est.aeronaves.length === 0 && <p className="text-[9px] text-zinc-600 font-mono">Sin aeronaves en esta sede.</p>}
+          <div className="space-y-1.5" role="radiogroup" aria-label="Aeronave">
+            {est.aeronaves.length === 0 && <p className="text-[13px] text-bm-hint">Sin aeronaves en esta sede.</p>}
             {est.aeronaves.map(a => {
               const sel = form.aeronave_id === a.id;
               return (
-                <button key={a.id} type="button" disabled={!a.libre}
+                <button key={a.id} type="button" disabled={!a.libre} role="radio" aria-checked={sel}
                   onClick={() => setForm(p => ({ ...p, aeronave_id: a.id }))}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl border text-left transition-all
-                    ${!a.libre ? 'opacity-40 cursor-not-allowed bg-white/[0.01] border-white/5'
-                    : sel ? 'bg-[#E1AD01]/10 border-[#E1AD01]/40'
-                    : 'bg-white/[0.02] border-white/10 hover:border-white/25'}`}>
-                  <span className="flex items-center gap-2">
-                    <span className={`text-[10px] font-black uppercase ${sel ? 'text-[#E1AD01]' : 'text-white'}`}>{a.matricula}</span>
-                    {a.modelo && <span className="text-[8px] text-zinc-600 font-mono">{a.modelo}</span>}
+                  className={opcion(a.libre, sel)}>
+                  <span className="flex min-w-0 items-baseline gap-2">
+                    <span className={`font-data text-sm font-semibold ${sel ? 'text-bm-red' : 'text-bm-ink'}`}>{a.matricula}</span>
+                    {a.modelo && <span className="truncate text-xs text-bm-steel">{a.modelo}</span>}
                   </span>
                   {!a.disponible_mro
-                    ? <span className="text-[7px] font-black text-red-400 uppercase flex items-center gap-1"><Wrench size={8} /> MRO</span>
+                    ? <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-bm-red-deep"><Wrench className="h-3 w-3" /> En MRO</span>
                     : a.ocupadaPor
-                    ? <span className="text-[7px] font-black text-amber-400 uppercase truncate max-w-[110px]">Ocupada · {nombreCorto(a.ocupadaPor.alumno_nombre)}</span>
-                    : sel ? <CheckCircle2 size={12} className="text-[#E1AD01]" />
-                    : <span className="text-[7px] font-black text-emerald-400 uppercase">Libre</span>}
+                    ? <span className="max-w-[130px] shrink-0 truncate text-xs font-medium text-bm-warn">Ocupada · {nombreCorto(a.ocupadaPor.alumno_nombre)}</span>
+                    : sel ? <CheckCircle2 className="h-4 w-4 shrink-0 text-bm-red" />
+                    : <span className="shrink-0 text-xs font-medium text-bm-ok">Libre</span>}
                 </button>
               );
             })}
           </div>
         </div>
         <div>
-          <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2 flex items-center gap-1.5">
-            <User size={10} /> Capitán
+          <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-bm-steel">
+            <User className="h-3.5 w-3.5" /> Capitán
           </p>
-          <div className="space-y-1.5 max-h-[230px] overflow-y-auto pr-1">
-            {est.instructores.length === 0 && <p className="text-[9px] text-zinc-600 font-mono">La RPC no devolvió capitanes activos.</p>}
+          <div className="max-h-[240px] space-y-1.5 overflow-y-auto pr-1" role="radiogroup" aria-label="Capitán">
+            {est.instructores.length === 0 && <p className="text-[13px] text-bm-hint">La RPC no devolvió capitanes activos.</p>}
             {est.instructores.map(i => {
               const sel = form.instructor_id === i.id;
               return (
-                <button key={i.id} type="button" disabled={!i.libre}
+                <button key={i.id} type="button" disabled={!i.libre} role="radio" aria-checked={sel}
                   onClick={() => setForm(p => ({ ...p, instructor_id: i.id }))}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl border text-left transition-all
-                    ${!i.libre ? 'opacity-40 cursor-not-allowed bg-white/[0.01] border-white/5'
-                    : sel ? 'bg-[#E1AD01]/10 border-[#E1AD01]/40'
-                    : 'bg-white/[0.02] border-white/10 hover:border-white/25'}`}>
-                  <span className={`text-[10px] font-black uppercase truncate ${sel ? 'text-[#E1AD01]' : 'text-white'}`} title={i.nombre_completo}>
-                    {i.nombre_completo}
-                    {i.sede && <span className="ml-2 text-[8px] font-normal text-zinc-500">{i.sede}</span>}
+                  className={opcion(i.libre, sel)}>
+                  <span className="min-w-0 truncate text-sm" title={i.nombre_completo}>
+                    <span className={`font-semibold ${sel ? 'text-bm-red' : 'text-bm-ink'}`}>{i.nombre_completo}</span>
+                    {i.sede && <span className="ml-2 text-xs text-bm-steel">{i.sede}</span>}
                   </span>
                   {!i.sedeCompatible
-                    ? <span className="text-[7px] font-black text-zinc-500 uppercase shrink-0">Otra sede</span>
+                    ? <span className="shrink-0 text-xs font-medium text-bm-hint">Otra sede</span>
                     : i.ocupadoPor
-                    ? <span className="text-[7px] font-black text-amber-400 uppercase shrink-0">En vuelo · {i.ocupadoPor.aeronave_matricula ?? ''}</span>
-                    : sel ? <CheckCircle2 size={12} className="text-[#E1AD01] shrink-0" />
-                    : <span className="text-[7px] font-black text-emerald-400 uppercase shrink-0">Libre</span>}
+                    ? <span className="shrink-0 text-xs font-medium text-bm-warn">En vuelo · <span className="font-data">{i.ocupadoPor.aeronave_matricula ?? ''}</span></span>
+                    : sel ? <CheckCircle2 className="h-4 w-4 shrink-0 text-bm-red" />
+                    : <span className="shrink-0 text-xs font-medium text-bm-ok">Libre</span>}
                 </button>
               );
             })}
@@ -724,57 +833,53 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
   // RENDER
   // ════════════════════════════════════════════════════════════════════════
 
+  const kpiCard = 'flex flex-col gap-2.5 rounded-[20px] border border-bm-line bg-white p-4';
+
   return (
-    <div className="space-y-6 text-white font-mono animate-in fade-in duration-500">
+    <div className="bm-app space-y-4 text-left text-bm-ink sm:space-y-5">
 
       {/* CABECERA */}
-      <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-[#080808]">
-        <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_top_right,rgba(225,173,1,0.10),transparent_35%)]" />
-        <div className="relative p-6 md:p-7 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-6">
-          <div className="flex items-center gap-4">
-            <div className="w-14 h-14 rounded-2xl bg-[#E1AD01]/10 border border-[#E1AD01]/20 flex items-center justify-center">
-              <CalendarDays size={25} className="text-[#E1AD01]" />
-            </div>
-            <div>
-              <h1 className="text-xl md:text-2xl font-black uppercase italic tracking-tight">
-                Planificación de <span className="text-[#E1AD01]">Vuelo</span>
-              </h1>
-              <p className="text-[9px] md:text-[10px] text-zinc-500 uppercase tracking-[0.25em] font-black mt-1">
-                Operación Águilas · Confirmación y reprogramación de slots
-              </p>
-              <p className="text-[9px] text-[#E1AD01]/70 uppercase mt-2">
-                {userProfile?.nombre_completo ?? 'Planificador'} · {userRole}
+      <div className="rounded-[24px] border border-bm-line bg-white p-4 sm:p-5">
+        <div className="flex flex-col gap-4 2xl:flex-row 2xl:items-center 2xl:justify-between">
+          <div className="flex min-w-0 items-center gap-3.5">
+            <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-bm-red-tint text-bm-red">
+              <CalendarDays className="h-6 w-6" />
+            </span>
+            <div className="min-w-0">
+              <h2 className="bm-heading text-lg leading-tight sm:text-xl">Planificación de vuelo</h2>
+              <p className="mt-0.5 text-[13px] text-bm-steel">Confirmación y reprogramación de slots</p>
+              <p className="mt-1 truncate text-[13px] font-medium">
+                {userProfile?.nombre_completo ?? 'Planificador'} · <span className="text-bm-steel">{rolLegible(userRole)}</span>
               </p>
             </div>
           </div>
 
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-wrap">
-            <div className="flex bg-black/70 border border-white/10 rounded-xl p-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex w-full rounded-2xl border border-bm-line bg-bm-canvas p-1 sm:w-auto" role="group" aria-label="Sede">
               {SEDES.map(s => (
-                <button key={s} type="button" onClick={() => setSede(s)}
-                  className={`px-3 py-2 rounded-lg text-[9px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5
-                    ${sede === s ? 'bg-[#E1AD01] text-black' : 'text-zinc-500 hover:text-white'}`}>
-                  {s !== 'TODAS' && <MapPin size={10} />}{s === 'BARQUISIMETO' ? 'BQTO' : s}
+                <button key={s} type="button" onClick={() => setSede(s)} aria-pressed={sede === s}
+                  className={`flex h-10 flex-1 items-center justify-center gap-1.5 rounded-xl px-3 text-sm font-medium transition-colors sm:flex-none ${
+                    sede === s ? 'bg-bm-ink text-white' : 'text-bm-steel hover:text-bm-ink'}`}>
+                  {s !== 'TODAS' && <MapPin className="h-3.5 w-3.5" />}{SEDE_LABEL[s]}
                 </button>
               ))}
             </div>
-            <div className="flex items-center justify-between bg-black/70 border border-white/10 rounded-xl p-1">
-              <button type="button" onClick={() => setWeekStart(p => addDays(p, -7))}
-                className="p-2.5 rounded-lg text-zinc-500 hover:text-white hover:bg-white/5"><ChevronLeft size={16} /></button>
-              <div className="px-4 min-w-[190px] text-center">
-                <p className="text-[8px] text-zinc-600 font-black uppercase tracking-[0.25em]">Semana</p>
-                <p className="text-[10px] font-black uppercase tracking-widest mt-0.5">{weekLabel}</p>
+            <div className="flex w-full min-w-0 items-center justify-between rounded-2xl border border-bm-line bg-bm-canvas p-1 sm:w-auto">
+              <button type="button" onClick={() => setWeekStart(p => addDays(p, -7))} aria-label="Semana anterior"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-bm-steel hover:bg-white hover:text-bm-ink"><ChevronLeft className="h-5 w-5" /></button>
+              <div className="min-w-0 px-3 text-center sm:min-w-[190px]">
+                <p className="text-[11px] text-bm-steel">Semana</p>
+                <p className="bm-num truncate text-sm font-semibold" aria-live="polite">{weekLabel}</p>
               </div>
-              <button type="button" onClick={() => setWeekStart(p => addDays(p, 7))}
-                className="p-2.5 rounded-lg text-zinc-500 hover:text-white hover:bg-white/5"><ChevronRight size={16} /></button>
+              <button type="button" onClick={() => setWeekStart(p => addDays(p, 7))} aria-label="Semana siguiente"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl text-bm-steel hover:bg-white hover:text-bm-ink"><ChevronRight className="h-5 w-5" /></button>
             </div>
-            <button type="button" onClick={() => setWeekStart(startOfWeek(new Date()))}
-              className="px-4 py-3 rounded-xl border border-white/10 bg-white/[0.02] text-zinc-400 hover:text-white text-[9px] font-black uppercase tracking-widest">
+            <button type="button" onClick={() => setWeekStart(startOfWeek(new Date()))} className={`${bmBtn.secondary} ${bmBtn.sm} flex-1 sm:!h-12 sm:flex-none`}>
               Hoy
             </button>
-            <button type="button" onClick={() => fetchBoard(true)} title="Actualizar"
-              className="px-3 py-3 rounded-xl border border-white/10 bg-white/[0.02] text-zinc-400 hover:text-[#E1AD01]">
-              <RefreshCw size={14} className={syncing ? 'animate-spin' : ''} />
+            <button type="button" onClick={() => fetchBoard(true)} title="Actualizar" aria-label="Actualizar tablero"
+              className={`${bmBtn.icon} sm:h-12 sm:w-12`}>
+              <RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />
             </button>
           </div>
         </div>
@@ -782,92 +887,96 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
 
       {/* AVISOS */}
       {error && (
-        <div className="rounded-2xl border border-red-500/20 bg-red-500/[0.06] p-4 flex items-start gap-3">
-          <AlertTriangle size={16} className="text-red-400 shrink-0 mt-0.5" />
-          <div>
-            <p className="text-[10px] font-black text-red-400 uppercase tracking-widest">Error de enlace operacional</p>
-            <p className="text-[9px] text-red-400/70 mt-1">{error}</p>
+        <BmNotice tone="danger" role="alert" icon={<AlertTriangle className="h-4 w-4" />}>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+            <div className="min-w-0">
+              <p className="font-semibold">No se pudo leer el tablero de vuelo</p>
+              <p className="mt-0.5 break-words font-data text-xs">{error}</p>
+            </div>
+            <button type="button" onClick={() => fetchBoard(false)} className={`${bmBtn.secondary} ${bmBtn.sm} shrink-0`}>
+              <RefreshCw className="h-4 w-4" /> Reintentar
+            </button>
           </div>
-        </div>
+        </BmNotice>
       )}
       {aviso && (
-        <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/[0.06] p-4 flex items-center gap-3">
-          <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
-          <p className="text-[10px] font-black text-emerald-400 uppercase tracking-wider">{aviso}</p>
-        </div>
+        <BmNotice tone="ok" role="status" icon={<CheckCircle2 className="h-4 w-4" />}>
+          <span className="font-medium">{aviso}</span>
+        </BmNotice>
       )}
 
       {/* KPIs */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div className="rounded-2xl border border-sky-500/20 bg-sky-500/[0.04] p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[8px] text-zinc-500 uppercase font-black tracking-widest">Por confirmar</span>
-            <Inbox size={13} className="text-sky-400" />
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <div className={kpiCard}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[13px] text-bm-steel">Por confirmar</span>
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#E8EEF9] text-[#2F5BB7]"><Inbox className="h-[18px] w-[18px]" /></span>
           </div>
-          <p className="text-2xl font-black italic text-sky-400 mt-2">{stats.pendientes}</p>
-          <p className="text-[7px] text-zinc-600 uppercase font-black mt-1">
-            {stats.vencidas > 0 ? <span className="text-red-400">{stats.vencidas} con fecha vencida</span> : 'solicitudes de alumnos'}
+          <p className="bm-figure text-[28px] text-[#2F5BB7]">{stats.pendientes}</p>
+          <p className="text-xs text-bm-steel">
+            {stats.vencidas > 0 ? <span className="font-medium text-bm-red">{stats.vencidas} con fecha vencida</span> : 'solicitudes de alumnos'}
           </p>
         </div>
-        <div className="rounded-2xl border border-[#E1AD01]/20 bg-[#E1AD01]/[0.04] p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[8px] text-zinc-500 uppercase font-black tracking-widest">Confirmados</span>
-            <ShieldCheck size={13} className="text-[#E1AD01]" />
+        <div className={kpiCard}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[13px] text-bm-steel">Confirmados</span>
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-bm-red-tint text-bm-red"><ShieldCheck className="h-[18px] w-[18px]" /></span>
           </div>
-          <p className="text-2xl font-black italic text-[#E1AD01] mt-2">{stats.confirmadas}</p>
-          <p className="text-[7px] text-zinc-600 uppercase font-black mt-1">esta semana · {stats.hoyConf} hoy</p>
+          <p className="bm-figure text-[28px] text-bm-red">{stats.confirmadas}</p>
+          <p className="text-xs text-bm-steel">esta semana · {stats.hoyConf} hoy</p>
         </div>
-        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[8px] text-zinc-500 uppercase font-black tracking-widest">Ocupación</span>
-            <Gauge size={13} className="text-zinc-500" />
+        <div className={kpiCard}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[13px] text-bm-steel">Ocupación</span>
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-bm-canvas text-bm-ink"><Gauge className="h-[18px] w-[18px]" /></span>
           </div>
-          <p className={`text-2xl font-black italic mt-2 ${stats.ocupacionPct >= 90 ? 'text-red-400' : stats.ocupacionPct >= 70 ? 'text-amber-400' : 'text-white'}`}>
-            {stats.ocupacionPct}<span className="text-xs text-zinc-600 ml-1">%</span>
+          <p className={`bm-figure text-[28px] ${stats.ocupacionPct >= 90 ? 'text-bm-red' : stats.ocupacionPct >= 70 ? 'text-bm-warn' : 'text-bm-ink'}`}>
+            {stats.ocupacionPct}<span className="ml-0.5 text-base not-italic text-bm-steel">%</span>
           </p>
-          <p className="text-[7px] text-zinc-600 uppercase font-black mt-1">capacidad restante de la semana</p>
+          <p className="text-xs text-bm-steel">de la capacidad que queda esta semana</p>
         </div>
-        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4">
-          <div className="flex items-center justify-between">
-            <span className="text-[8px] text-zinc-500 uppercase font-black tracking-widest">Recursos</span>
-            <Users size={13} className="text-zinc-500" />
+        <div className={kpiCard}>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[13px] text-bm-steel">Recursos</span>
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-bm-canvas text-bm-ink"><Users className="h-[18px] w-[18px]" /></span>
           </div>
-          <p className="text-2xl font-black italic text-white mt-2">{capacidadTotal}<span className="text-xs text-zinc-600 ml-1">/slot</span></p>
-          <p className="text-[7px] text-zinc-600 uppercase font-black mt-1">
+          <p className="bm-figure text-[28px]">{capacidadTotal}<span className="ml-1 text-sm not-italic text-bm-steel">/slot</span></p>
+          <p className="text-xs leading-snug text-bm-steel">
             {stats.aeronavesOps} aeronaves · {stats.instructores} capitanes
-            {stats.aeronavesMro > 0 && <span className="text-red-400"> · {stats.aeronavesMro} MRO</span>}
+            {stats.aeronavesMro > 0 && <span className="font-medium text-bm-red-deep"> · {stats.aeronavesMro} en MRO</span>}
           </p>
         </div>
       </div>
 
       {loading ? (
-        <div className="rounded-3xl border border-white/10 bg-[#080808] py-28 flex flex-col items-center justify-center">
-          <Loader2 size={28} className="animate-spin text-[#E1AD01]" />
-          <p className="text-[9px] text-zinc-600 uppercase tracking-[0.3em] font-black mt-4">Sincronizando tablero de vuelo...</p>
+        <div aria-busy="true" aria-label="Sincronizando tablero" className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+          <div className="bm-skeleton h-[420px] rounded-[24px] xl:col-span-4" />
+          <div className="bm-skeleton h-[420px] rounded-[24px] xl:col-span-8" />
         </div>
       ) : (
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-12 xl:gap-5">
 
           {/* BANDEJA DE SOLICITUDES */}
-          <div className="xl:col-span-4 rounded-3xl border border-white/10 bg-[#080808] overflow-hidden flex flex-col">
-            <div className="p-5 border-b border-white/5 flex items-center justify-between">
+          <section className="flex flex-col overflow-hidden rounded-[24px] border border-bm-line bg-white xl:col-span-4" aria-labelledby="fpb-bandeja">
+            <div className="flex items-center justify-between gap-3 border-b border-bm-line p-4 sm:px-5">
               <div className="flex items-center gap-2">
-                <Inbox size={14} className="text-sky-400" />
-                <h3 className="text-[10px] font-black uppercase tracking-widest">Bandeja de solicitudes</h3>
-                <span className="text-[9px] font-black text-sky-400 border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 rounded-full">{pendientes.length}</span>
+                <Inbox className="h-5 w-5 text-[#2F5BB7]" />
+                <h3 id="fpb-bandeja" className="bm-heading text-base">Solicitudes</h3>
+                <BmBadge tone="info">{pendientes.length}</BmBadge>
               </div>
-              <button type="button" onClick={() => setSoloSemana(v => !v)}
-                className={`text-[8px] font-black uppercase px-2.5 py-1.5 rounded-lg border transition-all
-                  ${soloSemana ? 'text-[#E1AD01] border-[#E1AD01]/30 bg-[#E1AD01]/10' : 'text-zinc-500 border-white/10 hover:text-white'}`}>
+              <button type="button" onClick={() => setSoloSemana(v => !v)} aria-pressed={soloSemana}
+                className={`h-9 shrink-0 rounded-lg border px-2.5 text-xs font-medium transition-colors ${
+                  soloSemana ? 'border-bm-ink bg-bm-ink text-white' : 'border-bm-line text-bm-steel hover:text-bm-ink'}`}>
                 {soloSemana ? 'Solo esta semana' : 'Todas'}
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto max-h-[720px] p-4 space-y-2">
+            <div className="flex-1 space-y-2.5 overflow-y-auto p-3 sm:p-4 xl:max-h-[760px]">
               {pendientes.length === 0 && (
-                <div className="text-center py-16">
-                  <CheckCircle2 size={22} className="mx-auto text-emerald-500/40" />
-                  <p className="text-[9px] text-zinc-600 font-black uppercase tracking-widest mt-3">Sin solicitudes pendientes</p>
+                <div className="py-14 text-center">
+                  <CheckCircle2 className="mx-auto h-6 w-6 text-bm-ok" />
+                  <p className="mt-2 text-sm font-medium">Sin solicitudes pendientes</p>
+                  <p className="mt-0.5 text-[13px] text-bm-steel">Las nuevas solicitudes de alumnos aparecen aquí al instante.</p>
                 </div>
               )}
               {pendientes.map(r => {
@@ -877,100 +986,101 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
                 const sinSaldo   = disponible < r.horas_planificadas;
                 const vencida    = r.fecha < hoyYMD || (r.fecha === hoyYMD && r.slot_hora <= ahoraHM());
                 return (
-                  <div key={r.id} className={`rounded-2xl border p-4 transition-all
-                    ${vencida ? 'border-red-500/25 bg-red-500/[0.03]' : 'border-sky-500/15 bg-sky-500/[0.03] hover:border-sky-500/35'}`}>
+                  <article key={r.id} className={`rounded-2xl border p-3.5 ${
+                    vencida ? 'border-bm-red/30 bg-bm-red-tint/40' : 'border-dashed border-[#2F5BB7]/40 bg-[#F6F8FD]'}`}>
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
-                        <p className="text-[11px] font-black uppercase truncate">{r.alumno_nombre}</p>
-                        <p className="text-[8px] text-zinc-500 mt-0.5 truncate">
-                          {r.alumno_serial ?? 'S/SERIAL'} · {r.alumno_sede ?? 'SIN SEDE'} · {r.tipo_vuelo ?? 'VUELO'}
+                        <p className="truncate text-[15px] font-semibold">{r.alumno_nombre}</p>
+                        <p className="mt-0.5 truncate text-xs text-bm-steel">
+                          <span className="font-data">{r.alumno_serial ?? 'S/serial'}</span> · {r.alumno_sede ?? 'Sin sede'} · {r.tipo_vuelo ?? 'Vuelo'}
                         </p>
                       </div>
                       <OcupacionBadge usados={usados} cap={cap} />
                     </div>
 
-                    <div className="flex items-center justify-between mt-3">
-                      <div className="flex items-center gap-2">
-                        <Clock3 size={11} className="text-[#E1AD01]" />
-                        <span className="text-[11px] font-black text-[#E1AD01]">{fmtDateLong(r.fecha)} · {r.slot_hora}</span>
-                      </div>
-                      <span className="text-[7px] text-zinc-600">{haceCuanto(r.created_at)}</span>
+                    <div className="mt-2.5 flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-1.5">
+                        <Clock3 className="h-4 w-4 text-bm-red" />
+                        <span className="bm-num text-sm font-semibold">{fmtDateLong(r.fecha)} · {r.slot_hora}</span>
+                      </span>
+                      <span className="shrink-0 text-[11px] text-bm-hint">{haceCuanto(r.created_at)}</span>
                     </div>
 
-                    <div className="flex items-center justify-between mt-2 text-[8px]">
-                      <span className={sinSaldo ? 'text-red-400 font-black' : 'text-zinc-500'}>
-                        Saldo libre {disponible.toFixed(1)}h · requiere {r.horas_planificadas.toFixed(1)}h
+                    <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-xs">
+                      <span className={sinSaldo ? 'font-semibold text-bm-red-deep' : 'text-bm-steel'}>
+                        Saldo libre <span className="bm-num">{disponible.toFixed(1)} h</span> · requiere <span className="bm-num">{r.horas_planificadas.toFixed(1)} h</span>
                       </span>
-                      {vencida && <span className="text-red-400 font-black uppercase">Hora vencida</span>}
+                      {vencida && <span className="font-semibold text-bm-red">Hora vencida</span>}
                     </div>
 
                     {r.motivo_planificacion && (
-                      <p className="text-[8px] text-amber-400/80 mt-2 uppercase">{r.motivo_planificacion}</p>
+                      <p className="mt-2 rounded-lg bg-bm-warn-tint px-2.5 py-1.5 text-xs text-[#7C2D12]">{r.motivo_planificacion}</p>
                     )}
 
-                    <div className="grid grid-cols-3 gap-1.5 mt-3">
+                    <div className="mt-3 grid grid-cols-3 gap-1.5">
                       <button type="button" onClick={() => openModal(r, 'CONFIRMAR')} disabled={vencida}
-                        className="py-2 rounded-xl text-[8px] font-black uppercase bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 hover:bg-emerald-500/25 disabled:opacity-30 flex items-center justify-center gap-1">
-                        <CheckCircle2 size={10} /> Confirmar
+                        title={vencida ? 'La hora ya pasó: reprograme' : undefined}
+                        className={`${bmBtn.success} !h-10 !gap-1 !px-2 !text-[13px]`}>
+                        <CheckCircle2 className="h-4 w-4" /> Confirmar
                       </button>
                       <button type="button" onClick={() => openModal(r, 'REPROGRAMAR')}
-                        className="py-2 rounded-xl text-[8px] font-black uppercase bg-[#E1AD01]/10 text-[#E1AD01] border border-[#E1AD01]/25 hover:bg-[#E1AD01]/20 flex items-center justify-center gap-1">
-                        <Repeat size={10} /> Reprog.
+                        className={`${bmBtn.secondary} !h-10 !gap-1 !px-2 !text-[13px]`}>
+                        <Repeat className="h-4 w-4" /> Reprog.
                       </button>
                       <button type="button" onClick={() => openModal(r, 'RECHAZAR')}
-                        className="py-2 rounded-xl text-[8px] font-black uppercase bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 flex items-center justify-center gap-1">
-                        <XCircle size={10} /> Rechazar
+                        className="inline-flex h-10 items-center justify-center gap-1 rounded-xl border border-bm-red/25 bg-white px-2 text-[13px] font-semibold text-bm-red-deep transition-colors hover:bg-bm-red-tint">
+                        <XCircle className="h-4 w-4" /> Rechazar
                       </button>
                     </div>
-                  </div>
+                  </article>
                 );
               })}
             </div>
-          </div>
+          </section>
 
           {/* TABLERO SEMANAL */}
-          <div className="xl:col-span-8 rounded-3xl border border-white/10 bg-[#080808] overflow-hidden">
-            <div className="p-5 border-b border-white/5 flex items-center justify-between flex-wrap gap-3">
+          <section className="min-w-0 overflow-hidden rounded-[24px] border border-bm-line bg-white xl:col-span-8" aria-labelledby="fpb-tablero">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-bm-line p-4 sm:px-5">
               <div className="flex items-center gap-2">
-                <CalendarDays size={14} className="text-[#E1AD01]" />
-                <h3 className="text-[10px] font-black uppercase tracking-widest">Ocupación por slot</h3>
+                <CalendarDays className="h-5 w-5 text-bm-red" />
+                <h3 id="fpb-tablero" className="bm-heading text-base">Ocupación por slot</h3>
               </div>
-              <div className="flex items-center gap-3 text-[7px] font-black uppercase text-zinc-600">
-                <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-emerald-500/40" /> Libre</span>
-                <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-amber-500/50" /> +75%</span>
-                <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-red-500/50" /> Lleno</span>
-                <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-sky-500/50" /> Solicitud</span>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-bm-steel">
+                <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm border border-bm-ok/30 bg-bm-ok-tint" /> Libre</span>
+                <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm border border-bm-warn/30 bg-bm-warn-tint" /> +75 %</span>
+                <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm border border-bm-red/30 bg-bm-red-tint" /> Lleno</span>
+                <span className="flex items-center gap-1.5"><span className="h-2.5 w-2.5 rounded-sm border border-dashed border-[#2F5BB7]/60 bg-[#E8EEF9]" /> Solicitud</span>
               </div>
             </div>
 
-            <div className="overflow-x-auto p-4">
-              <div className="min-w-[860px]">
-                <div className="grid grid-cols-[72px_repeat(7,1fr)] gap-1.5 mb-1.5">
-                  <div />
+            <div className="overflow-x-auto p-3 sm:p-4">
+              <div className="min-w-[680px]">
+                <div className="mb-1.5 grid grid-cols-[64px_repeat(7,minmax(0,1fr))] gap-1.5">
+                  <div className="sticky left-0 z-10 bg-white" />
                   {weekDays.map(d => {
                     const ymd = toYMD(d);
                     const esHoy = ymd === hoyYMD;
                     return (
-                      <div key={ymd} className={`rounded-xl border p-2 text-center ${esHoy ? 'border-[#E1AD01]/30 bg-[#E1AD01]/[0.07]' : 'border-white/5 bg-white/[0.02]'}`}>
-                        <p className={`text-[8px] font-black uppercase tracking-widest ${esHoy ? 'text-[#E1AD01]' : 'text-zinc-500'}`}>{DAYS_ES[d.getDay()]}</p>
-                        <p className={`text-lg font-black italic leading-none mt-1 ${esHoy ? 'text-[#E1AD01]' : 'text-white'}`}>{d.getDate()}</p>
+                      <div key={ymd} className={`rounded-xl p-2 text-center ${esHoy ? 'bg-bm-red text-white' : 'bg-bm-canvas'}`}>
+                        <p className={`text-[11px] font-medium ${esHoy ? 'text-white/85' : 'text-bm-steel'}`}>{DAYS_ES[d.getDay()]}</p>
+                        <p className="bm-figure mt-0.5 text-xl">{d.getDate()}</p>
                       </div>
                     );
                   })}
                 </div>
 
                 {SLOTS.map(slot => (
-                  <div key={slot.hora} className="grid grid-cols-[72px_repeat(7,1fr)] gap-1.5 mb-1.5">
-                    <div className="flex flex-col justify-center">
-                      <p className="text-[10px] font-black text-[#E1AD01]">{slot.hora}</p>
-                      {slot.bloqueado && <p className="text-[6px] text-zinc-600 font-black uppercase">Almuerzo</p>}
+                  <div key={slot.hora} className="mb-1.5 grid grid-cols-[64px_repeat(7,minmax(0,1fr))] gap-1.5">
+                    <div className="sticky left-0 z-10 flex flex-col justify-center bg-white pr-1">
+                      <p className="bm-num text-sm font-semibold">{slot.hora}</p>
+                      {slot.bloqueado && <p className="text-[10px] text-bm-hint">Almuerzo</p>}
                     </div>
                     {weekDays.map(d => {
                       const ymd = toYMD(d);
                       if (slot.bloqueado) {
                         return (
-                          <div key={ymd} className="rounded-xl border border-white/[0.03] bg-white/[0.01] min-h-[70px] flex items-center justify-center">
-                            <Lock size={10} className="text-zinc-800" />
+                          <div key={ymd} className="flex min-h-[64px] items-center justify-center rounded-xl bg-[repeating-linear-gradient(135deg,#F2F3F5_0_6px,#FFFFFF_6px_12px)]">
+                            <Lock className="h-3.5 w-3.5 text-bm-field" aria-label="Bloqueado" />
                           </div>
                         );
                       }
@@ -978,34 +1088,34 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
                       const cap   = sede === 'TODAS' ? capacidadTotal : capacidadAlumno(sede);
                       const pasado = ymd < hoyYMD || (ymd === hoyYMD && slot.hora <= ahoraHM());
                       const ratio = cap > 0 ? cell.conf.length / cap : 1;
-                      const tone  = pasado ? 'border-white/[0.04] bg-white/[0.01] opacity-50'
-                        : cap === 0 || ratio >= 1 ? 'border-red-500/25 bg-red-500/[0.05]'
-                        : ratio >= 0.75 ? 'border-amber-500/25 bg-amber-500/[0.04]'
-                        : 'border-emerald-500/15 bg-emerald-500/[0.02]';
+                      const tone  = pasado ? 'border-bm-line bg-bm-canvas opacity-60'
+                        : cap === 0 || ratio >= 1 ? 'border-bm-red/25 bg-bm-red-tint/60'
+                        : ratio >= 0.75 ? 'border-bm-warn/25 bg-bm-warn-tint/70'
+                        : 'border-bm-ok/20 bg-bm-ok-tint/50';
                       return (
-                        <div key={ymd} className={`rounded-xl border p-1.5 min-h-[70px] flex flex-col gap-1 ${tone}`}>
+                        <div key={ymd} className={`flex min-h-[64px] min-w-0 flex-col gap-1 rounded-xl border p-1.5 ${tone}`}>
                           <div className="flex items-center justify-between">
-                            <span className="text-[8px] font-black text-zinc-400">{cell.conf.length}/{cap}</span>
+                            <span className="bm-num text-[11px] font-semibold text-bm-steel">{cell.conf.length}/{cap}</span>
                             {cell.sol.length > 0 && (
-                              <span className="text-[7px] font-black text-sky-400 bg-sky-500/10 border border-sky-500/20 px-1 rounded">+{cell.sol.length}</span>
+                              <span className="rounded bg-[#E8EEF9] px-1 text-[10px] font-semibold text-[#2F5BB7]">+{cell.sol.length}</span>
                             )}
                           </div>
                           {cell.conf.map(r => (
                             <button key={r.id} type="button" onClick={() => openModal(r, 'CONFIRMAR')}
                               title={`${r.alumno_nombre} · ${r.aeronave_matricula ?? ''} · ${r.instructor_nombre ?? ''}`}
-                              className="w-full text-left rounded-md bg-[#E1AD01]/10 border border-[#E1AD01]/20 px-1.5 py-1 hover:border-[#E1AD01]/50 transition-all">
-                              <p className="text-[7px] font-black text-[#E1AD01] uppercase truncate">
+                              className="w-full rounded-md border border-bm-line border-l-2 border-l-bm-red bg-white px-1.5 py-1 text-left transition-colors hover:border-bm-red">
+                              <p className="truncate font-data text-[11px] font-semibold">
                                 {r.aeronave_matricula ?? 'S/N'}{r.reprogramada ? ' ↻' : ''}
                               </p>
-                              <p className="text-[7px] text-zinc-400 uppercase truncate">{nombreCorto(r.alumno_nombre)}</p>
-                              <p className="text-[6px] text-zinc-600 uppercase truncate">Cap. {nombreCorto(r.instructor_nombre)}</p>
+                              <p className="truncate text-[11px] text-bm-ink">{nombreCorto(r.alumno_nombre)}</p>
+                              <p className="truncate text-[10px] text-bm-steel">Cap. {nombreCorto(r.instructor_nombre)}</p>
                             </button>
                           ))}
                           {cell.sol.map(r => (
                             <button key={r.id} type="button" onClick={() => openModal(r, 'CONFIRMAR')}
-                              className="w-full text-left rounded-md bg-sky-500/10 border border-dashed border-sky-500/30 px-1.5 py-1 hover:border-sky-400 transition-all">
-                              <p className="text-[7px] font-black text-sky-400 uppercase truncate">Solicita</p>
-                              <p className="text-[7px] text-zinc-400 uppercase truncate">{nombreCorto(r.alumno_nombre)}</p>
+                              className="w-full rounded-md border border-dashed border-[#2F5BB7]/50 bg-white/80 px-1.5 py-1 text-left transition-colors hover:border-[#2F5BB7]">
+                              <p className="text-[10px] font-semibold text-[#2F5BB7]">Solicita</p>
+                              <p className="truncate text-[11px] text-bm-ink">{nombreCorto(r.alumno_nombre)}</p>
                             </button>
                           ))}
                         </div>
@@ -1015,236 +1125,230 @@ export const FlightPlanningBoard: React.FC<FlightPlanningBoardProps> = ({ userRo
                 ))}
               </div>
             </div>
-          </div>
+          </section>
         </div>
       )}
 
-      {/* ══ MODAL DE PLANIFICACIÓN ══════════════════════════════════════════ */}
-      {selected && (() => {
-        const disponible  = selected.saldo_horas - selected.horas_comprometidas;
-        const sinSaldo    = disponible < selected.horas_planificadas;
-        const cap         = capacidadAlumno(selected.alumno_sede);
-        const sugerencias = sugerenciasPara(selected);
-        const esConfirmada = selected.status === 'CONFIRMADA';
-        const tabs: { key: ModalMode; label: string }[] = [
-          { key: 'CONFIRMAR',   label: esConfirmada ? 'Reasignar' : 'Confirmar' },
-          { key: 'REPROGRAMAR', label: 'Reprogramar' },
-          { key: 'RECHAZAR',    label: esConfirmada ? 'Cancelar vuelo' : 'Rechazar' },
-        ];
-        const motivos = mode === 'RECHAZAR' ? MOTIVOS_RECHAZO : MOTIVOS_REPROGRAMAR;
+      {/* ══ MODAL DE PLANIFICACIÓN (BmModal: hoja inferior en móvil, Esc) ════ */}
+      <BmModal
+        open={!!selected}
+        onClose={closeModal}
+        busy={saving}
+        size="lg"
+        icon={<Plane className="h-5 w-5" />}
+        tone="danger"
+        title={selected?.alumno_nombre ?? ''}
+        subtitle={selected ? `${selected.alumno_serial ?? 'S/serial'} · ${selected.alumno_sede ?? 'Sin sede'} · ${ESTADO_LABEL[selected.status] ?? selected.status}` : undefined}
+      >
+        {selected && (() => {
+          const disponible  = selected.saldo_horas - selected.horas_comprometidas;
+          const sinSaldo    = disponible < selected.horas_planificadas;
+          const cap         = capacidadAlumno(selected.alumno_sede);
+          const sugerencias = sugerenciasPara(selected);
+          const esConfirmada = selected.status === 'CONFIRMADA';
+          const tabs: { key: ModalMode; label: string }[] = [
+            { key: 'CONFIRMAR',   label: esConfirmada ? 'Reasignar' : 'Confirmar' },
+            { key: 'REPROGRAMAR', label: 'Reprogramar' },
+            { key: 'RECHAZAR',    label: esConfirmada ? 'Cancelar vuelo' : 'Rechazar' },
+          ];
+          const motivos = mode === 'RECHAZAR' ? MOTIVOS_RECHAZO : MOTIVOS_REPROGRAMAR;
+          const fueraDeVentana = mode === 'REPROGRAMAR' && !!form.fecha && form.fecha > rango.hasta;   // [v1.2]
 
-        return (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 backdrop-blur-md p-4">
-            <div className="w-full max-w-3xl rounded-3xl border border-[#E1AD01]/20 bg-[#050505] shadow-2xl max-h-[92vh] flex flex-col overflow-hidden">
+          return (
+            <div className="space-y-4">
 
-              <div className="bg-[#E1AD01] text-black p-5 flex items-center justify-between shrink-0">
-                <div className="flex items-center gap-3 min-w-0">
-                  <Plane size={16} />
-                  <div className="min-w-0">
-                    <p className="text-[11px] font-black uppercase italic truncate">{selected.alumno_nombre}</p>
-                    <p className="text-[8px] font-black uppercase tracking-widest opacity-70">
-                      {selected.alumno_serial ?? 'S/SERIAL'} · {selected.alumno_sede ?? 'SIN SEDE'} · {selected.status}
-                    </p>
-                  </div>
+              {/* Resumen */}
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                <div className="rounded-xl bg-bm-canvas p-3">
+                  <p className="text-[11px] text-bm-steel">Pidió</p>
+                  <p className="bm-num mt-1 text-[13px] font-semibold">{fmtDateLong(selected.fecha_solicitada ?? selected.fecha)} · {selected.slot_solicitado ?? selected.slot_hora}</p>
                 </div>
-                <button type="button" onClick={closeModal} className="hover:rotate-90 transition-all"><X size={18} /></button>
+                <div className="rounded-xl bg-bm-canvas p-3">
+                  <p className="text-[11px] text-bm-steel">Actual</p>
+                  <p className="bm-num mt-1 text-[13px] font-semibold text-bm-red">{fmtDateLong(selected.fecha)} · {selected.slot_hora}</p>
+                </div>
+                <div className="rounded-xl bg-bm-canvas p-3">
+                  <p className="text-[11px] text-bm-steel">Tipo / horas</p>
+                  <p className="mt-1 text-[13px] font-semibold">{selected.tipo_vuelo ?? 'Vuelo'} · <span className="bm-num">{selected.horas_planificadas.toFixed(1)} h</span></p>
+                </div>
+                <div className={`rounded-xl p-3 ${sinSaldo ? 'bg-bm-red-tint' : 'bg-bm-ok-tint'}`}>
+                  <p className="text-[11px] text-bm-steel">Saldo libre</p>
+                  <p className={`bm-num mt-1 text-[13px] font-semibold ${sinSaldo ? 'text-bm-red-deep' : 'text-bm-ok'}`}>
+                    {disponible.toFixed(1)} h <span className="font-normal text-bm-steel">({selected.saldo_horas.toFixed(1)} − {selected.horas_comprometidas.toFixed(1)})</span>
+                  </p>
+                </div>
+              </div>
+              {sinSaldo && mode !== 'RECHAZAR' && (
+                <BmNotice tone="danger" icon={<AlertTriangle className="h-4 w-4" />}>
+                  El alumno no tiene saldo suficiente. El sistema bloqueará la confirmación.
+                </BmNotice>
+              )}
+
+              {/* Tabs */}
+              <div className="grid grid-cols-3 gap-1 rounded-2xl bg-bm-canvas p-1" role="group" aria-label="Acción">
+                {tabs.map(t => (
+                  <button key={t.key} type="button" onClick={() => switchMode(t.key)} aria-pressed={mode === t.key}
+                    className={`h-11 rounded-xl px-2 text-sm font-semibold transition-colors ${
+                      mode === t.key
+                        ? t.key === 'RECHAZAR' ? 'bg-white text-bm-red-deep shadow-sm ring-1 ring-bm-red/25'
+                        : t.key === 'REPROGRAMAR' ? 'bg-white text-bm-ink shadow-sm ring-1 ring-bm-ink/15'
+                        : 'bg-white text-bm-ok shadow-sm ring-1 ring-bm-ok/25'
+                        : 'text-bm-steel hover:text-bm-ink'}`}>
+                    {t.label}
+                  </button>
+                ))}
               </div>
 
-              <div className="p-6 space-y-5 overflow-y-auto flex-1">
-
-                {/* Resumen */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
-                    <p className="text-[7px] text-zinc-600 uppercase font-black">Pidió</p>
-                    <p className="text-[10px] font-black mt-1">{fmtDateLong(selected.fecha_solicitada ?? selected.fecha)} · {selected.slot_solicitado ?? selected.slot_hora}</p>
+              {/* CONFIRMAR / REASIGNAR */}
+              {mode === 'CONFIRMAR' && (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-bm-line p-3">
+                    <span className="bm-num text-sm font-medium">
+                      {fmtDateLong(form.fecha)} · {form.slot}
+                    </span>
+                    <OcupacionBadge usados={confirmadosEnSede(form.fecha, form.slot, selected.alumno_sede) - (esConfirmada ? 1 : 0)} cap={cap} />
                   </div>
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
-                    <p className="text-[7px] text-zinc-600 uppercase font-black">Actual</p>
-                    <p className="text-[10px] font-black text-[#E1AD01] mt-1">{fmtDateLong(selected.fecha)} · {selected.slot_hora}</p>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
-                    <p className="text-[7px] text-zinc-600 uppercase font-black">Tipo / horas</p>
-                    <p className="text-[10px] font-black mt-1">{selected.tipo_vuelo ?? 'VUELO'} · {selected.horas_planificadas.toFixed(1)}h</p>
-                  </div>
-                  <div className={`rounded-xl border p-3 ${sinSaldo ? 'border-red-500/30 bg-red-500/[0.05]' : 'border-emerald-500/20 bg-emerald-500/[0.03]'}`}>
-                    <p className="text-[7px] text-zinc-600 uppercase font-black">Saldo libre</p>
-                    <p className={`text-[10px] font-black mt-1 ${sinSaldo ? 'text-red-400' : 'text-emerald-400'}`}>
-                      {disponible.toFixed(1)}h <span className="text-zinc-600 font-normal">({selected.saldo_horas.toFixed(1)} − {selected.horas_comprometidas.toFixed(1)})</span>
-                    </p>
-                  </div>
+                  {renderRecursos()}
                 </div>
-                {sinSaldo && mode !== 'RECHAZAR' && (
-                  <div className="flex items-center gap-2 rounded-xl border border-red-500/25 bg-red-500/[0.06] p-3">
-                    <AlertTriangle size={12} className="text-red-400 shrink-0" />
-                    <p className="text-[9px] text-red-400 font-black uppercase">El alumno no tiene saldo suficiente. El sistema bloqueará la confirmación.</p>
-                  </div>
-                )}
+              )}
 
-                {/* Tabs */}
-                <div className="flex bg-black/60 rounded-2xl p-1 border border-white/10 gap-1">
-                  {tabs.map(t => (
-                    <button key={t.key} type="button" onClick={() => switchMode(t.key)}
-                      className={`flex-1 py-3 rounded-xl text-[9px] font-black uppercase transition-all
-                        ${mode === t.key
-                          ? t.key === 'RECHAZAR' ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                          : t.key === 'REPROGRAMAR' ? 'bg-[#E1AD01]/15 text-[#E1AD01] border border-[#E1AD01]/30'
-                          : 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                          : 'text-zinc-600 hover:text-zinc-300'}`}>
-                      {t.label}
-                    </button>
-                  ))}
-                </div>
-
-                {/* CONFIRMAR / REASIGNAR */}
-                {mode === 'CONFIRMAR' && (
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between rounded-xl border border-white/10 bg-white/[0.02] p-3">
-                      <span className="text-[9px] font-black uppercase text-zinc-400">
-                        {fmtDateLong(form.fecha)} · {form.slot}
-                      </span>
-                      <OcupacionBadge usados={confirmadosEnSede(form.fecha, form.slot, selected.alumno_sede) - (esConfirmada ? 1 : 0)} cap={cap} />
-                    </div>
-                    {renderRecursos()}
-                  </div>
-                )}
-
-                {/* REPROGRAMAR */}
-                {mode === 'REPROGRAMAR' && (
-                  <div className="space-y-4">
-                    {sugerencias.length > 0 && (
-                      <div>
-                        <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2">Próximos slots con cupo</p>
-                        <div className="flex flex-wrap gap-1.5">
-                          {sugerencias.map(s => {
-                            const sel = form.fecha === s.fecha && form.slot === s.slot;
-                            return (
-                              <button key={`${s.fecha}-${s.slot}`} type="button" onClick={() => setTarget(s.fecha, s.slot)}
-                                className={`px-3 py-2 rounded-xl border text-[9px] font-black uppercase transition-all
-                                  ${sel ? 'bg-[#E1AD01]/15 text-[#E1AD01] border-[#E1AD01]/40' : 'bg-white/[0.02] border-white/10 text-zinc-400 hover:text-white'}`}>
-                                {fmtDateLong(s.fecha)} · {s.slot} <span className="text-emerald-400 ml-1">{s.libres} libre{s.libres > 1 ? 's' : ''}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="grid grid-cols-1 md:grid-cols-[180px_1fr] gap-3">
-                      <input type="date" value={form.fecha} min={hoyYMD}
-                        onChange={e => e.target.value && setTarget(e.target.value, form.slot)}
-                        className="bg-black/50 border border-white/10 p-3 rounded-xl text-white text-xs outline-none focus:border-[#E1AD01]/60" />
-                      <div className="grid grid-cols-4 gap-1.5">
-                        {SLOTS_OPERATIVOS.map(s => {
-                          const usados = confirmadosEnSede(form.fecha, s, selected.alumno_sede);
-                          const pasado = form.fecha < hoyYMD || (form.fecha === hoyYMD && s <= ahoraHM());
-                          const sel = form.slot === s;
+              {/* REPROGRAMAR */}
+              {mode === 'REPROGRAMAR' && (
+                <div className="space-y-4">
+                  {sugerencias.length > 0 && (
+                    <div>
+                      <p className="mb-2 text-xs font-semibold text-bm-steel">Próximos slots con cupo</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {sugerencias.map(s => {
+                          const sel = form.fecha === s.fecha && form.slot === s.slot;
                           return (
-                            <button key={s} type="button" disabled={pasado} onClick={() => setTarget(form.fecha, s)}
-                              className={`py-2 rounded-xl border text-center transition-all disabled:opacity-25
-                                ${sel ? 'bg-[#E1AD01]/15 border-[#E1AD01]/40' : 'bg-white/[0.02] border-white/10 hover:border-white/25'}`}>
-                              <p className={`text-[10px] font-black ${sel ? 'text-[#E1AD01]' : 'text-white'}`}>{s}</p>
-                              <p className={`text-[7px] font-black ${usados >= cap ? 'text-red-400' : 'text-zinc-500'}`}>{usados}/{cap}</p>
+                            <button key={`${s.fecha}-${s.slot}`} type="button" onClick={() => setTarget(s.fecha, s.slot)} aria-pressed={sel}
+                              className={`h-10 rounded-xl border px-3 text-[13px] font-medium transition-colors ${
+                                sel ? 'border-bm-red bg-bm-red-tint text-bm-red' : 'border-bm-line bg-white text-bm-ink hover:border-bm-steel/40'}`}>
+                              <span className="bm-num">{fmtDateLong(s.fecha)} · {s.slot}</span>
+                              <span className="ml-1.5 text-bm-ok">{s.libres} libre{s.libres > 1 ? 's' : ''}</span>
                             </button>
                           );
                         })}
                       </div>
                     </div>
-                    {renderRecursos()}
-                  </div>
-                )}
-
-                {/* RECHAZAR / CANCELAR */}
-                {mode === 'RECHAZAR' && (
-                  <div className="rounded-xl border border-red-500/20 bg-red-500/[0.04] p-3">
-                    <p className="text-[9px] text-red-400 font-black uppercase">
-                      {esConfirmada
-                        ? 'El vuelo confirmado se cancelará y el capitán y la aeronave quedarán libres.'
-                        : 'La solicitud quedará rechazada. El alumno verá el motivo en su calendario.'}
-                    </p>
-                  </div>
-                )}
-
-                {/* Motivo */}
-                <div>
-                  <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2">
-                    Motivo {mode === 'CONFIRMAR' ? '(opcional)' : '*'}
-                  </p>
-                  {mode !== 'CONFIRMAR' && (
-                    <div className="flex flex-wrap gap-1.5 mb-2">
-                      {motivos.map(m => (
-                        <button key={m} type="button" onClick={() => setForm(p => ({ ...p, motivo: m }))}
-                          className={`px-2.5 py-1.5 rounded-lg border text-[8px] font-black uppercase transition-all
-                            ${form.motivo === m ? 'text-[#E1AD01] border-[#E1AD01]/40 bg-[#E1AD01]/10' : 'text-zinc-500 border-white/10 hover:text-white'}`}>
-                          {m}
-                        </button>
-                      ))}
-                    </div>
                   )}
-                  <textarea rows={2} value={form.motivo} onChange={e => setForm(p => ({ ...p, motivo: e.target.value }))}
-                    placeholder={mode === 'CONFIRMAR' ? 'Nota para el capitán / alumno' : 'Describa el motivo'}
-                    className="w-full bg-black/50 border border-white/10 p-3 rounded-xl text-white text-xs outline-none focus:border-[#E1AD01]/60 resize-none uppercase placeholder:normal-case placeholder:text-zinc-700" />
-                </div>
 
-                {formError && (
-                  <div className="flex items-start gap-2 rounded-xl border border-red-500/25 bg-red-500/[0.06] p-3">
-                    <AlertTriangle size={12} className="text-red-400 shrink-0 mt-0.5" />
-                    <p className="text-[9px] text-red-400 font-black">{formError}</p>
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-[190px_1fr]">
+                    <input type="date" value={form.fecha} min={hoyYMD} aria-label="Fecha del vuelo"
+                      onChange={e => e.target.value && setTarget(e.target.value, form.slot)}
+                      className={bmInput} />
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {SLOTS_OPERATIVOS.map(s => {
+                        const usados = confirmadosEnSede(form.fecha, s, selected.alumno_sede);
+                        const pasado = form.fecha < hoyYMD || (form.fecha === hoyYMD && s <= ahoraHM());
+                        const sel = form.slot === s;
+                        return (
+                          <button key={s} type="button" disabled={pasado} onClick={() => setTarget(form.fecha, s)} aria-pressed={sel}
+                            className={`rounded-xl border py-1.5 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                              sel ? 'border-bm-red bg-bm-red-tint' : 'border-bm-line bg-white hover:border-bm-steel/40'}`}>
+                            <p className={`bm-num text-sm font-semibold ${sel ? 'text-bm-red' : 'text-bm-ink'}`}>{s}</p>
+                            <p className={`bm-num text-[11px] ${usados >= cap ? 'font-semibold text-bm-red-deep' : 'text-bm-steel'}`}>{usados}/{cap}</p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {fueraDeVentana && (
+                    <BmNotice tone="info" icon={<CalendarDays className="h-4 w-4" />}>
+                      Fecha posterior a la ventana cargada ({fmtDateLong(rango.hasta)}): la ocupación mostrada puede estar incompleta. El servidor valida los conflictos al confirmar.
+                    </BmNotice>
+                  )}
+                  {renderRecursos()}
+                </div>
+              )}
+
+              {/* RECHAZAR / CANCELAR */}
+              {mode === 'RECHAZAR' && (
+                <BmNotice tone="danger" icon={<XCircle className="h-4 w-4" />}>
+                  {esConfirmada
+                    ? 'El vuelo confirmado se cancelará y el capitán y la aeronave quedarán libres.'
+                    : 'La solicitud quedará rechazada. El alumno verá el motivo en su calendario.'}
+                </BmNotice>
+              )}
+
+              {/* Motivo */}
+              <div>
+                <p className="mb-2 text-sm font-medium">
+                  Motivo {mode === 'CONFIRMAR' ? <span className="font-normal text-bm-steel">(opcional)</span> : <span className="text-bm-red">*</span>}
+                </p>
+                {mode !== 'CONFIRMAR' && (
+                  <div className="mb-2 flex flex-wrap gap-1.5">
+                    {motivos.map(m => (
+                      <button key={m} type="button" onClick={() => setForm(p => ({ ...p, motivo: m }))} aria-pressed={form.motivo === m}
+                        className={`rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                          form.motivo === m ? 'border-bm-red bg-bm-red-tint text-bm-red' : 'border-bm-line text-bm-steel hover:text-bm-ink'}`}>
+                        {m.charAt(0) + m.slice(1).toLowerCase()}
+                      </button>
+                    ))}
                   </div>
                 )}
+                <textarea rows={2} value={form.motivo} onChange={e => setForm(p => ({ ...p, motivo: e.target.value }))}
+                  aria-label="Motivo"
+                  placeholder={mode === 'CONFIRMAR' ? 'Nota para el capitán / alumno' : 'Describa el motivo'}
+                  className={`${bmTextarea} uppercase placeholder:normal-case`} />
+              </div>
 
-                <div className="flex gap-3">
-                  <button type="button" onClick={closeModal}
-                    className="flex-1 py-4 rounded-2xl border border-white/10 text-zinc-500 text-[9px] font-black uppercase hover:bg-white/5">
-                    Cerrar
-                  </button>
-                  <button type="button" onClick={submit} disabled={saving}
-                    className={`flex-[2] py-4 rounded-2xl text-[9px] font-black uppercase tracking-widest flex items-center justify-center gap-2 disabled:opacity-40
-                      ${mode === 'RECHAZAR' ? 'bg-red-500 text-white hover:bg-red-400'
-                      : mode === 'REPROGRAMAR' ? 'bg-[#E1AD01] text-black hover:bg-white'
-                      : 'bg-emerald-500 text-black hover:bg-emerald-400'}`}>
-                    {saving ? <Loader2 size={14} className="animate-spin" />
-                      : mode === 'RECHAZAR' ? <XCircle size={14} />
-                      : mode === 'REPROGRAMAR' ? <Repeat size={14} /> : <ShieldCheck size={14} />}
-                    {mode === 'RECHAZAR' ? (esConfirmada ? 'Cancelar vuelo' : 'Rechazar solicitud')
-                      : mode === 'REPROGRAMAR' ? 'Reprogramar y confirmar'
-                      : esConfirmada ? 'Guardar reasignación' : 'Confirmar vuelo'}
-                  </button>
-                </div>
+              {formError && (
+                <BmNotice tone="danger" role="alert" icon={<AlertTriangle className="h-4 w-4" />}>{formError}</BmNotice>
+              )}
 
-                {/* Trazabilidad */}
-                <div className="border-t border-white/5 pt-4">
-                  <p className="text-[8px] text-zinc-500 font-black uppercase tracking-widest mb-2 flex items-center gap-1.5">
-                    <History size={10} /> Trazabilidad
-                  </p>
-                  {loadingEventos ? (
-                    <Loader2 size={14} className="animate-spin text-zinc-600" />
-                  ) : eventos.length === 0 ? (
-                    <p className="text-[8px] text-zinc-700">Sin eventos registrados.</p>
-                  ) : (
-                    <div className="space-y-1.5">
-                      {eventos.map(ev => (
-                        <div key={ev.id} className="flex items-start justify-between gap-3 text-[8px]">
+              <div className="flex flex-col-reverse gap-2 sm:flex-row">
+                <button type="button" onClick={closeModal} disabled={saving} className={`${bmBtn.secondary} sm:flex-1`}>
+                  Cerrar
+                </button>
+                <button type="button" onClick={submit} disabled={saving}
+                  className={`${mode === 'RECHAZAR' ? bmBtn.danger : mode === 'REPROGRAMAR' ? bmBtn.primary : bmBtn.success} sm:flex-[2]`}>
+                  {saving ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : mode === 'RECHAZAR' ? <XCircle className="h-4 w-4" />
+                    : mode === 'REPROGRAMAR' ? <Repeat className="h-4 w-4" /> : <ShieldCheck className="h-4 w-4" />}
+                  {mode === 'RECHAZAR' ? (esConfirmada ? 'Cancelar vuelo' : 'Rechazar solicitud')
+                    : mode === 'REPROGRAMAR' ? 'Reprogramar y confirmar'
+                    : esConfirmada ? 'Guardar reasignación' : 'Confirmar vuelo'}
+                </button>
+              </div>
+
+              {/* Trazabilidad */}
+              <div className="border-t border-bm-line pt-4">
+                <p className="mb-2.5 flex items-center gap-1.5 text-xs font-semibold text-bm-steel">
+                  <History className="h-3.5 w-3.5" /> Trazabilidad
+                </p>
+                {loadingEventos ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-bm-hint" />
+                ) : eventos.length === 0 ? (
+                  <p className="text-[13px] text-bm-hint">Sin eventos registrados.</p>
+                ) : (
+                  <ol className="space-y-2.5">
+                    {eventos.map(ev => (
+                      <li key={ev.id} className="flex items-start justify-between gap-3 text-[13px]">
+                        <div className="flex min-w-0 gap-2.5">
+                          <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-bm-red" aria-hidden="true" />
                           <div className="min-w-0">
-                            <p className="font-black uppercase text-zinc-300">{ACCION_LABEL[ev.accion] ?? ev.accion.replace(/_/g, ' ')}</p>
+                            <p className="font-medium">{ACCION_LABEL[ev.accion] ?? ev.accion.replace(/_/g, ' ')}</p>
                             {ev.detalle?.a?.fecha && (
-                              <p className="text-zinc-600 truncate">
+                              <p className="bm-num truncate text-xs text-bm-steel">
                                 {ev.detalle?.de?.fecha ? `${ev.detalle.de.fecha} ${hm(ev.detalle.de.slot)} → ` : ''}
                                 {ev.detalle.a.fecha} {hm(ev.detalle.a.slot)} {ev.detalle.a.aeronave ? `· ${ev.detalle.a.aeronave}` : ''}
                               </p>
                             )}
-                            {ev.detalle?.motivo && <p className="text-amber-400/70 truncate">{ev.detalle.motivo}</p>}
+                            {ev.detalle?.motivo && <p className="truncate text-xs text-bm-warn">{ev.detalle.motivo}</p>}
                           </div>
-                          <span className="text-zinc-600 shrink-0">{fmtDateTime(ev.created_at)}</span>
                         </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
+                        <span className="bm-num shrink-0 text-xs text-bm-hint">{fmtDateTime(ev.created_at)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
               </div>
             </div>
-          </div>
-        );
-      })()}
+          );
+        })()}
+      </BmModal>
     </div>
   );
 };

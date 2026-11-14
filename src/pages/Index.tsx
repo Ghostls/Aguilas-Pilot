@@ -1,7 +1,14 @@
 // src/pages/Index.tsx
-// VALKYRON OS v7.3.4 — Archivo OMA + Stock completo + Impresión · B&M MANTENIMIENTO AERONÁUTICO
+// VALKYRON OS v7.3.5 — Archivo OMA + Stock completo + Impresión · B&M MANTENIMIENTO AERONÁUTICO
 // FUSIÓN v6.1 + v7.0 + v7.1 + rebrand B&M
 // ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v7.3.5:
+//   [UI]  Hangar de consulta (PlannerHangar v2.2), Mi Bitácora (CaptainDashboard
+//         v2.2), Calendario (FlightCalendar v2.1) y Planificación de vuelo
+//         (FlightPlanningboard v1.2) ya son B&M: se retira LegacyModuleFrame.
+//         Ningún módulo de Index lo usa ya; el marco se conserva sin usos por si
+//         hay que volver a envolver un módulo durante una migración.
+//
 // CHANGELOG v7.3.4:
 //   [UI]  Finanzas (FinancePanel v17.1) ya es B&M: se retira LegacyModuleFrame.
 //
@@ -243,6 +250,8 @@ const ModuleError: React.FC<{ recurso: string; error: string | null; onRetry: ()
  * aplica la variante nocturna B&M a los componentes shadcn internos.
  * Se elimina de cada módulo cuando ese módulo se migra a B&M.
  */
+// [v7.3.5] Sin usos en Index tras migrar Planificación, Calendario, Mi Bitácora y Hangar.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const LegacyModuleFrame: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div className="dark rounded-[24px] bg-[#050505] p-3 text-white sm:p-5">
     {children}
@@ -811,11 +820,11 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
             )}
 
             {safeTab === 'hangar-consulta' && isPlanner && (
-              <LegacyModuleFrame><PlannerHangar /></LegacyModuleFrame>
+              <PlannerHangar />   // [v7.3.5] B&M: sin LegacyModuleFrame
             )}
 
             {safeTab === 'captain-log' && isVisible('captain-log') && (
-              <LegacyModuleFrame><CaptainDashboard userProfile={userProfile} /></LegacyModuleFrame>
+              <CaptainDashboard userProfile={userProfile} />   // [v7.3.5] B&M
             )}
 
             {safeTab === 'fleet' && isVisible('fleet') && guard(
@@ -891,21 +900,19 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
             )}
 
             {safeTab === 'calendario' && isVisible('calendario') && (
-              <LegacyModuleFrame>
-                <FlightCalendar
-                  userRole={userProfile?.rol}
-                  userProfile={userProfile}
-                />
-              </LegacyModuleFrame>
+              // [v7.3.5] B&M: sin LegacyModuleFrame
+              <FlightCalendar
+                userRole={userProfile?.rol}
+                userProfile={userProfile}
+              />
             )}
 
             {safeTab === 'planificacion' && isVisible('planificacion') && (
-              <LegacyModuleFrame>
-                <FlightPlanningBoard
-                  userRole={userProfile?.rol}
-                  userProfile={userProfile}
-                />
-              </LegacyModuleFrame>
+              // [v7.3.5] B&M: sin LegacyModuleFrame
+              <FlightPlanningBoard
+                userRole={userProfile?.rol}
+                userProfile={userProfile}
+              />
             )}
 
             {safeTab === 'flights' && isVisible('flights') && (
@@ -922,7 +929,7 @@ const Index = (_props: { userRole?: string; fleet?: any[] }) => {
 
         <footer className="mt-auto flex flex-col gap-1 border-t border-bm-line px-4 py-5 text-xs text-bm-steel sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
           <span>B&amp;M Mantenimiento Aeronáutico</span>
-          <span>Valkyron OS v7.3.4</span>
+          <span>Valkyron OS v7.3.5</span>
         </footer>
       </div>
 

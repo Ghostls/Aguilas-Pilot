@@ -1,6 +1,26 @@
 // src/components/PlannerHangar.tsx
-// VALKYRON OS v2.1 — HANGAR DE CONSULTA PARA PLANIFICACIÓN (SIN controles de mantenimiento)
-// FUSIÓN: original + v2.0
+// VALKYRON OS v2.2 — HANGAR DE CONSULTA PARA PLANIFICACIÓN (SIN controles de mantenimiento)
+// B&M MANTENIMIENTO AERONÁUTICO
+// ─────────────────────────────────────────────────────────────────────────────
+// CHANGELOG v2.2 — REBRAND B&M + CONEXIONES:
+//   [FIX] Filtro de sede: el estado inicial se calculaba con el perfil del
+//         primer render; AuthContext lo carga después, así que el planificador
+//         quedaba siempre en TODAS. Ahora se aplica su sede cuando el perfil
+//         llega, salvo que ya haya elegido una a mano.
+//   [FIX] Al fallar la flota quedaban en pantalla los avisos MRO/órdenes de la
+//         consulta anterior junto al error. Se limpian.
+//   [FIX] "Última consulta" seguía visible con el error de flota y parecía
+//         dato vigente. Ahora solo se muestra con datos válidos.
+//   [UI]  B&M: cabecera blanca, filtros de sede en control segmentado, búsqueda
+//         a 16 px (sin zoom en iOS), KPI con cifras protagonistas, tarjetas
+//         blancas con veredicto en insignia y motivos en lista.
+// PRESERVADO: veredicto ASIGNABLE / NO_ASIGNABLE / SIN_VERIFICAR con los tres
+//   criterios (v_slots_disponibles.disponible_mro, estado operativo, órdenes
+//   abiertas), "sin verificar" nunca es "disponible", consultas cancelables con
+//   15 s, realtime flota/órdenes con debounce, actualización cada 2 min con la
+//   pestaña visible, filtros de solo presentación, export default.
+// ─────────────────────────────────────────────────────────────────────────────
+// VALKYRON OS v2.1 — FUSIÓN: original + v2.0
 // ─────────────────────────────────────────────────────────────────────────────
 // CHANGELOG v2.1 (sobre v2.0):
 //   [NEW] Filtro por sede (TODAS / BARQUISIMETO / MATURIN), inicia en la sede del
@@ -37,6 +57,7 @@ import { useAuth } from '@/context/AuthContext';
 import {
   AlertTriangle, CheckCircle2, HelpCircle, MapPin, Plane, RefreshCw, Search, ShieldAlert, Wrench,
 } from 'lucide-react';
+import { BmBadge, BmNotice, bmBtn, type BmTone } from './brand/bm-ui';   // [v2.2]
 
 type HangarAircraft = {
   id: string;
@@ -73,6 +94,19 @@ const CLEANUP_REASON = 'cleanup';
 const OPEN_ORDER_STATES = ['In Progress', 'Pending Parts', 'On Hold'];
 const openStates = OPEN_ORDER_STATES.map(s => s.toLowerCase());   // [KEEP original]
 const SEDES: SedeFiltro[] = ['TODAS', 'BARQUISIMETO', 'MATURIN'];
+
+// [NEW v2.2] Etiquetas y tonos B&M
+const SEDE_LABEL: Record<SedeFiltro, string> = {
+  TODAS: 'Todas',
+  BARQUISIMETO: 'BQTO',
+  MATURIN: 'Maturín',
+};
+
+const VEREDICTO_UI: Record<Verdict, { label: string; tone: BmTone; border: string; icon: React.ReactNode }> = {
+  ASIGNABLE:     { label: 'Candidata para planificación', tone: 'ok',     border: 'border-bm-ok/30',  icon: <CheckCircle2 className="h-3.5 w-3.5" /> },
+  NO_ASIGNABLE:  { label: 'No asignable',                 tone: 'danger', border: 'border-bm-line',   icon: <Wrench className="h-3.5 w-3.5" /> },
+  SIN_VERIFICAR: { label: 'Sin verificar',                tone: 'warn',   border: 'border-bm-warn/35', icon: <HelpCircle className="h-3.5 w-3.5" /> },
+};
 
 const normalize = (s: unknown) => String(s ?? '').trim().toLowerCase();
 
@@ -118,6 +152,19 @@ const PlannerHangar: React.FC = () => {
 
   const controllerRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sedeTocadaRef = useRef(false);   // [v2.2] el planificador eligió sede a mano
+
+  // [FIX v2.2] El perfil llega después del primer render (AuthContext asíncrono)
+  useEffect(() => {
+    if (sedeTocadaRef.current) return;
+    const s = normSede(profile?.sede);
+    if (s === 'BARQUISIMETO' || s === 'MATURIN') setSede(s);
+  }, [profile?.sede]);
+
+  const elegirSede = (s: SedeFiltro) => {
+    sedeTocadaRef.current = true;
+    setSede(s);
+  };
 
   const load = useCallback(async () => {
     controllerRef.current?.abort(CLEANUP_REASON);
@@ -156,6 +203,7 @@ const PlannerHangar: React.FC = () => {
             ? String(fleetRes.reason)
             : fleetRes.value.error?.message ?? 'Error';
         setFleet([]); // ante falla, no declarar aeronaves disponibles
+        setWarnings([]); // [v2.2] sin avisos de la consulta anterior
         setError(msg);
         return;
       }
@@ -186,6 +234,7 @@ const PlannerHangar: React.FC = () => {
     } catch (err) {
       if (controller.signal.aborted && controller.signal.reason === CLEANUP_REASON) return;
       setFleet([]); // ante falla, no declarar aeronaves disponibles
+      setWarnings([]); // [v2.2]
       setError(err instanceof Error ? err.message : 'No se pudo comprobar la disponibilidad.');
     } finally {
       clearTimeout(timer);
@@ -285,29 +334,27 @@ const PlannerHangar: React.FC = () => {
 
   const card = (e: Evaluated) => {
     const ac = e.aircraft;
-    const tone = e.verdict === 'ASIGNABLE'
-      ? 'border-emerald-600/25'
-      : e.verdict === 'NO_ASIGNABLE'
-        ? 'border-red-500/20 opacity-80'
-        : 'border-amber-500/25';
+    const ui = VEREDICTO_UI[e.verdict];
     return (
-      <article key={ac.id} className={`rounded-2xl border bg-white/[0.03] p-5 ${tone}`}>
-        <p className={`mb-2 flex items-center gap-1.5 text-xs font-bold uppercase ${
-          e.verdict === 'ASIGNABLE' ? 'text-emerald-400' : e.verdict === 'NO_ASIGNABLE' ? 'text-red-400' : 'text-amber-300'
-        }`}>
-          {e.verdict === 'ASIGNABLE' && <><CheckCircle2 size={13} /> Candidata para planificación</>}
-          {e.verdict === 'NO_ASIGNABLE' && <><Wrench size={13} /> No asignable</>}
-          {e.verdict === 'SIN_VERIFICAR' && <><HelpCircle size={13} /> Sin verificar</>}
-        </p>
-        <h4 className="text-2xl font-black tracking-tight">{ac.matricula}</h4>
-        <p className="mt-1 text-sm text-slate-300">{ac.modelo || 'Modelo no registrado'}</p>
-        <p className="mt-3 text-xs text-slate-400">Sede: {ac.sede || 'Sin sede'}</p>
-        <p className="mt-1 text-xs text-slate-400">Horas: {fmtHoras(ac.horas_vuelo_totales)}</p>
-        <p className="mt-1 text-xs text-slate-500">Estado registrado: {ac.estado || 'Sin registrar'}</p>
+      <article key={ac.id} className={`flex flex-col rounded-[20px] border bg-white p-4 sm:p-5 ${ui.border}`}>
+        <div className="flex items-start justify-between gap-2">
+          <BmBadge tone={ui.tone} icon={ui.icon}>{ui.label}</BmBadge>
+        </div>
+        <h4 className="mt-3 font-data text-2xl font-semibold tracking-tight">{ac.matricula}</h4>
+        <p className="mt-0.5 text-sm text-bm-steel">{ac.modelo || 'Modelo no registrado'}</p>
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[13px]">
+          <dt className="text-bm-steel">Sede</dt>
+          <dd className="truncate font-medium">{ac.sede || 'Sin sede'}</dd>
+          <dt className="text-bm-steel">Horas</dt>
+          <dd className="bm-num font-medium">{fmtHoras(ac.horas_vuelo_totales)}</dd>
+          <dt className="text-bm-steel">Estado registrado</dt>
+          <dd className="truncate font-medium">{ac.estado || 'Sin registrar'}</dd>
+        </dl>
         {e.reasons.length > 0 && (
-          <ul className="mt-3 space-y-1">
+          <ul className={`mt-3 space-y-1 rounded-xl px-3 py-2.5 text-[13px] ${
+            e.verdict === 'NO_ASIGNABLE' ? 'bg-bm-red-tint text-bm-red-deep' : 'bg-bm-warn-tint text-[#7C2D12]'}`}>
             {e.reasons.map(r => (
-              <li key={r} className="text-[11px] text-slate-400">• {r}</li>
+              <li key={r} className="flex gap-1.5"><span aria-hidden="true">•</span>{r}</li>
             ))}
           </ul>
         )}
@@ -315,122 +362,136 @@ const PlannerHangar: React.FC = () => {
     );
   };
 
+  const kpi = (label: string, value: number, cls: string) => (
+    <div className="rounded-[20px] border border-bm-line bg-white p-3.5 sm:p-4">
+      <p className="text-[13px] leading-tight text-bm-steel">{label}</p>
+      <p className={`bm-figure mt-2 text-[28px] sm:text-[32px] ${cls}`}>{value}</p>
+    </div>
+  );
+
   return (
-    <section className="space-y-6 text-white">
-      <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/5 p-5">
-        <div className="flex items-center gap-3">
-          <Plane className="text-[#E1AD01]" />
-          <div>
-            <h3 className="font-black uppercase tracking-wider">Hangar · Consulta para planificación</h3>
-            <p className="text-xs text-slate-400">
+    <section className="bm-app space-y-4 text-left text-bm-ink sm:space-y-5">
+      <div className="flex flex-col gap-4 rounded-[24px] border border-bm-line bg-white p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+        <div className="flex min-w-0 items-center gap-3.5">
+          <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-bm-red-tint text-bm-red">
+            <Plane className="h-6 w-6" />
+          </span>
+          <div className="min-w-0">
+            <h3 className="bm-heading text-lg leading-tight sm:text-xl">Hangar · consulta para planificación</h3>
+            <p className="mt-0.5 text-[13px] leading-snug text-bm-steel">
               Asignable = disponible en MRO del sistema, estado operativo y sin órdenes de trabajo abiertas.
             </p>
           </div>
         </div>
         <button type="button" onClick={() => void load()} disabled={busy}
-          className="flex items-center gap-2 rounded-xl bg-[#E1AD01] px-4 py-3 text-xs font-black uppercase text-black disabled:opacity-50">
-          <RefreshCw size={15} className={busy ? 'animate-spin' : ''} /> Actualizar
+          className={`${bmBtn.secondary} ${bmBtn.sm} w-full shrink-0 sm:w-auto`}>
+          <RefreshCw className={`h-4 w-4 ${busy ? 'animate-spin' : ''}`} /> Actualizar
         </button>
       </div>
 
-      <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-xs text-amber-200">
+      <BmNotice tone="warn" icon={<ShieldAlert className="h-4 w-4" />}>
         Este listado es orientativo. Una aeronave solo puede asignarse a un vuelo tras verificar
         documentación, mantenimiento, liberación autorizada y restricciones operacionales vigentes.
         La asignación final la valida el servidor al confirmar el vuelo.
-      </div>
+      </BmNotice>
 
       {/* [v2.1] Filtros */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex rounded-xl border border-white/10 bg-black/60 p-1">
+        <div className="flex rounded-2xl border border-bm-line bg-white p-1" role="group" aria-label="Sede">
           {SEDES.map(s => (
-            <button key={s} type="button" onClick={() => setSede(s)}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-[10px] font-black uppercase tracking-wider transition-all ${
-                sede === s ? 'bg-[#E1AD01] text-black' : 'text-slate-500 hover:text-white'
+            <button key={s} type="button" onClick={() => elegirSede(s)} aria-pressed={sede === s}
+              className={`flex h-10 flex-1 items-center justify-center gap-1.5 rounded-xl px-3 text-sm font-medium transition-colors sm:flex-none ${
+                sede === s ? 'bg-bm-ink text-white' : 'text-bm-steel hover:text-bm-ink'
               }`}>
-              {s !== 'TODAS' && <MapPin size={11} />}
-              {s === 'BARQUISIMETO' ? 'BQTO' : s}
+              {s !== 'TODAS' && <MapPin className="h-3.5 w-3.5" />}
+              {SEDE_LABEL[s]}
             </button>
           ))}
         </div>
-        <div className="relative sm:w-72">
-          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600" />
+        <div className="relative sm:w-80">
+          <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-bm-hint" />
           <input
             type="search"
             value={query}
             onChange={e => setQuery(e.target.value)}
             placeholder="Buscar matrícula o modelo"
-            className="w-full rounded-xl border border-white/10 bg-black/60 py-2.5 pl-9 pr-3 text-xs text-white outline-none focus:border-[#E1AD01]/60"
+            aria-label="Buscar matrícula o modelo"
+            className="h-12 w-full rounded-xl border border-bm-field bg-white pl-10 pr-3 text-base text-bm-ink outline-none transition-[border-color,box-shadow] placeholder:text-bm-hint focus:border-bm-red focus:ring-4 focus:ring-bm-red/10"
           />
         </div>
       </div>
 
       {error && (
-        <div role="alert" className="flex items-center justify-between gap-3 rounded-xl border border-red-500/30 p-4 text-sm text-red-300">
-          <span className="flex items-center gap-2"><ShieldAlert size={18} />{error}</span>
-          <button type="button" onClick={() => void load()} className="rounded-lg border border-red-500/30 px-3 py-2 text-xs font-bold uppercase hover:bg-red-500/10">
-            Reintentar
-          </button>
-        </div>
+        <BmNotice tone="danger" role="alert" icon={<ShieldAlert className="h-4 w-4" />}>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+            <div className="min-w-0">
+              <p className="font-semibold">No se pudo consultar la flota</p>
+              <p className="mt-0.5 break-words font-data text-xs">{error}</p>
+            </div>
+            <button type="button" onClick={() => void load()} className={`${bmBtn.secondary} ${bmBtn.sm} shrink-0`}>
+              Reintentar
+            </button>
+          </div>
+        </BmNotice>
       )}
 
       {warnings.map(w => (
-        <div key={w} className="flex items-start gap-2 rounded-xl border border-amber-500/25 p-4 text-xs text-amber-200">
-          <AlertTriangle size={16} className="shrink-0" />{w}
-        </div>
+        <BmNotice key={w} tone="warn" icon={<AlertTriangle className="h-4 w-4" />}>{w}</BmNotice>
       ))}
 
       {busy && fleet.length === 0 && !error ? (
-        <p className="text-slate-400">Verificando disponibilidad...</p>
+        <div aria-busy="true" aria-label="Verificando disponibilidad" className="space-y-3">
+          <div className="grid grid-cols-3 gap-3">
+            {[0, 1, 2].map(i => <div key={i} className="bm-skeleton h-[96px] rounded-[20px]" />)}
+          </div>
+          <p className="text-sm text-bm-steel">Verificando disponibilidad...</p>
+        </div>
       ) : !error && (
         <>
           <div className="grid grid-cols-3 gap-3">
-            <div className="rounded-xl border border-emerald-600/25 p-4">
-              <p className="text-[10px] uppercase text-slate-400">Asignables</p>
-              <p className="text-2xl font-black text-emerald-400">{asignables.length}</p>
-            </div>
-            <div className="rounded-xl border border-red-500/20 p-4">
-              <p className="text-[10px] uppercase text-slate-400">No asignables</p>
-              <p className="text-2xl font-black text-red-400">{noAsignables.length}</p>
-            </div>
-            <div className="rounded-xl border border-amber-500/25 p-4">
-              <p className="text-[10px] uppercase text-slate-400">Sin verificar</p>
-              <p className="text-2xl font-black text-amber-300">{sinVerificar.length}</p>
-            </div>
+            {kpi('Asignables', asignables.length, 'text-bm-ok')}
+            {kpi('No asignables', noAsignables.length, 'text-bm-red')}
+            {kpi('Sin verificar', sinVerificar.length, 'text-bm-warn')}
           </div>
 
           {asignables.length === 0 && (
-            <p className="rounded-xl border border-white/10 p-8 text-center text-slate-400">
-              No hay aeronaves verificadas como disponibles en este momento.
-            </p>
+            <div className="rounded-[20px] border border-dashed border-bm-field bg-white px-4 py-8 text-center">
+              <Plane className="mx-auto h-6 w-6 text-bm-hint" />
+              <p className="mt-2 text-sm font-medium">No hay aeronaves verificadas como disponibles en este momento.</p>
+            </div>
           )}
 
           {asignables.length > 0 && (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">{asignables.map(card)}</div>
+            <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3">{asignables.map(card)}</div>
           )}
 
           {sinVerificar.length > 0 && (
             <>
-              <h4 className="text-xs font-black uppercase tracking-widest text-amber-300">Sin verificar</h4>
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">{sinVerificar.map(card)}</div>
+              <h4 className="flex items-center gap-2 pt-1 text-sm font-semibold text-bm-warn">
+                <HelpCircle className="h-4 w-4" /> Sin verificar
+              </h4>
+              <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3">{sinVerificar.map(card)}</div>
             </>
           )}
 
           {noAsignables.length > 0 && (
             <>
-              <h4 className="text-xs font-black uppercase tracking-widest text-red-400">No asignables</h4>
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">{noAsignables.map(card)}</div>
+              <h4 className="flex items-center gap-2 pt-1 text-sm font-semibold text-bm-red">
+                <Wrench className="h-4 w-4" /> No asignables
+              </h4>
+              <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3">{noAsignables.map(card)}</div>
             </>
           )}
 
           {visibles.length === 0 && fleet.length > 0 && (
-            <p className="text-center text-xs text-slate-500">Ninguna aeronave coincide con los filtros aplicados.</p>
+            <p className="text-center text-sm text-bm-steel">Ninguna aeronave coincide con los filtros aplicados.</p>
           )}
         </>
       )}
 
-      {updatedAt && (
-        <p className="text-xs text-slate-500">
-          Última consulta: {updatedAt} · actualización automática cada 2 min
+      {updatedAt && !error && (
+        <p className="text-xs text-bm-steel">
+          Última consulta: <span className="bm-num">{updatedAt}</span> · actualización automática cada 2 min
         </p>
       )}
     </section>
